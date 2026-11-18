@@ -1,0 +1,14040 @@
+/*
+ V6 - Login + Meter Condition + Disconnection
+ Server URL remains the same. Existing survey flow preserved.
+ Users are authenticated by the Google Apps Script backend.
+*/
+/* ORAI TOWN: paste the Web App URL of the Orai Apps Script deployment here
+   (Deploy > Manage deployments > Web app URL ending in /exec). */
+const SERVER_URL = "PASTE_ORAI_APPS_SCRIPT_EXEC_URL_HERE";
+
+const state = {
+  consumers: [],
+  masterReady: false,
+  masterCount: 0,
+  current: null,
+  db: null,
+  masterDb: null,
+  activeMasterStore: "masterConsumers",
+  masterCount: 0,
+  masterMeta: null,
+
+  lookup: new Map(),
+  meterLookup: new Map(),
+  normalizedLookup: new Map(),
+  sessionToken: localStorage.getItem("consumerMobileAuthToken") || "",
+  userId: localStorage.getItem("consumerMobileUserId") || "",
+  userName: localStorage.getItem("consumerMobileUserName") || "",
+  isAdmin: localStorage.getItem("consumerMobileIsAdmin") === "YES",
+  division: localStorage.getItem("consumerMobileDivision") || "",
+  subdivision: localStorage.getItem("consumerMobileSubdivision") || "",
+  substation: localStorage.getItem("consumerMobileSubstation") || "",
+  role: localStorage.getItem("consumerMobileRole") || "",
+
+  duplicateInfo: null,
+  disconnectCurrent: null,
+  doorSurveyGps: null,
+  disconnectGps: null,
+  phoneCurrent: null
+};
+
+const $ = id => document.getElementById(id);
+
+
+/* =========================================================
+   GLOBAL PROCESSING / LOADING INDICATOR
+   ========================================================= */
+
+let globalLoadingCount = 0;
+
+function showGlobalLoading(
+  title="Processing...",
+  message="Please wait, your request is being processed."
+){
+
+  const overlay=$("globalLoadingOverlay");
+
+  if(!overlay) return;
+
+  globalLoadingCount++;
+
+  $("globalLoadingTitle").textContent=title;
+  $("globalLoadingMessage").textContent=message;
+
+  overlay.classList.remove("hidden");
+  overlay.setAttribute("aria-hidden","false");
+}
+
+
+function updateGlobalLoading(title,message){
+
+  const overlay=$("globalLoadingOverlay");
+
+  if(!overlay) return;
+
+  if(title){
+    $("globalLoadingTitle").textContent=title;
+  }
+
+  if(message){
+    $("globalLoadingMessage").textContent=message;
+  }
+}
+
+
+function hideGlobalLoading(){
+
+  const overlay=$("globalLoadingOverlay");
+
+  if(!overlay) return;
+
+  globalLoadingCount=Math.max(
+    0,
+    globalLoadingCount-1
+  );
+
+  if(globalLoadingCount>0) return;
+
+  overlay.classList.add("hidden");
+  overlay.setAttribute("aria-hidden","true");
+}
+
+
+
+/* =========================================================
+   LANGUAGE SWITCH
+   English <-> Hindi
+
+   Important:
+   - UI text only
+   - Consumer/master data is never translated
+   - Original bilingual text is preserved
+   ========================================================= */
+
+const LANGUAGE_STORAGE_KEY = "kuthondFieldWorkLanguage";
+
+let currentLanguage =
+  localStorage.getItem(LANGUAGE_STORAGE_KEY) === "hi"
+    ? "hi"
+    : "en";
+
+
+/*
+ * Explicit special cases.
+ *
+ * These are strings where normal parenthesis parsing
+ * would be ambiguous.
+ */
+const LANGUAGE_TEXT_OVERRIDES = {
+
+  "Logged in as(लॉगिन उपयोगकर्ता):": {
+    en: "Logged in as:",
+    hi: "लॉगिन उपयोगकर्ता:"
+  },
+
+  "Language / भाषा:": {
+    en: "Language:",
+    hi: "भाषा:"
+  },
+
+  "Remark(टिप्पणी)(चोरी या स्टोर रीडिंग की संभावना)": {
+    en: "Remark (Possibility of Theft or Stored Reading)",
+    hi: "टिप्पणी (चोरी या स्टोर रीडिंग की संभावना)"
+  },
+
+  "Remarks(टिप्पणी)(चोरी या स्टोर रीडिंग की संभावना)": {
+    en: "Remarks (Possibility of Theft or Stored Reading)",
+    hi: "टिप्पणी (चोरी या स्टोर रीडिंग की संभावना)"
+  }
+
+};
+
+
+/*
+ * ---------------------------------------------------------
+ * Parse bilingual text safely.
+ *
+ * We use the LAST top-level parenthesis group as the
+ * Hindi translation.
+ *
+ * Therefore:
+ *
+ * Luxury (Rich) House(शानदार/आलीशान घर)
+ *
+ * becomes:
+ *
+ * English = Luxury (Rich) House
+ * Hindi   = शानदार/आलीशान घर
+ *
+ * Nested parentheses are supported.
+ * ---------------------------------------------------------
+ */
+function parseBilingualText(text){
+
+  const value=String(text||"").trim();
+
+  if(!value) return null;
+
+
+  /*
+   * Explicit overrides first.
+   */
+  if(LANGUAGE_TEXT_OVERRIDES[value]){
+
+    return {
+      english:LANGUAGE_TEXT_OVERRIDES[value].en,
+      hindi:LANGUAGE_TEXT_OVERRIDES[value].hi
+    };
+
+  }
+
+
+  /*
+   * Find all TOP-LEVEL parenthesis groups.
+   */
+  const groups=[];
+
+  let depth=0;
+  let start=-1;
+
+  for(let i=0;i<value.length;i++){
+
+    const ch=value[i];
+
+    if(ch==="("){
+
+      if(depth===0){
+        start=i;
+      }
+
+      depth++;
+
+    }else if(ch===")"){
+
+      if(depth>0){
+        depth--;
+
+        if(depth===0 && start>=0){
+
+          groups.push({
+            start,
+            end:i
+          });
+
+          start=-1;
+        }
+      }
+
+    }
+
+  }
+
+
+  /*
+   * Unbalanced parentheses = do not guess.
+   */
+  if(depth!==0 || !groups.length){
+    return null;
+  }
+
+
+  /*
+   * The final TOP-LEVEL group must contain Hindi.
+   */
+  const last=groups[groups.length-1];
+
+  const english=value
+    .slice(0,last.start)
+    .trim();
+
+  const hindi=value
+    .slice(last.start+1,last.end)
+    .trim();
+
+  const suffix=value
+    .slice(last.end+1)
+    .trim();
+
+
+  if(!english || !hindi){
+    return null;
+  }
+
+
+  /*
+   * Hindi translation must actually contain Devanagari.
+   */
+  if(!/[\u0900-\u097F]/.test(hindi)){
+    return null;
+  }
+
+
+  return {
+    english:english + suffix,
+    hindi:hindi + suffix
+  };
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Original text storage.
+ *
+ * WeakMap is used so the original DOM text node is kept
+ * without adding data attributes to the actual page.
+ * ---------------------------------------------------------
+ */
+const languageTextNodes = new WeakMap();
+
+
+/*
+ * Store original bilingual text for a text node.
+ */
+function rememberLanguageTextNode(node){
+
+  if(!node || node.nodeType!==Node.TEXT_NODE){
+    return;
+  }
+
+  if(languageTextNodes.has(node)){
+    return;
+  }
+
+  const text=node.nodeValue || "";
+
+  if(!text.trim()){
+    return;
+  }
+
+  const parsed=parseBilingualText(text);
+
+  if(!parsed){
+    return;
+  }
+
+  languageTextNodes.set(node,text);
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Protect actual data.
+ *
+ * These fields contain consumer/master values and must
+ * NEVER be language translated.
+ * ---------------------------------------------------------
+ */
+function isConsumerDataElement(el){
+
+  if(!el) return true;
+
+  if(
+    el.matches(
+      "#loggedUserName," +
+      "#dAcct,#dSdoCode,#dName,#dFather,#dAddress," +
+      "#dFeededVillage,#dSupply,#dLoad,#dConnectionStatus," +
+      "#dMeterNo,#dCurrentReading,#dOutstanding," +
+      "#dLastPayDate,#dLastPayAmount," +
+
+      "#dcAcct,#dcSdoCode,#dcName,#dcFather,#dcAddress," +
+      "#dcFeededVillage,#dcSupply,#dcLoad,#dcMeterNo," +
+      "#dcOutstanding,#dcLastPayDate,#dcLastPayAmount," +
+
+      "#rcAcct,#rcSdoCode,#rcName,#rcFather,#rcAddress," +
+      "#rcFeededVillage,#rcSupply,#rcLoad,#rcMeterNo," +
+      "#rcOutstanding,#rcLastPayDate,#rcLastPayAmount," +
+
+      "#phoneAcct,#phoneSdoCode,#phoneName,#phoneFather," +
+      "#phoneAddress,#phoneFeededVillage,#phoneSupply," +
+      "#phoneLoad,#phoneOutstanding,#phoneLastPayDate," +
+      "#phoneLastPayAmount"
+    )
+  ){
+    return true;
+  }
+
+  /*
+   * Also respect explicit protection attributes if
+   * they are used elsewhere in the app.
+   */
+  if(
+    el.matches(
+      "[data-consumer-data],[data-master-data]"
+    )
+  ){
+    return true;
+  }
+
+  return false;
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Discover bilingual text nodes.
+ *
+ * Unlike the old version, this does NOT skip a button just
+ * because the button contains <small>.
+ * ---------------------------------------------------------
+ */
+function prepareLanguageTextNodes(){
+
+  const walker=document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_TEXT,
+    null
+  );
+
+  while(walker.nextNode()){
+
+    const node=walker.currentNode;
+    const parent=node.parentElement;
+
+    if(!parent) continue;
+
+
+    /*
+     * Never process script/style.
+     */
+    if(
+      parent.closest("script,style,noscript")
+    ){
+      continue;
+    }
+
+
+    /*
+     * Never process actual form values.
+     */
+    if(
+      parent.closest(
+        "input,textarea"
+      )
+    ){
+      continue;
+    }
+
+
+    /*
+     * Option text is handled separately.
+     */
+    if(
+      parent.closest("option")
+    ){
+      continue;
+    }
+
+
+    /*
+     * Never process consumer/master values.
+     */
+    if(isConsumerDataElement(parent)){
+      continue;
+    }
+
+
+    rememberLanguageTextNode(node);
+
+  }
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Translate every dropdown automatically.
+ *
+ * IMPORTANT:
+ * option.value is NEVER changed.
+ *
+ * This means all existing save/search logic continues to
+ * receive exactly the same values as before.
+ * ---------------------------------------------------------
+ */
+function applyLanguageToDropdowns(){
+
+  document.querySelectorAll("select").forEach(select=>{
+
+    select.querySelectorAll("option").forEach(option=>{
+
+      /*
+       * Store original option text once.
+       */
+      if(
+        option.dataset.languageOriginal===undefined
+      ){
+
+        option.dataset.languageOriginal=
+          option.textContent || "";
+
+      }
+
+
+      const original=
+        option.dataset.languageOriginal;
+
+      /*
+       * Special response dropdowns already have
+       * explicit translations.
+       */
+      let parsed=parseBilingualText(original);
+
+
+      /*
+       * If the option is already Hindi-only, don't try
+       * to reverse-engineer it.
+       *
+       * The two response dropdowns are handled by their
+       * values below.
+       */
+      if(parsed){
+
+        option.textContent=
+          currentLanguage==="hi"
+            ? parsed.hindi
+            : parsed.english;
+
+      }
+
+    });
+
+  });
+
+
+  /*
+   * Explicit response dropdowns.
+   *
+   * Their VALUE fields remain untouched.
+   */
+  applySpecialResponseDropdowns();
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Special response dropdowns.
+ * ---------------------------------------------------------
+ */
+function applySpecialResponseDropdowns(){
+
+  const consumerPaymentResponse=$(
+    "consumerPaymentResponse"
+  );
+
+  if(consumerPaymentResponse){
+
+    const map={
+
+      "":{
+        en:"Select",
+        hi:"चुनें"
+      },
+
+      "कुछ दिन बाद जमा करेंगे":{
+        en:"1 - कुछ दिन बाद जमा करेंगे (दिनांक लिखें)",
+        hi:"1 - कुछ दिन बाद जमा करेंगे (दिनांक लिखें)"
+      },
+
+      "जमा नहीं करेंगे":{
+        en:"2 - जमा नहीं करेंगे",
+        hi:"2 - जमा नहीं करेंगे"
+      },
+
+      "बिल गलत है":{
+        en:"3 - बिल गलत है",
+        hi:"3 - बिल गलत है"
+      },
+
+      "बिल जमा है":{
+        en:"4 - बिल जमा है",
+        hi:"4 - बिल जमा है"
+      },
+
+      "JE/SDO से बात करेंगे":{
+        en:"5 - JE/SDO से बात करेंगे",
+        hi:"5 - JE/SDO से बात करेंगे"
+      },
+
+      "कार्यालय आएंगे":{
+        en:"6 - कार्यालय आएंगे",
+        hi:"6 - कार्यालय आएंगे"
+      },
+
+      "पीडी (PD) कराना है":{
+        en:"7 - पीडी (PD) कराना है",
+        hi:"7 - पीडी (PD) कराना है"
+      },
+
+      "घर पर बात करेंगे":{
+        en:"8 - घर पर बात करेंगे",
+        hi:"8 - घर पर बात करेंगे"
+      },
+
+      "घर पर ताला लगा है":{
+        en:"9 - घर पर ताला लगा है (उपभोक्ता से फोन पर बात नहीं हो पा रही है)",
+        hi:"9 - घर पर ताला लगा है (उपभोक्ता से फोन पर बात नहीं हो पा रही है)"
+      },
+
+      "घर पर केवल महिला है":{
+        en:"10 - घर पर केवल महिला है (पुरुष से फोन पर बात नहीं हो पा रही है)",
+        hi:"10 - घर पर केवल महिला है (पुरुष से फोन पर बात नहीं हो पा रही है)"
+      },
+
+      "अन्य":{
+        en:"11 - Other",
+        hi:"11 - अन्य"
+      }
+
+    };
+
+
+    consumerPaymentResponse
+      .querySelectorAll("option")
+      .forEach(option=>{
+
+        const item=map[option.value];
+
+        if(!item) return;
+
+        option.textContent=
+          currentLanguage==="hi"
+            ? item.hi
+            : item.en;
+
+      });
+
+  }
+
+
+  const phoneResponse=$("phoneResponse");
+
+  if(phoneResponse){
+
+    const map={
+
+      "":{
+        en:"Select",
+        hi:"चुनें"
+      },
+
+      "गलत नंबर":{
+        en:"1 - गलत नंबर",
+        hi:"1 - गलत नंबर"
+      },
+
+      "कॉल रिसीव नहीं कर रहे":{
+        en:"2 - कॉल रिसीव नहीं कर रहे",
+        hi:"2 - कॉल रिसीव नहीं कर रहे"
+      },
+
+      "कुछ दिन बाद जमा करेंगे":{
+        en:"3 - कुछ दिन बाद जमा करेंगे (दिनांक लिखें)",
+        hi:"3 - कुछ दिन बाद जमा करेंगे (दिनांक लिखें)"
+      },
+
+      "जमा नहीं करेंगे":{
+        en:"4 - जमा नहीं करेंगे",
+        hi:"4 - जमा नहीं करेंगे"
+      },
+
+      "बिल गलत है":{
+        en:"5 - बिल गलत है",
+        hi:"5 - बिल गलत है"
+      },
+
+      "घर पर बात करेंगे":{
+        en:"6 - घर पर बात करेंगे",
+        hi:"6 - घर पर बात करेंगे"
+      },
+
+      "JE/SDO से बात करेंगे":{
+        en:"7 - JE/SDO से बात करेंगे",
+        hi:"7 - JE/SDO से बात करेंगे"
+      },
+
+      "डबल कनेक्शन है":{
+        en:"8 - डबल कनेक्शन है",
+        hi:"8 - डबल कनेक्शन है"
+      },
+
+      "PD होना है":{
+        en:"9 - PD होना है",
+        hi:"9 - PD होना है"
+      },
+
+      "बिल जमा है":{
+        en:"10 - बिल जमा है",
+        hi:"10 - बिल जमा है"
+      },
+
+      "कार्यालय आएंगे":{
+        en:"11 - कार्यालय आएंग",
+        hi:"11 - कार्यालय आएंगे"
+      },
+
+      "नंबर स्विच ऑफ है":{
+        en:"12 - नंबर स्विच ऑफ है",
+        hi:"12 - नंबर स्विच ऑफ है"
+      },
+
+      "नंबर नॉट रीचेबल है":{
+        en:"13 - नंबर नॉट रीचेबल है",
+        hi:"13 - नंबर नॉट रीचेबल है"
+      },
+
+      "इनकमिंग कॉल उपलब्ध नहीं है":{
+        en:"14 - इनकमिंग कॉल उपलब्ध नहीं है (रिचार्ज नहीं है)",
+        hi:"14 - इनकमिंग कॉल उपलब्ध नहीं है (रिचार्ज नहीं है)"
+      },
+
+      "अमान्य नंबर":{
+        en:"15 - अमान्य नंबर",
+        hi:"15 - अमान्य नंबर"
+      },
+
+      "अन्य":{
+        en:"16 - Other",
+        hi:"16 - अन्य"
+      }
+
+    };
+
+
+    phoneResponse
+      .querySelectorAll("option")
+      .forEach(option=>{
+
+        const item=map[option.value];
+
+        if(!item) return;
+
+        option.textContent=
+          currentLanguage==="hi"
+            ? item.hi
+            : item.en;
+
+      });
+
+  }
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Apply language to placeholders.
+ * ---------------------------------------------------------
+ */
+function applyLanguageToPlaceholders(){
+
+  document.querySelectorAll(
+    "input[placeholder],textarea[placeholder]"
+  ).forEach(el=>{
+
+    if(
+      el.dataset.languagePlaceholderOriginal===undefined
+    ){
+
+      el.dataset.languagePlaceholderOriginal=
+        el.getAttribute("placeholder") || "";
+
+    }
+
+
+    const original=
+      el.dataset.languagePlaceholderOriginal;
+
+    const parsed=parseBilingualText(original);
+
+    if(!parsed) return;
+
+
+    el.setAttribute(
+      "placeholder",
+      currentLanguage==="hi"
+        ? parsed.hindi
+        : parsed.english
+    );
+
+  });
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Main language application.
+ * ---------------------------------------------------------
+ */
+function applyLanguage(){
+
+  /*
+   * Discover any UI text which has been added since the
+   * previous call.
+   */
+  prepareLanguageTextNodes();
+
+
+  /*
+   * Translate remembered individual text nodes.
+   *
+   * This is deliberately TEXT-NODE based rather than
+   * element.textContent based.
+   *
+   * Therefore buttons containing <small> remain intact.
+   */
+  languageTextNodesCleanup();
+
+
+  /*
+   * Dropdowns.
+   */
+  applyLanguageToDropdowns();
+
+
+  /*
+   * Placeholders.
+   */
+  applyLanguageToPlaceholders();
+  updateExistingSearchPlaceholder();
+  updateModuleSearchPlaceholder("disconnectSearchType","disconnectAccountId");
+  updateModuleSearchPlaceholder("recheckSearchType","recheckAccountId");
+
+
+  /*
+   * Language button.
+   */
+  const btn=$("languageSwitchBtn");
+
+  if(btn){
+
+    btn.textContent=
+      currentLanguage==="en"
+        ? "हिंदी"
+        : "English";
+
+    btn.title=
+      currentLanguage==="en"
+        ? "हिंदी में बदलें"
+        : "Switch to English";
+
+  }
+
+
+  /*
+   * Language label.
+   */
+  const label=$("languageSwitchLabel");
+
+  if(label){
+
+    label.textContent=
+      currentLanguage==="en"
+        ? "Language:"
+        : "भाषा:";
+
+  }
+
+
+  document.documentElement.lang=
+    currentLanguage==="hi"
+      ? "hi"
+      : "en";
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Apply translation to remembered text nodes.
+ * ---------------------------------------------------------
+ */
+function languageTextNodesCleanup(){
+
+  /*
+   * WeakMap cannot be iterated directly.
+   *
+   * Re-scan the DOM and use the stored original text for
+   * each node.
+   */
+  const walker=document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_TEXT,
+    null
+  );
+
+  while(walker.nextNode()){
+
+    const node=walker.currentNode;
+
+    const original=
+      languageTextNodes.get(node);
+
+    if(!original) continue;
+
+    const parent=node.parentElement;
+
+    if(!parent) continue;
+
+
+    /*
+     * Safety exclusions.
+     */
+    if(
+      parent.closest("script,style,noscript,input,textarea,option")
+    ){
+      continue;
+    }
+
+    if(isConsumerDataElement(parent)){
+      continue;
+    }
+
+
+    const parsed=parseBilingualText(original);
+
+    if(!parsed) continue;
+
+
+    node.nodeValue=
+      currentLanguage==="hi"
+        ? parsed.hindi
+        : parsed.english;
+
+  }
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Toggle language.
+ * ---------------------------------------------------------
+ */
+function toggleLanguage(){
+
+  currentLanguage=
+    currentLanguage==="en"
+      ? "hi"
+      : "en";
+
+
+  localStorage.setItem(
+    LANGUAGE_STORAGE_KEY,
+    currentLanguage
+  );
+
+
+  applyLanguage();
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Initialize.
+ * ---------------------------------------------------------
+ */
+function initLanguageSwitch(){
+
+  prepareLanguageTextNodes();
+
+
+  const btn=$("languageSwitchBtn");
+
+  if(btn){
+
+    btn.onclick=toggleLanguage;
+
+  }
+
+
+  applyLanguage();
+
+}
+
+function setStatus(id, text, cls="") {
+  $(id).textContent = text;
+  $(id).className = "status " + cls;
+}
+
+async function serverPost(action, extra={}) {
+
+  const response =
+    await fetch(SERVER_URL, {
+      method:"POST",
+
+      headers:{
+        "Content-Type":
+          "text/plain;charset=utf-8"
+      },
+
+      body:JSON.stringify(
+        Object.assign(
+          {
+            action:action,
+            token:state.sessionToken
+          },
+          extra
+        )
+      )
+    });
+
+  const contentType =
+    response.headers.get(
+      "content-type"
+    ) || "";
+
+  const raw =
+    await response.text();
+
+
+  let parsed;
+
+  try {
+
+    parsed = JSON.parse(raw);
+
+
+  } catch (err) {
+
+    const preview =
+      String(raw || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 300);
+
+    throw new Error(
+      `Server returned a non-JSON response for "${action}". ` +
+      `HTTP ${response.status}` +
+      `${response.statusText ? " " + response.statusText : ""}. ` +
+      `Content-Type: ${contentType || "unknown"}. ` +
+
+
+      `Response: ${preview}`
+    );
+
+  }
+
+  /*
+   * Google sometimes delivers an app request as GET (doGet).
+   * That reply is never a real answer: treat it as a delivery
+   * failure (retried where the caller retries).
+   */
+  if (parsed && parsed.code === "GET_NOT_SUPPORTED") {
+    throw new Error(
+      `Server did not receive "${action}" correctly. Please try again.`
+    );
+  }
+
+  return parsed;
+
+}
+
+
+
+
+const MAIN_VIEW_IDS = [
+  "surveyTypeCard",
+  "existingSearchCard",
+  "consumerCard",
+  "entryCard",
+  "newSurveyCard",
+  "myCollectionCard",
+  "uploadCard",
+  "masterUpdateCard",
+  "dashboardCard",
+  "correctionCard",
+  "activitySearchCard",
+  "accountActivityModuleCard",
+  "phoneCallingModuleCard",
+  "disconnectionCard",
+  "fieldWorkModulesCard",
+  "adminCard",
+  "phoneCallingCard",
+  "recheckCard",
+  "masterListsModuleCard",
+  "defaulterListCard",
+  "disconnectedUnpaidCard"
+];
+
+
+function showMainView(view) {
+  MAIN_VIEW_IDS.forEach(id => {
+    const el=$(id);
+    if (el) el.classList.add("hidden");
+  });
+
+  if (view === "home") {
+
+    ["surveyTypeCard","fieldWorkModulesCard","consumerLookupModuleCard","accountActivityModuleCard","progressModuleCard","masterListsModuleCard","phoneCallingModuleCard","myCollectionCard","uploadCard","masterUpdateCard"].forEach(id => {
+
+      const el=$(id);
+      if (el) el.classList.remove("hidden");
+    });
+  } else if (view) {
+    const el=$(view);
+    if (el) el.classList.remove("hidden");
+  }
+}
+
+function showApp() {
+  $("loginCard").classList.add("hidden");
+  $("appContent").classList.remove("hidden");
+  $("loggedUserName").textContent = state.userName || state.userId;
+
+  const showAdmin = state.isAdmin === true || state.userId.toLowerCase() === "admin";
+  $("dashboardBtn").classList.remove("hidden");
+  /* v20.18: get the dashboard substation list ready before the dashboard is opened */
+  setTimeout(() => { if (state.sessionToken && navigator.onLine !== false) loadDashboardFilters(); }, 4000);
+  if (showAdmin) {
+    $("adminBtn").classList.remove("hidden");
+  } else {
+    $("adminBtn").classList.add("hidden");
+    $("adminCard").classList.add("hidden");
+    $("correctionCard").classList.add("hidden");
+  }
+}
+
+function showLogin() {
+  $("loginCard").classList.remove("hidden");
+  $("appContent").classList.add("hidden");
+  $("loginPassword").value = "";
+}
+
+async function checkAuth() {
+  const response = await fetch(SERVER_URL, {
+    method: "POST",
+    headers: {"Content-Type":"text/plain;charset=utf-8"},
+    body: JSON.stringify({
+      action:"check_auth",
+      token:state.sessionToken
+    })
+  });
+  return await response.json();
+}
+
+
+async function serverLogin(userId, password) {
+
+  /*
+   * Retries only delivery failures (network error or Google's
+   * HTML error page). A real answer such as "Invalid User ID
+   * or Password" is returned immediately.
+   * Safe to retry: the backend reuses the user's existing token.
+   */
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+
+    try {
+
+      const response = await fetch(SERVER_URL, {
+        method: "POST",
+        headers: {"Content-Type": "text/plain;charset=utf-8"},
+        body: JSON.stringify({action:"login", user_id:userId, password:password})
+      });
+      const result = await response.json();
+
+      /* Google delivered the request as GET: not a real answer. */
+      if (result && result.code === "GET_NOT_SUPPORTED") {
+        throw new Error("Login request was not delivered correctly.");
+      }
+
+      return result;
+
+    } catch (err) {
+
+      console.error(`login attempt ${attempt} failed`, err);
+
+      if (attempt === maxAttempts) {
+        throw err;
+      }
+
+      setStatus(
+        "loginStatus",
+        `Server busy, retrying ${attempt + 1} of ${maxAttempts}…`
+      );
+
+      await new Promise(
+        resolve => setTimeout(resolve, 3000 * attempt)
+      );
+
+    }
+
+  }
+
+}
+
+
+let loginInProgress = false;
+
+async function login() {
+  if (loginInProgress) return;
+  loginInProgress = true;
+  try {
+    await loginOnce();
+  } finally {
+    loginInProgress = false;
+  }
+}
+
+async function loginOnce() {
+  const userId = $("loginUserId").value.trim();
+  const password = $("loginPassword").value;
+
+  if (!userId || !password) {
+    return setStatus("loginStatus", "Enter User ID and Password.", "error");
+  }
+
+  setStatus("loginStatus", "Checking login...");
+  try {
+    const result = await serverLogin(userId, password);
+
+    if (!result.success) return setStatus("loginStatus", result.message || "Invalid login.", "error");
+
+    /* Never accept a "success" without a real token and user. */
+    if (!result.token || !result.user_id) {
+      return setStatus("loginStatus", "Login failed. Please try again.", "error");
+    }
+
+
+    state.sessionToken = result.token;
+    state.userId = result.user_id;
+    state.userName = result.user_name;
+    state.isAdmin = !!result.is_admin;
+    state.division = result.division || "";
+    state.subdivision = result.subdivision || "";
+    state.substation = result.substation || "";
+    state.role = result.role || "";
+
+    localStorage.setItem("consumerMobileIsAdmin", state.isAdmin ? "YES" : "NO");
+    localStorage.setItem("consumerMobileDivision", state.division);
+    localStorage.setItem("consumerMobileSubdivision", state.subdivision);
+    localStorage.setItem("consumerMobileSubstation", state.substation);
+    localStorage.setItem("consumerMobileRole", state.role);
+
+    localStorage.setItem("consumerMobileAuthToken", state.sessionToken);
+
+
+    localStorage.setItem("consumerMobileUserId", state.userId);
+    localStorage.setItem("consumerMobileUserName", state.userName);
+
+    showApp();
+    setMasterGate(!state.masterReady);
+    setStatus("loginStatus", "");
+    /*
+     * Villages for this user: show the saved list, and load it
+     * from the server automatically only if this phone has none.
+     */
+    renderSavedVillageList();
+    ensureVillageList();
+
+    /* Master download starts only after permissions are allowed,
+       so the heavy master import never freezes the permission card. */
+    ensureDevicePermissions().then(() => startMasterSetup());
+
+
+  } catch (e) {
+    setStatus("loginStatus", "Login failed. Check internet connection.", "error");
+  }
+}
+
+function logout() {
+  localStorage.removeItem("consumerMobileAuthToken");
+  localStorage.removeItem("consumerMobileUserId");
+  localStorage.removeItem("consumerMobileUserName");
+  localStorage.removeItem("consumerMobileIsAdmin");
+  localStorage.removeItem("consumerMobileDivision");
+  localStorage.removeItem("consumerMobileSubdivision");
+  localStorage.removeItem("consumerMobileSubstation");
+  localStorage.removeItem("consumerMobileRole");
+
+  state.sessionToken = "";
+  state.userId = "";
+  state.userName = "";
+  state.division = "";
+  state.subdivision = "";
+  state.substation = "";
+  state.role = "";
+
+  showLogin();
+}
+
+/*
+ * =========================================================
+ * VILLAGE LIST (per user, from Village Master sheet)
+ * =========================================================
+ * - Saved on the phone per user (localStorage).
+ * - Loaded from the server automatically ONLY when this
+ *   phone has no saved list for the user (first login).
+ * - Later updates: "CHECK FOR VILLAGE LIST UPDATE" button.
+ * - A failed check never removes the saved list.
+ */
+const VILLAGE_LIST_KEY_PREFIX = "fieldworkVillageList:";
+
+/* Old single list from village.json (used only until the
+   first successful load for this user). */
+const LEGACY_VILLAGE_KEY = "kuthondVillageDataV2";
+
+let villageCheckRunning = false;
+
+function villageListStorageKey() {
+  return VILLAGE_LIST_KEY_PREFIX +
+    String(state.userId || "").trim().toLowerCase();
+}
+
+function getSavedVillageList() {
+
+  if (!state.userId) return null;
+
+  try {
+    const raw = localStorage.getItem(villageListStorageKey());
+    if (!raw) return null;
+
+    const data = JSON.parse(raw);
+
+    return data && Array.isArray(data.villages)
+      ? data
+      : null;
+
+  } catch (e) {
+    return null;
+  }
+
+}
+
+function getLegacyVillageList() {
+
+  try {
+    const data = JSON.parse(
+      localStorage.getItem(LEGACY_VILLAGE_KEY) || "null"
+    );
+
+    return Array.isArray(data) ? data : null;
+
+  } catch (e) {
+    return null;
+  }
+
+}
+
+function saveVillageList(result) {
+
+
+
+  const data = {
+    version: String(result.version || ""),
+    villages: result.villages,
+    feeders: Array.isArray(result.feeders) ? result.feeders : [],
+    checked_at: new Date().toISOString()
+  };
+
+  try {
+    localStorage.setItem(
+      villageListStorageKey(),
+      JSON.stringify(data)
+    );
+  } catch (e) {
+    console.error("Could not save village list", e);
+  }
+
+  return data;
+
+}
+
+/*
+ * =========================================================
+ * FEEDER / DT DROPDOWNS (survey forms)
+ * =========================================================
+ * Feeder option value = "SUBSTATION||FEEDER" (feeder names
+ * are unique only within a substation). Options are grouped
+ * by substation. Brackets in names are shown as [ ] so the
+ * language switch never treats them as a Hindi part.
+ */
+
+
+const FEEDER_DT_PAIRS = [["feeder", "dt"], ["newFeeder", "newDt"], ["activityCorrFeeder", "activityCorrDt"]];
+
+/* "Not known" choices: feeder value parses to substation "", feeder "NOT KNOWN". */
+const FEEDER_NOT_KNOWN_VALUE = "||NOT KNOWN";
+const DT_NOT_KNOWN_VALUE = "NOT KNOWN";
+const NOT_KNOWN_TEXT = "NOT KNOWN / ज्ञात नहीं";
+
+function referenceDisplayText(text) {
+  return String(text || "").replace(/\(/g, "[").replace(/\)/g, "]");
+}
+
+function parseFeederValue(value) {
+  const parts = String(value || "").split("||");
+  return {
+    substation: parts.length > 1 ? parts[0] : "",
+    feeder: parts.length > 1 ? parts[1] : ""
+  };
+}
+
+function fillDtDropdown(dtId, feederId) {
+
+  const dtSelect = $(dtId);
+  const feederSelect = $(feederId);
+  if (!dtSelect || !feederSelect) return;
+
+  const selectedValue = dtSelect.value;
+  const firstOption = dtSelect.options[0];
+
+  dtSelect.innerHTML = "";
+
+
+  if (firstOption) dtSelect.appendChild(firstOption);
+
+  /* Once a feeder is chosen, DT can always be "not known". */
+  if (feederSelect.value) {
+    const notKnown = document.createElement("option");
+    notKnown.value = DT_NOT_KNOWN_VALUE;
+    notKnown.textContent = NOT_KNOWN_TEXT;
+    dtSelect.appendChild(notKnown);
+  }
+
+  const chosen = parseFeederValue(feederSelect.value);
+
+  const entry = getSavedFeeders().find(f =>
+    String(f.substation || "") === chosen.substation &&
+    String(f.feeder || "") === chosen.feeder
+  );
+
+  for (const dt of (entry && Array.isArray(entry.dts) ? entry.dts : [])) {
+    const option = document.createElement("option");
+    option.value = dt;
+    option.textContent = referenceDisplayText(dt);
+    dtSelect.appendChild(option);
+  }
+
+  if (
+    selectedValue &&
+    Array.from(dtSelect.options).some(o => o.value === selectedValue)
+  ) {
+    dtSelect.value = selectedValue;
+  }
+
+}
+
+function fillFeederDropdowns(feeders) {
+
+  for (const [feederId, dtId] of FEEDER_DT_PAIRS) {
+
+    const select = $(feederId);
+    if (!select) continue;
+
+    const selectedValue = select.value;
+    const firstOption = select.options[0];
+
+    select.innerHTML = "";
+
+    if (firstOption) select.appendChild(firstOption);
+
+    const notKnown = document.createElement("option");
+    notKnown.value = FEEDER_NOT_KNOWN_VALUE;
+    notKnown.textContent = NOT_KNOWN_TEXT;
+    select.appendChild(notKnown);
+
+    const groups = new Map();
+
+    for (const f of (feeders || [])) {
+      const substation = String(f.substation || "");
+      if (!groups.has(substation)) groups.set(substation, []);
+      groups.get(substation).push(f);
+    }
+
+    for (const [substation, list] of groups) {
+
+      let parent = select;
+
+      if (substation) {
+        parent = document.createElement("optgroup");
+        parent.label = referenceDisplayText(substation);
+        select.appendChild(parent);
+      }
+
+      for (const f of list) {
+        const option = document.createElement("option");
+        option.value = substation + "||" + f.feeder;
+        option.textContent = referenceDisplayText(f.feeder);
+        parent.appendChild(option);
+      }
+    }
+
+    if (
+      selectedValue &&
+      Array.from(select.options).some(o => o.value === selectedValue)
+    ) {
+      select.value = selectedValue;
+    }
+
+    fillDtDropdown(dtId, feederId);
+  }
+
+}
+
+/* Optional numeric field: empty, or a plain number. */
+function isValidOptionalNumber(value) {
+  return value === "" || /^\d+(\.\d+)?$/.test(value);
+}
+
+function feederDisplay(record) {
+  return record.feeder_substation
+    ? record.feeder_substation + " / " + record.feeder
+    : (record.feeder || "—");
+}
+
+
+
+
+/*
+ * Fills the 5 village dropdowns. Same options as before
+ * (first option kept, "Not in the list" for survey village,
+ * sorted by label). A value already selected in an open
+ * form is kept if it still exists in the new list.
+ */
+function fillVillageDropdowns(villages) {
+
+  const normalizedVillages = (villages || [])
+    .map(v => {
+
+      if (typeof v === "string") {
+        return {
+          value: v,
+          label: v
+        };
+      }
+
+      return {
+        value: String(v.value ?? v.name ?? "").trim(),
+        label: String(v.label ?? v.name ?? v.value ?? "").trim()
+      };
+    })
+    .filter(v => v.value && v.label)
+    .sort((a,b) =>
+      a.label.localeCompare(
+        b.label,
+        undefined,
+        {sensitivity:"base"}
+      )
+    );
+
+  for (const selectId of ["village", "newVillage", "villageFilter","disconnectVillageFilter","recheckVillageFilter"]) {
+
+    const villageSelect = $(selectId);
+
+    if (!villageSelect) continue;
+
+    const selectedValue = villageSelect.value;
+
+    // Keep existing first option
+    const firstOption = villageSelect.options[0];
+
+    villageSelect.innerHTML = "";
+
+    if (firstOption) {
+      villageSelect.appendChild(firstOption);
+    }
+    if (selectId === "village") {
+       const notInListOption = document.createElement("option");
+       notInListOption.value = "NOT_IN_LIST";
+       notInListOption.textContent = "Not in the list (सूची में नहीं)";
+       villageSelect.appendChild(notInListOption);
+    }
+
+    for (const village of normalizedVillages) {
+
+      const option =
+        document.createElement("option");
+
+      option.value = village.value;
+      option.textContent = village.label;
+
+      villageSelect.appendChild(option);
+    }
+
+    if (
+      selectedValue &&
+      Array.from(villageSelect.options).some(o => o.value === selectedValue)
+    ) {
+
+
+      villageSelect.value = selectedValue;
+    }
+  }
+
+  /* Feeder / DT dropdowns use the same saved reference data. */
+  fillFeederDropdowns(getSavedFeeders());
+
+}
+
+
+/*
+ * Feeders + DTs saved with the village list (reference data).
+ * Returns [] until the first successful load.
+ * Used by the survey form (Phase B).
+ */
+function getSavedFeeders() {
+
+  const saved = getSavedVillageList();
+
+  return saved && Array.isArray(saved.feeders)
+    ? saved.feeders
+    : [];
+
+}
+
+function updateVillageListInfo() {
+
+  const info = $("villageListInfo");
+  if (!info) return;
+
+  const saved = getSavedVillageList();
+
+  if (saved && Array.isArray(saved.feeders)) {
+    const dtCount = saved.feeders.reduce(
+      (n, f) => n + (Array.isArray(f.dts) ? f.dts.length : 0),
+      0
+    );
+    info.textContent =
+      `Villages: ${saved.villages.length} · Feeders: ${saved.feeders.length} · DTs: ${dtCount} · Last checked: ${formatMasterDate(saved.checked_at)}`;
+  } else if (saved || getLegacyVillageList()) {
+    info.textContent =
+      "Using the previously saved village list. Tap the button below to load the latest village, feeder and DT lists.";
+  } else {
+    info.textContent =
+      "Village, feeder and DT lists are not loaded yet. Tap the button below to load them.";
+  }
+
+}
+
+/*
+ * Shows the list saved on this phone. No network.
+ */
+function renderSavedVillageList() {
+
+  const saved = getSavedVillageList();
+
+  fillVillageDropdowns(
+    saved
+      ? saved.villages
+      : (getLegacyVillageList() || [])
+  );
+
+  updateVillageListInfo();
+
+}
+
+/*
+ * reference_data (villages + feeders + DTs) is read-only,
+ * so it is safe to retry. Same retry rules as master_check.
+ */
+async function fetchVillageListFromServer() {
+
+  const maxAttempts = 3;
+
+  let result = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+
+    try {
+
+      result = await serverPost("reference_data");
+      break;
+
+    } catch (err) {
+
+      console.error(`reference_data attempt ${attempt} failed`, err);
+
+      if (attempt === maxAttempts) {
+        throw new Error(
+          "Could not reach the server to load the village, feeder and DT lists. " +
+          "Please check your internet connection and try again."
+        );
+      }
+
+      await new Promise(
+        resolve => setTimeout(resolve, 3000 * attempt)
+      );
+
+    }
+
+  }
+
+  if (!result.success) {
+    throw new Error(
+      result.message || "Could not load the village, feeder and DT lists."
+    );
+  }
+
+  if (!Array.isArray(result.villages) || !Array.isArray(result.feeders)) {
+    throw new Error("Lists received from the server are invalid.");
+  }
+
+  return result;
+
+}
+
+/*
+ * Button: CHECK AND UPDATE (villages, feeders, DTs)
+ * (also used once automatically on first login).
+ */
+async function checkVillageListUpdate(auto = false) {
+
+  if (villageCheckRunning) return;
+  if (!state.sessionToken) return;
+
+  villageCheckRunning = true;
+
+  const button = $("checkVillageListBtn");
+  if (button) button.disabled = true;
+
+  const hasStatus = !!$("villageListStatus");
+  const userAtStart = state.userId;
+
+  if (hasStatus) {
+    setStatus(
+      "villageListStatus",
+      auto
+        ? "Loading village, feeder and DT lists…"
+        : "Checking village, feeder and DT lists…"
+    );
+  }
+
+  try {
+
+    const result = await fetchVillageListFromServer();
+
+    /* User logged out / changed while checking: ignore. */
+    if (state.userId !== userAtStart) return;
+
+    const saved = getSavedVillageList();
+    const unchanged =
+      saved && saved.version === String(result.version || "");
+
+    saveVillageList(result);
+    saveVideoSettings(result.video_settings);
+
+    if (!unchanged) {
+      fillVillageDropdowns(result.villages);
+    }
+
+    updateVillageListInfo();
+
+    const counts =
+      `${result.villages.length} villages, ${result.feeders.length} feeders`;
+
+    if (hasStatus) {
+      setStatus(
+        "villageListStatus",
+        unchanged
+          ? `Lists are up to date. ${counts}.`
+          : `Lists updated. ${counts} are now available.`,
+        "ok"
+      );
+    }
+
+  } catch (e) {
+
+    console.error(e);
+
+    if (state.userId !== userAtStart) return;
+
+    if (hasStatus) {
+      setStatus(
+        "villageListStatus",
+        (getSavedVillageList()
+          ? "The saved lists are still in use. "
+          : "") +
+        (e.message || "Could not load the village, feeder and DT lists."),
+        "error"
+      );
+    }
+
+  } finally {
+
+    villageCheckRunning = false;
+    if (button) button.disabled = false;
+
+  }
+
+}
+
+/*
+ * Load automatically when this phone has no saved lists for
+ * this user, or only an older village-only list (no feeders).
+ */
+function ensureVillageList() {
+
+  const saved = getSavedVillageList();
+
+  if (!state.sessionToken || (saved && Array.isArray(saved.feeders))) return;
+
+  checkVillageListUpdate(true);
+
+}
+
+
+/*
+ * =========================================================
+ * DEVICE PERMISSIONS (location + camera + microphone)
+ * =========================================================
+ * Required according to the hardware this device has:
+ * location always; camera / microphone only if present.
+ * The app is blocked by the permission gate until all
+ * required permissions are granted. Checked after login and
+ * at every start. The browser prompts only after a tap.
+ */
+
+let permissionRequestRunning = false;
+
+/* Callers waiting for the permission gate to close (e.g. master setup). */
+let permissionWaiters = [];
+
+function releasePermissionWaiters() {
+  const waiters = permissionWaiters;
+  permissionWaiters = [];
+  waiters.forEach(resolve => resolve());
+}
+
+async function detectMediaHardware() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      return { camera: false, microphone: false };
+    }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const camera = devices.some(d => d.kind === "videoinput");
+    return {
+      camera: camera,
+      /* Some phones list the microphone only after it is allowed. */
+      microphone: camera || devices.some(d => d.kind === "audioinput")
+    };
+
+  } catch (e) {
+    console.warn("Could not detect camera/microphone", e);
+    return { camera: false, microphone: false };
+  }
+}
+
+async function queryPermissionState(name) {
+  try {
+    if (!navigator.permissions || !navigator.permissions.query) return "unknown";
+    const result = await navigator.permissions.query({ name: name });
+    return result.state;
+  } catch (e) {
+    return "unknown";
+  }
+}
+
+function updateNoCameraNotices() {
+  const noCamera = state.deviceHasCamera === false;
+  ["noCameraNoticeDisconnect", "noCameraNoticeRecheck"].forEach(id => {
+    if ($(id)) $(id).classList.toggle("hidden", !noCamera);
+  });
+}
+
+async function currentPermissionStatus() {
+
+  const hw = await detectMediaHardware();
+
+  state.deviceHasCamera = hw.camera;
+  updateNoCameraNotices();
+
+  const items = [{ key: "geolocation", label: "Location" }];
+  if (hw.camera) items.push({ key: "camera", label: "Camera" });
+  if (hw.microphone) items.push({ key: "microphone", label: "Microphone" });
+
+  for (const item of items) {
+    item.state = await queryPermissionState(item.key);
+
+    /* Browsers without the permissions API: trust this session's grants. */
+    if (item.state === "unknown") {
+      if (item.key === "geolocation" && state.locationPermissionOk) item.state = "granted";
+      if (item.key !== "geolocation" && state.mediaPermissionOk) item.state = "granted";
+    }
+  }
+
+  return {
+    items: items,
+    missing: items.filter(i => i.state !== "granted")
+  };
+}
+
+function renderPermissionGate(status) {
+
+  $("permissionList").innerHTML = status.items.map(i => {
+    const text =
+      i.state === "granted" ? "Allowed" :
+      i.state === "denied" ? "Blocked" :
+      "Not allowed yet";
+    return `<div>${escapeHtml(i.label)}: <b>${text}</b></div>`;
+  }).join("");
+
+  const blocked = status.items.some(i => i.state === "denied");
+  const help = $("permissionHelp");
+
+  if (blocked) {
+    help.textContent =
+      "A permission is blocked, so the phone will not ask again. " +
+      "Installed app: long-press the app icon, open App info, then Permissions, and allow Location, Camera and Microphone. " +
+      "In Chrome: tap the icon left of the address, open Permissions or Site settings, and allow them. " +
+      "Then tap ALLOW PERMISSIONS again.";
+    help.className = "status error";
+  } else {
+    help.textContent = "";
+    help.className = "status";
+  }
+
+}
+
+function showPermissionGate(show) {
+  if ($("permissionGate")) $("permissionGate").classList.toggle("hidden", !show);
+}
+
+/*
+ * After login and at every start. Never prompts by itself.
+ * Resolves when all required permissions are allowed, so the
+ * caller can start the master setup only then.
+ */
+async function ensureDevicePermissions() {
+
+  if (!state.sessionToken || !$("permissionGate")) return;
+
+  const status = await currentPermissionStatus();
+
+  if (!status.missing.length) {
+    showPermissionGate(false);
+    return;
+  }
+
+  renderPermissionGate(status);
+  showPermissionGate(true);
+
+  return new Promise(resolve => permissionWaiters.push(resolve));
+
+}
+
+/* ALLOW PERMISSIONS button: location first, then camera + microphone together. */
+async function requestDevicePermissions() {
+
+  if (permissionRequestRunning) return;
+  permissionRequestRunning = true;
+
+  const button = $("permissionAllowBtn");
+  if (button) button.disabled = true;
+
+  const help = $("permissionHelp");
+  const progress = text => {
+    if (help) { help.textContent = text; help.className = "status"; }
+  };
+
+  /* Refresh the list on the card without closing it. */
+  const refreshList = async () => {
+    const status = await currentPermissionStatus();
+    renderPermissionGate(status);
+    return status;
+  };
+
+  try {
+
+    const hw = await detectMediaHardware();
+
+    /* 1. Location: continue as soon as the user answers the prompt,
+          without waiting for an actual GPS fix. */
+    if ((await queryPermissionState("geolocation")) !== "granted") {
+
+      progress("Step 1: allow Location when the phone asks…");
+
+      await new Promise(resolve => {
+
+        if (!navigator.geolocation) return resolve();
+
+        let done = false;
+        let poll = null;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          if (poll) clearInterval(poll);
+          resolve();
+        };
+
+        navigator.geolocation.getCurrentPosition(
+          () => { state.locationPermissionOk = true; finish(); },
+          err => {
+            /* Timeout / GPS off still means permission was given. */
+            state.locationPermissionOk = err && err.code !== err.PERMISSION_DENIED;
+            finish();
+          },
+          { enableHighAccuracy: false, timeout: 20000, maximumAge: Infinity }
+        );
+
+        /* The answer shows up here immediately after the tap. */
+        if (done) return;
+        poll = setInterval(async () => {
+          const s = await queryPermissionState("geolocation");
+          if (s === "granted" || s === "denied") {
+            state.locationPermissionOk = s === "granted";
+            finish();
+          }
+        }, 400);
+
+      });
+
+      await refreshList();
+    }
+
+    /* 2. Camera + microphone together (one prompt on most phones). */
+    const needMedia =
+      (hw.camera && (await queryPermissionState("camera")) !== "granted") ||
+      (hw.microphone && (await queryPermissionState("microphone")) !== "granted");
+
+    if (needMedia && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+
+      progress("Step 2: allow Camera and Microphone when the phone asks…");
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: hw.camera,
+          audio: hw.microphone
+        });
+        stream.getTracks().forEach(t => t.stop());
+        state.mediaPermissionOk = true;
+      } catch (e) {
+        console.warn("Camera/microphone permission not given", e);
+        state.mediaPermissionOk = false;
+      }
+    }
+
+    const status = await refreshList();
+
+    if (!status.missing.length) {
+      progress("All permissions allowed.");
+      setTimeout(() => {
+        showPermissionGate(false);
+        releasePermissionWaiters();
+      }, 600);
+
+
+    } else {
+      showPermissionGate(true);
+
+      /* Not blocked in the app, but the phone still did not allow it. */
+      if (!status.missing.some(i => i.state === "denied")) {
+        const help = $("permissionHelp");
+        help.textContent =
+          "The phone did not allow " + status.missing.map(i => i.label).join(", ") + ". " +
+          "Check Android Settings, then Apps, then Chrome, then Permissions, and allow Camera, Microphone and Location for Chrome. " +
+          "Also make sure the Camera access and Microphone access switches in the quick settings panel are ON. " +
+          "Then tap ALLOW PERMISSIONS again.";
+        help.className = "status error";
+      }
+    }
+
+
+  } finally {
+
+    permissionRequestRunning = false;
+    if (button) button.disabled = false;
+
+  }
+
+}
+
+
+
+
+
+/*
+ * =========================================================
+ * VIDEO EVIDENCE: RECORDER (Disconnection / Recheck) — C3b
+ * =========================================================
+ * - Recorded inside the app at low quality (~3 MB per minute).
+ * - SAVE VIDEO downloads the clip to the phone's Download
+ *   folder (the user's own copy, fully under their control).
+ * - If the subdivision uploads videos, a hidden copy is kept in
+ *   a separate database ("FieldworkVideos") only until the R2
+ *   upload succeeds (C3c).
+ */
+const VIDEO_DB_NAME = "FieldworkVideos";
+const VIDEO_STORE = "videos";
+const VIDEO_DEFAULT_MAX_SECONDS = 150;
+
+const VIDEO_FORM_IDS = {
+  DISCONNECTION: { info: "disconnectVideoInfo", status: "disconnectSaveStatus", section: "disconnectVideoSection", statusSelect: "disconnectStatus" },
+  RECHECK: { info: "recheckVideoInfo", status: "recheckSaveStatus", section: "recheckVideoSection", statusSelect: "recheckStatus" }
+};
+
+
+const videoRecorder = {
+  type: null, stream: null, recorder: null, chunks: [], timer: null,
+  startedAt: 0, seconds: 0, blob: null, url: null, mimeType: "", cancelled: false,
+  elapsedMs: 0, segmentStart: 0, paused: false
+};
+
+/* Recorded time so far, excluding pauses. */
+function videoElapsedSeconds() {
+  const running = videoRecorder.paused ? 0 : (Date.now() - videoRecorder.segmentStart);
+  return (videoRecorder.elapsedMs + running) / 1000;
+}
+
+/* ---------- video settings (from the backend) ---------- */
+
+function videoSettingsKey() {
+  return "fieldworkVideoSettings:" + String(state.userId || "").trim().toLowerCase();
+}
+
+
+function saveVideoSettings(settings) {
+  if (!settings || !state.userId) return;
+  const before = !!getVideoSettings().video_upload;
+  try {
+    localStorage.setItem(
+      videoSettingsKey(),
+      JSON.stringify(Object.assign({}, settings, { saved_at: new Date().toISOString() }))
+    );
+  } catch (e) {
+    console.warn("Could not save video settings", e);
+  }
+
+  /* Flag changed: old video messages no longer apply. */
+  if (before !== !!settings.video_upload) {
+    if ($("videoUploadStatus")) setStatus("videoUploadStatus", "");
+    refreshVideoUploadInfo();
+  }
+}
+
+function getVideoSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(videoSettingsKey()) || "null");
+    if (s) return s;
+  } catch (e) {}
+  return { video_upload: false, video_max_seconds: VIDEO_DEFAULT_MAX_SECONDS };
+}
+
+function videoMaxSeconds() {
+  const n = Number(getVideoSettings().video_max_seconds);
+  return n > 0 ? n : VIDEO_DEFAULT_MAX_SECONDS;
+}
+
+/* ---------- small helpers ---------- */
+
+function pickVideoMimeType() {
+  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return "";
+  const candidates = [
+    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+    "video/mp4",
+    "video/webm;codecs=vp8,opus",
+    "video/webm"
+  ];
+  return candidates.find(t => MediaRecorder.isTypeSupported(t)) || "";
+}
+
+function videoExtension(mime) {
+  return /mp4/i.test(String(mime || "")) ? "mp4" : "webm";
+}
+
+function formatDuration(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+function videoFileName(type, accountId, date, ext) {
+  const p = n => String(n).padStart(2, "0");
+  const stamp =
+    date.getFullYear() + "-" + p(date.getMonth() + 1) + "-" + p(date.getDate()) + "_" +
+    p(date.getHours()) + "-" + p(date.getMinutes()) + "-" + p(date.getSeconds());
+  const account = String(accountId || "NA").replace(/[^A-Za-z0-9]/g, "") || "NA";
+  return "FW_" + type + "_" + account + "_" + stamp + "." + ext;
+}
+
+function currentActivityConsumer(type) {
+  return type === "DISCONNECTION" ? state.disconnectCurrent : state.recheckCurrent;
+}
+
+function videoRecorderStatus(text, kind) {
+  setStatus("videoRecorderStatus", text, kind || "");
+}
+
+function updateVideoTimer(seconds) {
+  if ($("videoRecorderTimer")) {
+    $("videoRecorderTimer").textContent =
+      formatDuration(seconds) + " / " + formatDuration(videoMaxSeconds());
+  }
+}
+
+function setRecorderButtons(mode) {
+  const show = {
+    videoStartBtn: mode === "ready",
+    videoPauseBtn: mode === "recording",
+    videoResumeBtn: mode === "paused",
+    videoStopBtn: mode === "recording" || mode === "paused",
+    videoPlayBtn: mode === "review",
+    videoSaveBtn: mode === "review",
+    videoRetakeBtn: mode === "review"
+  };
+
+  Object.keys(show).forEach(id => {
+    if ($(id)) $(id).classList.toggle("hidden", !show[id]);
+  });
+}
+
+function stopRecorderStream() {
+  if (videoRecorder.stream) {
+    videoRecorder.stream.getTracks().forEach(t => t.stop());
+    videoRecorder.stream = null;
+  }
+}
+
+/* ---------- form state ---------- */
+
+
+
+function clearActivityVideo(type) {
+  if (!state.activityVideo) state.activityVideo = {};
+  state.activityVideo[type] = null;
+  const ids = VIDEO_FORM_IDS[type];
+  if (ids && $(ids.info)) $(ids.info).textContent = "No video recorded yet.";
+  updateVideoSection(type);
+}
+
+/*
+ * Video part of the form is shown only for statuses that need a
+ * video. For other statuses no video is recorded; a video recorded
+ * before the status was changed is discarded.
+ */
+function updateVideoSection(type) {
+  const ids = VIDEO_FORM_IDS[type];
+  if (!ids) return;
+  const select = $(ids.statusSelect);
+  const required = isVideoRequired(type, select ? select.value : "");
+  if ($(ids.section)) $(ids.section).classList.toggle("hidden", !required);
+  if (!required && getActivityVideo(type)) {
+    state.activityVideo[type] = null;
+    if ($(ids.info)) $(ids.info).textContent = "No video recorded yet.";
+  }
+}
+
+
+function getActivityVideo(type) {
+  return state.activityVideo ? state.activityVideo[type] : null;
+}
+
+function videoSummary(video) {
+  return video.fileName + " · " + formatBytes(video.size) + " · " + formatDuration(video.durationSec);
+}
+
+/* ---------- recorder ---------- */
+
+async function openVideoRecorder(type) {
+
+  const ids = VIDEO_FORM_IDS[type];
+
+  if (state.deviceHasCamera === false) {
+    return setStatus(ids.status, "This device does not have a camera, so this form cannot be submitted.", "error");
+  }
+
+  if (!currentActivityConsumer(type)) {
+    return setStatus(ids.status, "Search an Account ID first.", "error");
+  }
+
+  if (!window.MediaRecorder || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return setStatus(ids.status, "This browser cannot record video.", "error");
+  }
+
+  closeVideoRecorder(false);
+
+  videoRecorder.type = type;
+  videoRecorder.cancelled = false;
+
+  $("videoRecorderModal").classList.remove("hidden");
+  setRecorderButtons("none");
+  updateVideoTimer(0);
+  videoRecorderStatus("Starting camera…");
+
+  try {
+    videoRecorder.stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 20, max: 24 }
+      },
+      audio: true
+    });
+  } catch (e) {
+    console.error(e);
+    videoRecorderStatus("Camera could not start. Check camera and microphone permissions.", "error");
+    return;
+  }
+
+  const preview = $("videoRecorderPreview");
+  preview.removeAttribute("src");
+  preview.autoplay = true;
+  preview.srcObject = videoRecorder.stream;
+  preview.muted = true;
+  preview.controls = false;
+  try { await preview.play(); } catch (e) {}
+
+  setRecorderButtons("ready");
+  videoRecorderStatus("Point the camera and tap START RECORDING.");
+}
+
+function startVideoRecording() {
+
+  if (!videoRecorder.stream) return;
+
+  const mime = pickVideoMimeType();
+  let recorder;
+
+  try {
+    recorder = new MediaRecorder(
+      videoRecorder.stream,
+      Object.assign(
+        { videoBitsPerSecond: 650000, audioBitsPerSecond: 48000 },
+        mime ? { mimeType: mime } : {}
+      )
+    );
+  } catch (e) {
+    recorder = new MediaRecorder(videoRecorder.stream);
+  }
+
+  videoRecorder.recorder = recorder;
+  videoRecorder.mimeType = recorder.mimeType || mime || "video/webm";
+  videoRecorder.chunks = [];
+
+  recorder.ondataavailable = e => {
+    if (e.data && e.data.size) videoRecorder.chunks.push(e.data);
+  };
+  recorder.onstop = finishVideoRecording;
+
+
+
+  recorder.start(1000);
+  videoRecorder.startedAt = Date.now();
+  videoRecorder.elapsedMs = 0;
+  videoRecorder.segmentStart = Date.now();
+  videoRecorder.paused = false;
+
+  setRecorderButtons("recording");
+  videoRecorderStatus("Recording…");
+
+  const max = videoMaxSeconds();
+  videoRecorder.timer = setInterval(() => {
+    const s = videoElapsedSeconds();
+    updateVideoTimer(Math.min(Math.floor(s), max));
+    if (s >= max) stopVideoRecording();
+  }, 250);
+}
+
+function pauseVideoRecording() {
+  const r = videoRecorder.recorder;
+  if (!r || r.state !== "recording" || !r.pause) return;
+  r.pause();
+  videoRecorder.elapsedMs += Date.now() - videoRecorder.segmentStart;
+  videoRecorder.paused = true;
+  setRecorderButtons("paused");
+  videoRecorderStatus("Paused. Tap RESUME to continue, or STOP to finish.");
+}
+
+function resumeVideoRecording() {
+  const r = videoRecorder.recorder;
+  if (!r || r.state !== "paused" || !r.resume) return;
+  r.resume();
+  videoRecorder.segmentStart = Date.now();
+  videoRecorder.paused = false;
+  setRecorderButtons("recording");
+  videoRecorderStatus("Recording…");
+}
+
+function stopVideoRecording() {
+  clearInterval(videoRecorder.timer);
+  videoRecorder.timer = null;
+  if (!videoRecorder.paused) {
+    videoRecorder.elapsedMs += Date.now() - videoRecorder.segmentStart;
+    videoRecorder.paused = true;
+  }
+  const r = videoRecorder.recorder;
+  if (r && r.state !== "inactive") r.stop();
+}
+
+
+
+function finishVideoRecording() {
+
+  clearInterval(videoRecorder.timer);
+  videoRecorder.timer = null;
+  stopRecorderStream();
+
+  if (videoRecorder.cancelled) return;
+
+  videoRecorder.seconds = Math.min(
+    videoMaxSeconds(),
+    Math.max(1, Math.round(videoRecorder.elapsedMs / 1000))
+
+  );
+
+  videoRecorder.blob = new Blob(videoRecorder.chunks, {
+    type: String(videoRecorder.mimeType).split(";")[0]
+  });
+
+  if (videoRecorder.url) URL.revokeObjectURL(videoRecorder.url);
+  videoRecorder.url = URL.createObjectURL(videoRecorder.blob);
+
+
+
+  /* Load the clip but do not play it until PLAY PREVIEW is tapped. */
+  const preview = $("videoRecorderPreview");
+  preview.autoplay = false;
+  preview.srcObject = null;
+  preview.src = videoRecorder.url;
+  preview.muted = false;
+  preview.controls = false;
+
+  updateVideoTimer(videoRecorder.seconds);
+  setRecorderButtons("review");
+  videoRecorderStatus(
+    "Recorded " + formatDuration(videoRecorder.seconds) + " · " +
+    formatBytes(videoRecorder.blob.size) + ". Tap PLAY PREVIEW to check it, then USE THIS VIDEO or RETAKE.",
+    "ok"
+  );
+}
+
+function playVideoPreview() {
+  const preview = $("videoRecorderPreview");
+  if (!preview || !videoRecorder.url) return;
+  preview.controls = true;
+  try { preview.currentTime = 0; } catch (e) {}
+  const p = preview.play();
+  if (p && p.catch) p.catch(() => {});
+}
+
+/* Saves the clip to the phone's Download folder (called on SUBMIT). */
+function downloadActivityVideo(video) {
+  const url = URL.createObjectURL(video.blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = video.fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+
+/* USE THIS VIDEO: keep it for the form. Saved to Download on SUBMIT. */
+function saveRecordedVideo() {
+
+  const type = videoRecorder.type;
+  const consumer = currentActivityConsumer(type);
+  if (!type || !videoRecorder.blob || !consumer) return;
+
+  const date = new Date(videoRecorder.startedAt || Date.now());
+  const fileName = videoFileName(type, consumer.ACCT_ID, date, videoExtension(videoRecorder.mimeType));
+
+
+  if (!state.activityVideo) state.activityVideo = {};
+  state.activityVideo[type] = {
+    accountId: String(consumer.ACCT_ID || ""),
+    blob: videoRecorder.blob,
+    fileName: fileName,
+    contentType: videoRecorder.blob.type || "video/webm",
+    size: videoRecorder.blob.size,
+    durationSec: videoRecorder.seconds,
+    recordedAt: date.toISOString()
+  };
+
+  const ids = VIDEO_FORM_IDS[type];
+  if ($(ids.info)) {
+    $(ids.info).textContent =
+      "Video ready: " + videoSummary(state.activityVideo[type]) +
+      ". It will be saved to Download when you submit.";
+  }
+  setStatus(ids.status, "");
+
+  if (videoRecorder.url) URL.revokeObjectURL(videoRecorder.url);
+  videoRecorder.url = null;
+  videoRecorder.blob = null;
+
+  closeVideoRecorder(false);
+
+}
+
+function retakeVideo() {
+  const type = videoRecorder.type;
+  if (videoRecorder.url) URL.revokeObjectURL(videoRecorder.url);
+  videoRecorder.url = null;
+  videoRecorder.blob = null;
+  openVideoRecorder(type);
+}
+
+/* Close the recorder; cancel = discard anything recorded. */
+function closeVideoRecorder(cancel) {
+
+  if (cancel) videoRecorder.cancelled = true;
+
+  clearInterval(videoRecorder.timer);
+  videoRecorder.timer = null;
+
+  const r = videoRecorder.recorder;
+  if (r && r.state !== "inactive") {
+    videoRecorder.cancelled = true;
+    r.stop();
+  }
+  videoRecorder.recorder = null;
+
+  stopRecorderStream();
+
+  if (cancel && videoRecorder.url) {
+    URL.revokeObjectURL(videoRecorder.url);
+    videoRecorder.url = null;
+    videoRecorder.blob = null;
+  }
+
+  const preview = $("videoRecorderPreview");
+  if (preview) {
+    preview.pause();
+    preview.srcObject = null;
+    preview.removeAttribute("src");
+  }
+
+  if ($("videoRecorderModal")) $("videoRecorderModal").classList.add("hidden");
+}
+
+/* ---------- record + hidden copy ---------- */
+
+function attachVideoToRecord(record, video) {
+  record.video_file = video.fileName;
+  record.video_content_type = video.contentType;
+  record.video_size_bytes = video.size;
+  record.video_duration_sec = video.durationSec;
+  record.video_recorded_at = video.recordedAt;
+  record.video_upload = !!getVideoSettings().video_upload;
+}
+
+function openVideoDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(VIDEO_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(VIDEO_STORE)) {
+        db.createObjectStore(VIDEO_STORE, { keyPath: "record_id" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/*
+ * Always kept (whatever the phone's saved flag says). UPLOAD VIDEOS
+ * asks the backend: upload allowed -> sent to R2; not allowed ->
+ * hidden copy deleted. The Download copy is never touched.
+ */
+async function keepVideoForUpload(record, video) {
+
+  try {
+    const db = await openVideoDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(VIDEO_STORE, "readwrite");
+      tx.objectStore(VIDEO_STORE).put({
+        record_id: record.disconnection_id || record.recheck_id,
+        activity_type: record.activity_type,
+        user_id: state.userId,
+        account_id: record.account_id,
+        file_name: video.fileName,
+        content_type: video.contentType,
+        size_bytes: video.size,
+        duration_sec: video.durationSec,
+        recorded_at: video.recordedAt,
+        blob: video.blob,
+        status: "PENDING",
+        saved_at: new Date().toISOString()
+      });
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  } catch (e) {
+    console.error("Could not keep video for upload", e);
+  }
+  refreshVideoUploadInfo();
+}
+
+/*
+ * Video is required only for:
+ *   Disconnection: DISCONNECTED
+ *   Recheck: FOUND CONNECTED, STILL DISCONNECTED (found disconnected), HOUSE LOCKED
+ * For other statuses it is optional (kept if recorded).
+ */
+const VIDEO_REQUIRED_STATUSES = {
+  DISCONNECTION: ["DISCONNECTED", "HOUSE LOCK AND DISCONNECTED"],
+  RECHECK: ["FOUND CONNECTED", "STILL DISCONNECTED", "HOUSE LOCKED"]
+};
+
+function isVideoRequired(type, status) {
+  return (VIDEO_REQUIRED_STATUSES[type] || []).indexOf(String(status || "").toUpperCase()) !== -1;
+}
+
+/* Save guard shared by both forms. */
+function checkActivityVideo(type, consumer, required) {
+  const video = getActivityVideo(type);
+  if (!video) return required ? "Record the video first. Video is required for this status." : "";
+  if (video.accountId !== String(consumer.ACCT_ID || "")) {
+    return "The video was recorded for another account. Record it again.";
+  }
+  return "";
+}
+
+
+/*
+ * =========================================================
+ * VIDEO UPLOAD TO R2 (UPLOAD VIDEOS button) — C3c
+ * =========================================================
+ * - Only videos whose record is already UPLOADED are sent.
+ * - Oldest first. Each video: ask Apps Script for a signed
+ *   upload link (daily limits checked there), PUT the file
+ *   straight to R2, then confirm with Apps Script.
+ * - After success the hidden copy is deleted. The copy in the
+ *   Download folder is never touched.
+ * - Daily limit reached: stop; the rest upload another day.
+ */
+let videoUploadRunning = false;
+
+async function getPendingVideos() {
+  const db = await openVideoDB();
+  try {
+    const all = await new Promise((resolve, reject) => {
+      const req = db.transaction(VIDEO_STORE, "readonly").objectStore(VIDEO_STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    return all
+      .filter(v => String(v.user_id || "") === String(state.userId || ""))
+      .sort((a, b) => String(a.recorded_at || "").localeCompare(String(b.recorded_at || "")));
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteHiddenVideo(recordId) {
+  const db = await openVideoDB();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(VIDEO_STORE, "readwrite");
+      tx.objectStore(VIDEO_STORE).delete(recordId);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+/* IDs of disconnection / recheck records already uploaded. */
+async function uploadedActivityIds() {
+  const ids = new Set();
+  for (const [store, field] of [["disconnections", "disconnection_id"], ["rechecks", "recheck_id"]]) {
+    const rows = await getAllFromStore(store);
+    rows.forEach(r => {
+      if (String(r.upload_status || "").toUpperCase() === "UPLOADED" && r[field]) ids.add(r[field]);
+    });
+  }
+  return ids;
+}
+
+/* Read-only / idempotent calls: retry delivery failures. */
+async function serverPostWithRetry(action, extra) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await serverPost(action, extra);
+    } catch (err) {
+      console.error(`${action} attempt ${attempt} failed`, err);
+      if (attempt === 3) {
+        throw new Error("Could not reach the server. Please check your internet connection and try again.");
+      }
+      await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
+    }
+  }
+}
+
+function putVideoToR2(url, blob, contentType, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let lastProgress = Date.now();
+
+    /* No progress for 90 seconds: give up this attempt. */
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastProgress > 90000) xhr.abort();
+    }, 5000);
+
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("Content-Type", contentType || blob.type || "application/octet-stream");
+
+    xhr.upload.onprogress = e => {
+      lastProgress = Date.now();
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      clearInterval(watchdog);
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error("Video storage returned HTTP " + xhr.status + "."));
+    };
+    xhr.onerror = () => {
+      clearInterval(watchdog);
+      reject(new Error("Network problem while uploading the video."));
+    };
+    xhr.onabort = () => {
+      clearInterval(watchdog);
+      reject(new Error("Video upload stopped responding."));
+    };
+
+    xhr.send(blob);
+  });
+}
+
+/* Returns "DONE", "LIMIT" or "DISABLED"; throws on other failures. */
+async function uploadOneVideo(video, onProgress) {
+
+  const link = await serverPostWithRetry("video_upload_url", {
+    record_id: video.record_id,
+    account_id: video.account_id,
+    video_user_id: video.user_id,
+    activity_type: video.activity_type,
+    size_bytes: video.size_bytes,
+    content_type: video.content_type,
+    recorded_at: video.recorded_at
+  });
+
+  saveVideoSettings(link.video_settings);
+
+  if (!link.success) {
+    if (link.code === "VIDEO_DAILY_LIMIT") return { outcome: "LIMIT", message: link.message };
+    if (link.code === "VIDEO_UPLOAD_DISABLED") {
+      await deleteHiddenVideo(video.record_id);
+      return { outcome: "DISABLED", message: link.message };
+    }
+    if (link.code === "AUTH") {
+      logout();
+      alert("Your login session has expired. Please login again.");
+    }
+    throw new Error(link.message || "Could not get a video upload link.");
+  }
+
+  if (link.already_uploaded) {
+    await deleteHiddenVideo(video.record_id);
+    return { outcome: "DONE" };
+  }
+
+  await putVideoToR2(link.upload_url, video.blob, link.content_type, onProgress);
+
+  const confirm = await serverPostWithRetry("video_uploaded", {
+    record_id: video.record_id,
+    activity_type: video.activity_type,
+    key: link.key
+  });
+
+  saveVideoSettings(confirm.video_settings);
+
+  if (!confirm.success) {
+    throw new Error(confirm.message || "Video upload could not be confirmed.");
+  }
+
+  await deleteHiddenVideo(video.record_id);
+  return { outcome: "DONE" };
+}
+
+async function uploadPendingVideos() {
+
+  if (videoUploadRunning) return;
+  if (!state.sessionToken) return showLogin();
+
+  videoUploadRunning = true;
+  const button = $("uploadVideosBtn");
+  if (button) button.disabled = true;
+
+  try {
+
+    const videos = await getPendingVideos();
+
+    if (!videos.length) {
+      return setStatus("videoUploadStatus", "No pending videos.", "ok");
+    }
+
+    /* A video's record must be on the server first: upload records automatically. */
+    let uploadedIds = await uploadedActivityIds();
+
+    if (videos.some(v => !uploadedIds.has(v.record_id))) {
+      setStatus("videoUploadStatus", "Uploading records first…");
+      await uploadPending();
+      uploadedIds = await uploadedActivityIds();
+    }
+
+    const ready = videos.filter(v => uploadedIds.has(v.record_id));
+    const waiting = videos.length - ready.length;
+
+    if (!ready.length) {
+      return setStatus(
+        "videoUploadStatus",
+        "The records could not be uploaded, so their videos are still pending. See the message under UPLOAD RECORDS.",
+        "error"
+      );
+    }
+
+
+
+    let done = 0;
+    let disabled = 0;
+
+    for (let i = 0; i < ready.length; i++) {
+
+      const v = ready[i];
+      const label = `Uploading video ${i + 1} of ${ready.length}`;
+      setStatus("videoUploadStatus", label + "…");
+
+      let result;
+
+      try {
+        result = await uploadOneVideo(v, (sent, total) => {
+          setStatus(
+            "videoUploadStatus",
+            `${label}: ${formatBytes(sent)} / ${formatBytes(total)}`
+          );
+        });
+      } catch (e) {
+        setStatus(
+          "videoUploadStatus",
+          `Stopped after ${done} of ${ready.length} videos. ${e.message || "Upload failed."} ` +
+          "Remaining videos are still pending.",
+          "error"
+        );
+        return;
+      }
+
+      if (result.outcome === "LIMIT") {
+        setStatus(
+          "videoUploadStatus",
+          `${done} uploaded. ${result.message} ${ready.length - done} videos are still pending.`,
+          "error"
+        );
+        return;
+      }
+
+      if (result.outcome === "DISABLED") {
+        disabled++;
+        continue;
+      }
+
+      done++;
+    }
+
+    if (disabled) {
+      setStatus(
+        "videoUploadStatus",
+        `Video upload is off for your subdivision. ${disabled} videos were removed from the upload list; ` +
+        "their copies stay in the Download folder.",
+        "error"
+      );
+      return;
+    }
+
+    setStatus(
+      "videoUploadStatus",
+      `Video upload complete. ${done} uploaded.` +
+      (waiting ? ` ${waiting} videos are waiting because their records could not be uploaded yet.` : ""),
+      "ok"
+    );
+
+  } catch (e) {
+    console.error(e);
+    setStatus("videoUploadStatus", e.message || "Video upload failed.", "error");
+  } finally {
+    videoUploadRunning = false;
+    if (button) button.disabled = false;
+    refreshVideoUploadInfo();
+  }
+}
+
+/* Video counts in My Collection and Upload Status. */
+async function refreshVideoCounts(pendingVideos) {
+
+  if (!state.db) return;
+
+  const [disconnections, rechecks] = await Promise.all([
+    getAllFromStore("disconnections"),
+    getAllFromStore("rechecks")
+  ]);
+
+  const today = v151LocalDateKey(new Date());
+  const withVideo = list => list.filter(r => r.video_file);
+  const todayCount = list => list.filter(r => v151LocalDateKey(r.created_at) === today).length;
+  const pendingOf = type => (pendingVideos || []).filter(v => v.activity_type === type).length;
+  const set = (id, n) => { if ($(id)) $(id).textContent = Number(n).toLocaleString("en-IN"); };
+
+  const dv = withVideo(disconnections);
+  const rv = withVideo(rechecks);
+
+  set("uploadDisconnectionVideoSaved", dv.length);
+  set("uploadDisconnectionVideoPending", pendingOf("DISCONNECTION"));
+  set("uploadRecheckVideoSaved", rv.length);
+  set("uploadRecheckVideoPending", pendingOf("RECHECK"));
+
+  set("collectionDisconnectionVideoToday", todayCount(dv));
+  set("collectionRecheckVideoToday", todayCount(rv));
+  set("collectionDisconnectionVideoTotal", dv.length);
+  set("collectionRecheckVideoTotal", rv.length);
+}
+
+/* Info line in the Videos section. */
+/* v20.12: videos recorded more than a day ago and still on this phone (internet problem, upload not tapped) */
+function showVideoWaitNotice(videos) {
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const old = (videos || []).filter(v => { const t = Date.parse(v.recorded_at || ""); return !isNaN(t) && t < dayAgo; });
+  let el = $("videoWaitNotice");
+  if (!old.length) { if (el) el.classList.add("hidden"); return; }
+  if (!el) {
+    const card = $("loggedUserName") && $("loggedUserName").closest(".card");
+    if (!card) return;
+    el = document.createElement("div");
+    el.id = "videoWaitNotice";
+    el.setAttribute("role", "status");
+    el.style.cssText = "margin:0 0 12px;padding:7px 10px;border-radius:8px;font-size:12px;font-weight:600;line-height:1.4;" +
+      "background:#fff7df;border:1px solid #e09a00;color:#6b3b00;cursor:pointer";
+    el.addEventListener("click", () => {
+      showMainView("home");
+      const btn = $("uploadVideosBtn");
+      if (btn) btn.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    card.insertAdjacentElement("afterend", el);
+  }
+  const n = old.length;
+  el.textContent = n + (n === 1 ? " video has" : " videos have") + " been waiting on this phone for more than a day. " +
+    "Tap here, then UPLOAD VIDEOS AND RECORDS BOTH (Wi-Fi is best). " +
+    "(" + n + " वीडियो एक दिन से अधिक समय से अपलोड नहीं हुए - यहाँ टैप करें)";
+  el.classList.remove("hidden");
+}
+
+async function refreshVideoUploadInfo() {
+
+  const info = $("videoUploadInfo");
+  if (!info || !state.userId) return;
+
+  let videos = [];
+  try { videos = await getPendingVideos(); } catch (e) {}
+
+  refreshVideoCounts(videos).catch(err => console.error("Video counts failed", err));
+  showVideoWaitNotice(videos);                                     /* v20.12 */
+
+
+
+
+  const settings = getVideoSettings();
+  const bytes = videos.reduce((n, v) => n + (Number(v.size_bytes) || 0), 0);
+
+  if (videos.length) {
+    info.textContent =
+      `Pending videos: ${videos.length} · ${formatBytes(bytes)}. Wi-Fi is recommended.`;
+  } else if (settings.video_upload) {
+    info.textContent = "No pending videos.";
+  } else {
+    info.textContent =
+      "No pending videos. Video upload is currently off for your subdivision.";
+  }
+}
+/*
+ * =========================================================
+ * SHARE ON WHATSAPP (Disconnection / Recheck)
+ * =========================================================
+ * After a successful save (and after the video was saved to the
+ * Download folder), a "Saved" window offers sharing in two steps:
+ *   1. SHARE ON WHATSAPP        -> the details (text message)
+ *   2. SHARE VIDEO ON WHATSAPP  -> the video file (only if a
+ *                                   video was recorded)
+ * Sharing works offline: WhatsApp queues the message and sends
+ * it when the network returns.
+ */
+let lastShareItem = null;
+
+function shareDateText(iso) {
+  try {
+    return new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric",
+      hour: "2-digit", minute: "2-digit"
+    }).format(new Date(iso));
+  } catch (e) {
+    return String(iso || "");
+  }
+}
+
+function buildActivityShareText(record) {
+
+  const isDisc = record.activity_type === "DISCONNECTION";
+  const status = isDisc ? record.disconnection_status : record.present_status;
+  const lat = record.latitude, lng = record.longitude;
+
+  return [
+    "*" + (isDisc ? "DISCONNECTION" : "RECHECK") + "* – Fieldwork App",
+    "Account: " + (record.account_id || ""),
+    "Name: " + (record.consumer_name || ""),
+    record.father_name ? "Father/Husband: " + record.father_name : "",
+    record.feeded_village_name ? "Village: " + record.feeded_village_name : "",
+    "Status: " + (status || ""),
+    record.office_list ? "List: " + record.office_list : "",                       /* v20.17 */
+    record.paid_amount ? "Amount Paid: ₹" + record.paid_amount : "",
+    record.payment_mode ? "Payment Mode: " + record.payment_mode : "",
+    record.committed_payment_date ? "Committed Payment Date: " + record.committed_payment_date : "",
+    record.outstanding !== "" && record.outstanding != null ? "Outstanding: ₹" + record.outstanding : "",
+    record.meter_status ? "Meter: " + record.meter_status : "",
+    record.current_reading ? "Site Reading: " + record.current_reading : "",
+    record.house_condition ? "House Condition: " + record.house_condition : "",
+    record.remarks ? "Remark: " + record.remarks : "",
+    lat && lng ? "Location: https://maps.google.com/?q=" + lat + "," + lng : "",
+    "Date: " + shareDateText(record.created_at),
+    "By: " + (record.user_name || "") + " (" + (record.user_id || "") + ")"
+  ].filter(Boolean).join("\n");
+}
+
+function setShareButtons(step) {
+  /* step: "details" | "video" */
+  if ($("shareWhatsAppBtn")) $("shareWhatsAppBtn").classList.toggle("hidden", step !== "details");
+  if ($("shareVideoBtn")) $("shareVideoBtn").classList.toggle("hidden", step !== "video");
+}
+
+async function openShareModal(record, video) {
+
+  if (!$("shareModal")) return;
+
+  /* Give the Download a moment to finish before the window opens. */
+  if (video) await new Promise(resolve => setTimeout(resolve, 1500));
+
+  lastShareItem = { record: record, video: video || null };
+
+  const what = record.activity_type === "DISCONNECTION" ? "Disconnection" : "Recheck";
+  $("shareModalText").textContent =
+    what + " for account " + (record.account_id || "") + " is saved. " +
+    (video ? "The video is saved in the Download folder as " + video.fileName + ". " : "") +
+
+    (video
+      ? "Tap SHARE ON WHATSAPP to send the details and the video together."
+      : "Tap SHARE ON WHATSAPP to send the details to your group.");
+
+  setStatus("shareModalStatus", "");
+  setShareButtons("details");
+
+  /* Open WhatsApp sharing straight away while the SAVE tap still allows it.
+     If the phone does not allow it (or the share is closed), the Saved screen opens once. */
+  if (navigator.share && navigator.userActivation && navigator.userActivation.isActive) {
+    if (await shareLastActivity(true)) return;
+  }
+
+  $("shareModal").classList.remove("hidden");
+}
+
+function closeShareModal() {
+  lastShareItem = null;
+  if ($("shareModal")) $("shareModal").classList.add("hidden");
+}
+
+
+
+/*
+ * SHARE ON WHATSAPP: details + video (if any) in one share.
+ * auto = true when called straight after SAVE.
+ * Returns true when the share went through (then the Saved screen is not needed).
+ */
+async function shareLastActivity(auto) {
+
+  auto = auto === true;   /* the button passes its click event here */
+  const item = lastShareItem;
+  if (!item) return false;
+
+  if (!navigator.share) {
+    if (!auto) setStatus("shareModalStatus", "Sharing is not supported on this device.", "error");
+    return false;
+  }
+
+  const data = { text: buildActivityShareText(item.record) };
+  let videoMissing = false;
+
+  if (item.video && item.video.blob) {
+    const file = new File([item.video.blob], item.video.fileName, {
+      type: item.video.contentType || "video/mp4"
+    });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) data.files = [file];
+    else videoMissing = true;
+  }
+
+  /* This phone cannot attach the video here: show the screen with the file name instead. */
+  if (auto && videoMissing) return false;
+
+  try {
+    await navigator.share(data);
+  } catch (e) {
+    if (e && e.name === "AbortError") return false;   /* Share sheet closed: the Saved screen opens once */
+    console.error(e);
+    if (!auto) setStatus("shareModalStatus", "Could not open sharing. Please try again.", "error");
+    return false;
+  }
+
+  if (videoMissing) {
+    setStatus("shareModalStatus",
+      "Details shared. This phone cannot share the video from here; attach it from the Download folder: " + item.video.fileName,
+      "error");
+    return false;
+  }
+
+  closeShareModal();
+  return true;
+}
+
+
+
+
+
+/* SEND DETAILS ONLY: the text message on its own. */
+async function shareLastActivityVideo() {
+
+  const item = lastShareItem;
+  if (!item) return;
+
+  try {
+    await navigator.share({ text: buildActivityShareText(item.record) });
+    closeShareModal();
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    console.error(e);
+    setStatus("shareModalStatus", "Could not open sharing. Please try again.", "error");
+  }
+}
+
+/*
+ * =========================================================
+ * DEFAULTER LIST (D2) — works offline from the phone's master
+ * =========================================================
+ * Own screen (defaulterListCard). Filters are switch lists with
+ * "Select all", in one chain where each list narrows the next:
+ *   Connection Status -> SDO Code -> Substation -> Feeder ->
+ *   Village -> Supply Category -> Supply Type -> MR Source Code ->
+ *   SBM Machine ID
+ * Sanctioned Load (All / range) and Outstanding (numbers only),
+ * Last Payment Date filter, DOC.
+ * Up to 3 sort levels. PDF: A4 landscape, wrapped rows.
+ */
+const DL_BLANK = "__BLANK__";
+const DL_ROW_WARNING = 3000;
+const DL_BATCH = 5000;
+
+const DL_SORT_FIELDS = [
+  ["", "None"],
+  ["outstanding", "Outstanding"],
+  ["sdo", "SDO Code"],
+  ["substation", "Substation"],
+  ["feeder", "Feeder"],
+  ["village", "Village"],
+  ["supplyCat", "Supply Category"],
+  ["lastPay", "Last Pay Date"],
+  ["doc", "DOC"],
+  ["load", "Sanctioned Load"],
+  ["mrSource", "MR Source Code"],
+  ["sbm", "SBM Machine ID"],
+  ["account", "Account ID"],
+  ["name", "Name"]
+];
+
+/* Switch lists: element id -> field in the options combos / sets. */
+const DL_LISTS = ["dlStatus", "dlSdo", "dlSub", "dlFeeder", "dlVillage", "dlSupplyCat", "dlSupply", "dlMr", "dlSbm"];
+
+/* One cascading chain, top to bottom: list id -> field in the combos. */
+const DL_CHAINS = [
+  {
+    ids: ["dlStatus", "dlSdo", "dlSub", "dlFeeder", "dlVillage", "dlSupplyCat", "dlSupply", "dlMr", "dlSbm"],
+    fields: ["status", "sdo", "sub", "feeder", "village", "cat", "supply", "mr", "sbm"],
+    rows: "combos"
+  }
+];
+
+/*
+ * Supply category from the supply type code:
+ *   10, 11, 11H, 17 -> LMV-1   (numeric part without its last digit)
+ *   100, 101, 102   -> LMV-10
+ *   H11, H12, H13   -> HV-1
+ * A single digit keeps its digit (5 -> LMV-5). Blank -> BLANK,
+ * anything else -> OTHER.
+ */
+function supplyCategory(value) {
+  const s = String(value == null ? "" : value).trim().toUpperCase();
+  if (!s) return DL_BLANK;
+  const hv = s.match(/^H\s*-?\s*(\d+)/);
+  if (hv) return "HV-" + (hv[1].length > 1 ? hv[1].slice(0, -1) : hv[1]);
+  const lmv = s.match(/^(\d+)/);
+  if (lmv) return "LMV-" + (lmv[1].length > 1 ? lmv[1].slice(0, -1) : lmv[1]);
+  return "OTHER";
+}
+
+/* id -> null (all selected) or Set of selected values */
+const dlSel = {};
+
+const DL_DEFAULT_SORT = [["substation", "asc"], ["village", "asc"], ["outstanding", "desc"]];
+
+let dlOptions = null;
+let dlBusy = false;
+
+/* ---------- reading the master ---------- */
+
+/* Reads the active master in batches of 5000 (keeps the screen responsive). */
+async function forEachMasterBatch(onBatch) {
+  let lastKey = null;
+  while (true) {
+    const batch = await new Promise((resolve, reject) => {
+      const store = state.masterDb
+        .transaction(state.activeMasterStore, "readonly")
+        .objectStore(state.activeMasterStore);
+      const range = lastKey === null ? null : IDBKeyRange.lowerBound(lastKey, true);
+      const req = store.getAll(range, DL_BATCH);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    if (!batch.length) break;
+    onBatch(batch);
+    lastKey = batch[batch.length - 1].ACCT_ID;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    if (batch.length < DL_BATCH) break;
+  }
+}
+
+function dlVal(value) {
+  const s = String(value == null ? "" : value).trim();
+  return s || DL_BLANK;
+}
+
+function dlOutstanding(c) {
+  return Number(String(c.TOTAL_OUTSTANDING == null ? "" : c.TOTAL_OUTSTANDING).replace(/,/g, "")) || 0;
+}
+
+function dlOptionsKey() {                                          /* v20.13: + daily update number */
+  return state.activeMasterStore + "|" + state.masterCount + "|" + ((getLocalMasterMeta() || {}).updates_seq || 0);
+}
+
+async function dlLoadOptions() {
+
+  const key = dlOptionsKey();
+  if (dlOptions && dlOptions.key === key) return dlOptions;
+
+  const combos = new Map();
+  const nplCounts = {};                                             /* v20.14 */
+
+  await forEachMasterBatch(batch => {
+    for (const c of batch) {
+      const t = nplTypeOf(c);
+      if (t) nplCounts[t] = (nplCounts[t] || 0) + 1;
+      const combo = {
+        status: dlVal(c.CONNECTION_STATUS),
+        sdo: dlVal(c.SDO_CODE),
+        sub: dlVal(c.SUBSTATION),
+        feeder: dlVal(c.FEEDER),
+        village: dlVal(c.feeded_village_name),
+        cat: supplyCategory(c.SUPPLY_TYPE),
+        supply: dlVal(c.SUPPLY_TYPE),
+        mr: dlVal(c.MR_SOURCE_CD),
+        sbm: dlVal(c.SBM_MACHINE_ID),
+        npl: nplTypeOf(c) || "-"                                  /* v20.12 */
+      };
+      combos.set(
+        [combo.status, combo.sdo, combo.sub, combo.feeder, combo.village, combo.supply, combo.mr, combo.sbm, combo.npl].join("|"),
+        combo
+      );
+    }
+  });
+
+  dlOptions = {
+    key: key,
+    combos: Array.from(combos.values()),
+    nplCounts: nplCounts
+  };
+  return dlOptions;
+}
+
+/* ---------- filter screen: switch lists ---------- */
+
+function dlSortValues(values) {
+  return values.slice().sort((a, b) => (a === DL_BLANK) - (b === DL_BLANK) || a.localeCompare(b, undefined, { numeric: true }));
+}
+
+function dlUpdateSummary(id) {
+  const summary = $(id + "Summary");
+  if (!summary) return;
+  const total = (dlSel[id + "_values"] || []).length;
+  const sel = dlSel[id];
+  summary.textContent =
+    sel === null ? "All" :
+    !sel.size ? "None selected" :
+    sel.size + " of " + total + " selected";
+  summary.classList.toggle("dl-summary-warn", sel !== null && !sel.size);
+}
+
+/*
+ * Builds one switch list. Earlier choices are kept: if the list was
+ * on "all", it stays "all"; otherwise previously chosen values that
+ * still exist stay chosen.
+ */
+function dlRenderChecklist(id, values) {
+
+  const box = $(id);
+  if (!box) return;
+
+  const sorted = dlSortValues(values);
+  const prev = dlSel[id];
+  dlSel[id] = prev ? new Set(sorted.filter(v => prev.has(v))) : null;
+  if (dlSel[id] && dlSel[id].size === sorted.length) dlSel[id] = null;
+  dlSel[id + "_values"] = sorted;
+
+  box.innerHTML = "";
+
+  const makeRow = (text, checked, cls) => {
+    const row = document.createElement("label");
+    row.className = "dl-check" + (cls ? " " + cls : "");
+    const span = document.createElement("span");
+    span.textContent = text;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = checked;
+    const sw = document.createElement("span");
+    sw.className = "dl-switch";
+    row.appendChild(span);
+    row.appendChild(input);
+    row.appendChild(sw);
+    return { row: row, input: input };
+  };
+
+  if (sorted.length > 12) {
+    const search = document.createElement("input");
+    search.className = "dl-search";
+    search.placeholder = "Search / खोजें";
+    search.addEventListener("input", () => {
+      const q = search.value.trim().toLowerCase();
+      box.querySelectorAll(".dl-check[data-value]").forEach(r => {
+        r.classList.toggle("hidden", !!q && !r.dataset.label.toLowerCase().includes(q));
+      });
+    });
+    box.appendChild(search);
+  }
+
+  const all = makeRow("Select all / सभी चुनें", dlSel[id] === null, "all");
+  box.appendChild(all.row);
+
+  const inputs = [];
+
+  sorted.forEach(v => {
+    const label = v === DL_BLANK ? "BLANK" : v;
+    const item = makeRow(label, dlSel[id] === null || dlSel[id].has(v));
+    item.row.dataset.value = v;
+    item.row.dataset.label = label;
+    inputs.push({ value: v, input: item.input });
+    box.appendChild(item.row);
+
+    item.input.addEventListener("change", () => {
+      const chosen = new Set(inputs.filter(x => x.input.checked).map(x => x.value));
+      dlSel[id] = chosen.size === sorted.length ? null : chosen;
+      all.input.checked = dlSel[id] === null;
+      dlUpdateSummary(id);
+      dlAfterListChange(id);
+    });
+  });
+
+  all.input.addEventListener("change", () => {
+    inputs.forEach(x => { x.input.checked = all.input.checked; });
+    dlSel[id] = all.input.checked ? null : new Set();
+    dlUpdateSummary(id);
+    dlAfterListChange(id);
+  });
+
+  dlUpdateSummary(id);
+}
+
+function dlAfterListChange(id) {
+  /* Disconnected But Unpaid List uses the same switch lists. */
+  if (id.indexOf("du") === 0) return duAfterListChange(id);
+  const chain = DL_CHAINS.find(ch => ch.ids.indexOf(id) !== -1);
+  if (chain && chain.ids.indexOf(id) < chain.ids.length - 1) dlRefreshCascade(id);
+}
+
+function dlChosen(id) {
+  return dlSel[id] === undefined ? null : dlSel[id];
+}
+
+/*
+ * Rebuilds the lists below the changed one in its chain
+ * (changedId = the first list of a chain rebuilds that whole chain
+ * except the first list; null = both chains from the top).
+ */
+function dlRefreshCascade(changedId) {
+
+  const o = dlOptions;
+  if (!o) return;
+
+  DL_CHAINS.forEach(chain => {
+
+    const pos = changedId ? chain.ids.indexOf(changedId) : 0;
+    if (changedId && pos === -1) return;
+    const from = changedId ? pos + 1 : 0;
+
+    let rows = o[chain.rows];
+    /* v20.12: an office list limits every filter below it to the consumers on that list */
+    const npl = $("dlNpl") ? $("dlNpl").value : "ALL";
+    if (npl === "BOTH") rows = rows.filter(r => r.npl && r.npl !== "-");
+    else if (npl !== "ALL") rows = rows.filter(r => r.npl === npl);
+
+    chain.ids.forEach((id, i) => {
+      const field = chain.fields[i];
+      if (i >= from) dlRenderChecklist(id, Array.from(new Set(rows.map(r => r[field]))));
+      const sel = dlChosen(id);
+      if (sel) rows = rows.filter(r => sel.has(r[field]));
+    });
+  });
+
+  /* Hide Substation / Feeder / MR Source when the master has no such column. */
+  [["dlSubBox", "sub"], ["dlFeederBox", "feeder"], ["dlMrBox", "mr"], ["dlSbmBox", "sbm"]].forEach(([box, field]) => {
+    if ($(box)) $(box).classList.toggle("hidden", !o.combos.some(c => c[field] !== DL_BLANK));
+  });
+}
+
+function dlToggleList(id) {
+  const box = $(id);
+  if (box) box.classList.toggle("hidden");
+}
+
+function dlInitSortSelects() {
+  for (let i = 1; i <= 3; i++) {
+    const field = $("dlSort" + i);
+    const dir = $("dlDir" + i);
+    if (!field || field.options.length) continue;
+    DL_SORT_FIELDS.forEach(([value, label]) => {
+      const o = document.createElement("option");
+      o.value = value;
+      o.textContent = label;
+      field.appendChild(o);
+    });
+    [["asc", "Ascending"], ["desc", "Descending"]].forEach(([value, label]) => {
+      const o = document.createElement("option");
+      o.value = value;
+      o.textContent = label;
+      dir.appendChild(o);
+    });
+    field.value = DL_DEFAULT_SORT[i - 1][0];
+    dir.value = DL_DEFAULT_SORT[i - 1][1];
+  }
+}
+
+function dlUpdatePayBoxes() {
+  const mode = $("dlPayMode").value;
+  $("dlLongBox").classList.toggle("hidden", mode !== "LONG");
+  $("dlSinceBox").classList.toggle("hidden", mode !== "SINCE");
+  if ($("dlNplPaidBox")) $("dlNplPaidBox").classList.toggle("hidden", !$("dlNpl") || $("dlNpl").value === "ALL");
+}
+
+function dlUpdateLoadBox() {
+  $("dlLoadBox").classList.toggle("hidden", $("dlLoadMode").value !== "RANGE");
+}
+
+function dlUpdateDocBox() {
+  $("dlDocBox").classList.toggle("hidden", $("dlDocMode").value !== "BETWEEN");
+}
+
+/* Number fields: digits and one decimal point only. */
+function dlNumbersOnly(input) {
+  input.addEventListener("input", () => {
+    const clean = input.value.replace(/[^0-9.]/g, "").replace(/(\..*)\./g, "$1");
+    if (clean !== input.value) input.value = clean;
+  });
+}
+
+async function openDefaulterList(mode) {
+
+  if (!state.masterReady || !state.masterDb) {
+    alert("Master Data is not ready yet. Please wait for the master to finish loading.");
+    return;
+  }
+  mode = typeof mode === "string" ? mode : "ALL";                  /* v20.12 */
+
+
+  dlInitSortSelects();
+  dlUpdatePayBoxes();
+  dlUpdateLoadBox();
+  dlUpdateDocBox();
+  setStatus("dlStatusMsg", "");
+  showMainView("defaulterListCard");
+  window.scrollTo(0, 0);
+
+  if (dlOptions && dlOptions.key === dlOptionsKey()) {
+    dlSwitchNplMode(mode);
+    return;
+  }
+  dlNplMode = mode;
+  if ($("dlNpl")) $("dlNpl").value = mode;
+  dlUpdateNplTitle();
+
+  $("dlFilters").classList.add("hidden");
+  setStatus("dlStatusMsg", "");
+  showGlobalLoading("Reading Master Data…", "Preparing the filters. This can take a few seconds.");
+
+  try {
+    const o = await dlLoadOptions();
+
+    dlRestoreFilters();
+    dlRefreshCascade(null);
+    dlFixEmptyRestoredLists();
+
+    $("dlFilters").classList.remove("hidden");
+    setStatus("dlStatusMsg", "");
+    dlNplEmptyNotice();
+  } catch (e) {
+    console.error(e);
+    setStatus("dlStatusMsg", "Could not read Master Data. " + (e.message || ""), "error");
+  } finally {
+    hideGlobalLoading();
+  }
+}
+
+function closeDefaulterList() {
+  if (dlBusy) return;
+  showMainView("home");
+}
+
+/* ---------- filtering ---------- */
+
+function dlReadFilters() {
+
+  const num = id => {
+    const v = String($(id).value || "").trim();
+    return v === "" || isNaN(Number(v)) ? null : Number(v);
+  };
+  const set = id => dlChosen(id);
+
+  const sort = [];
+  for (let i = 1; i <= 3; i++) {
+    const field = $("dlSort" + i).value;
+    if (field) sort.push({ field: field, dir: $("dlDir" + i).value });
+  }
+
+  return {
+    sdo: set("dlSdo"),
+    sub: $("dlSubBox").classList.contains("hidden") ? null : set("dlSub"),
+    feeder: $("dlFeederBox").classList.contains("hidden") ? null : set("dlFeeder"),
+    village: set("dlVillage"),
+    status: set("dlStatus"),
+    supplyCat: set("dlSupplyCat"),
+    supply: set("dlSupply"),
+    mr: $("dlMrBox").classList.contains("hidden") ? null : set("dlMr"),
+    sbm: $("dlSbmBox") && !$("dlSbmBox").classList.contains("hidden") ? set("dlSbm") : null,
+    loadMin: $("dlLoadMode").value === "RANGE" ? num("dlLoadMin") : null,
+    loadMax: $("dlLoadMode").value === "RANGE" ? num("dlLoadMax") : null,
+    outMin: num("dlOutMin"),
+    payMode: $("dlPayMode").value,
+    longDate: $("dlLongDate").value || "2023-03-31",
+    sinceDate: $("dlSinceDate").value || "",
+    docFrom: $("dlDocMode").value === "BETWEEN" ? ($("dlDocFrom").value || "") : "",
+    docTo: $("dlDocMode").value === "BETWEEN" ? ($("dlDocTo").value || "") : "",
+    npl: $("dlNpl") ? $("dlNpl").value : "ALL",
+    nplPaid: $("dlNplPaid") && $("dlNpl") && $("dlNpl").value !== "ALL" ? $("dlNplPaid").value : "ALL",
+    sort: sort
+  };
+}
+
+function dlMatches(c, f) {
+
+  if (f.sdo && !f.sdo.has(dlVal(c.SDO_CODE))) return false;
+  if (f.sub && !f.sub.has(dlVal(c.SUBSTATION))) return false;
+  if (f.feeder && !f.feeder.has(dlVal(c.FEEDER))) return false;
+  if (f.village && !f.village.has(dlVal(c.feeded_village_name))) return false;
+  if (f.status && !f.status.has(dlVal(c.CONNECTION_STATUS))) return false;
+  if (f.supplyCat && !f.supplyCat.has(supplyCategory(c.SUPPLY_TYPE))) return false;
+  if (f.supply && !f.supply.has(dlVal(c.SUPPLY_TYPE))) return false;
+  if (f.mr && !f.mr.has(dlVal(c.MR_SOURCE_CD))) return false;
+  if (f.sbm && !f.sbm.has(dlVal(c.SBM_MACHINE_ID))) return false;
+
+  if (f.outMin !== null && dlOutstanding(c) < f.outMin) return false;
+
+  if (f.loadMin !== null || f.loadMax !== null) {
+    const load = parseMasterLoad(c.LOAD);
+    if (load === null) return false;
+    if (f.loadMin !== null && load < f.loadMin) return false;
+    if (f.loadMax !== null && load > f.loadMax) return false;
+  }
+
+  if (f.payMode !== "ALL") {
+    const lastPay = parseMasterDate(c.LAST_PAY_DATE);
+    const never = !lastPay || lastPay < NEVER_PAID_BEFORE;
+    if (f.payMode === "NEVER" && !never) return false;
+    if (f.payMode === "LONG" && (never || lastPay >= f.longDate)) return false;
+    if (f.payMode === "SINCE" && f.sinceDate && !never && lastPay >= f.sinceDate) return false;
+  }
+
+  if (f.docFrom || f.docTo) {
+    const doc = parseMasterDate(c.DOC);
+    if (!doc) return false;
+    if (f.docFrom && doc < f.docFrom) return false;
+    if (f.docTo && doc > f.docTo) return false;
+  }
+
+  if (f.npl && f.npl !== "ALL") {                                   /* v20.11: office list */
+    const t = nplTypeOf(c);
+    if (!t || (f.npl !== "BOTH" && t !== f.npl)) return false;
+    if (f.nplPaid === "PAID" && !nplPaidSince(c)) return false;
+    if (f.nplPaid === "NOTPAID" && nplPaidSince(c)) return false;
+  }
+
+  return true;
+}
+
+/* v20.17: "Never Paid" / "Long Unpaid" / "" for messages */
+function officeListName(c) {
+  const t = nplTypeOf(c);
+  return t === "NEVER PAID" ? "Never Paid" : t === "LONG UNPAID" ? "Long Unpaid" : "";
+}
+/* v20.17: Disconnected, also when the house was locked */
+function isDisconnectedStatus(s) {
+  s = String(s || "").trim().toUpperCase();
+  return s === "DISCONNECTED" || s === "HOUSE LOCK AND DISCONNECTED";
+}
+
+/* v20.11: office Never Paid / Long Unpaid list (Fieldwork Master Tool, data\lists) */
+function nplTypeOf(c) {
+  const t = String((c && c.NPL_TYPE) || "").trim().toUpperCase();
+  return t === "NEVER PAID" || t === "LONG UNPAID" ? t : "";
+}
+/* paid after the list: never paid = any payment; long unpaid = a payment after the list's last payment */
+function nplPaidSince(c) {
+  const t = nplTypeOf(c);
+  const pay = parseMasterDate(c.LAST_PAY_DATE);
+  if (!t || !pay || pay < "1950-01-01") return false;
+  if (t === "NEVER PAID") return true;
+  const listPay = parseMasterDate(c.NPL_PAY_DATE);
+  return !listPay || pay > listPay;
+}
+function nplTag(c) {
+  const t = nplTypeOf(c);
+  if (!t) return "";
+  return (t === "NEVER PAID" ? "Never paid" : "Long unpaid") + (nplPaidSince(c) ? " (paid)" : "");
+}
+
+function dlRow(c) {
+  return {
+    npl: nplTag(c),
+    account: String(c.ACCT_ID || ""),
+    name: String(c.NAME || ""),
+
+    father: String(c.FATHER_NAME || ""),
+    address: String(c.ADDRESS || ""),
+    village: String(c.feeded_village_name || ""),
+    sdo: String(c.SDO_CODE || ""),
+    substation: String(c.SUBSTATION || ""),
+    feeder: String(c.FEEDER || ""),
+    mrSource: String(c.MR_SOURCE_CD || ""),
+    sbm: String(c.SBM_MACHINE_ID || ""),
+    supplyCat: supplyCategory(c.SUPPLY_TYPE) === DL_BLANK ? "" : supplyCategory(c.SUPPLY_TYPE),
+    mobile: String(c.MOBILE_NUMBER || ""),
+    meter: String(c.METER_NO || ""),
+    loadText: String(c.LOAD || ""),
+    supplyType: String(c.SUPPLY_TYPE || ""),
+    load: parseMasterLoad(c.LOAD),
+    doc: parseMasterDate(c.DOC),
+    outstanding: dlOutstanding(c),
+    lastPay: parseMasterDate(c.LAST_PAY_DATE),
+    lastPayAmount: String(c.LAST_PAY_AMOUNT || "")
+  };
+}
+
+function dlCompare(a, b, sort) {
+  for (const s of sort) {
+    const va = a[s.field], vb = b[s.field];
+    let cmp;
+    if (typeof va === "number" || typeof vb === "number" || va === null || vb === null) {
+      /* Numbers; missing values always last. */
+      if (va === null || va === undefined) cmp = (vb === null || vb === undefined) ? 0 : 1;
+      else if (vb === null || vb === undefined) cmp = -1;
+      else cmp = s.dir === "desc" ? vb - va : va - vb;
+      if (cmp) return cmp;
+      continue;
+    }
+    const sa = String(va || ""), sb = String(vb || "");
+    if (!sa || !sb) {
+      cmp = (!sa) - (!sb);        /* empty always last */
+    } else {
+      cmp = sa.localeCompare(sb, undefined, { numeric: true });
+      if (s.dir === "desc") cmp = -cmp;
+    }
+    if (cmp) return cmp;
+  }
+  return 0;
+}
+
+async function dlCollect(f, keepRows) {
+  let count = 0, total = 0;
+  const rows = [];
+  await forEachMasterBatch(batch => {
+    for (const c of batch) {
+      if (!dlMatches(c, f)) continue;
+      count++;
+      total += dlOutstanding(c);
+      if (keepRows) rows.push(dlRow(c));
+    }
+  });
+  if (keepRows && f.sort.length) rows.sort((a, b) => dlCompare(a, b, f.sort));
+  return { count: count, total: total, rows: rows };
+}
+
+/* Lists switched to "none": nothing could match. */
+function dlEmptyListNames() {
+  const names = {
+    dlSdo: "SDO Code", dlSub: "Substation", dlFeeder: "Feeder", dlVillage: "Village",
+    dlStatus: "Connection Status", dlSupplyCat: "Supply Category", dlSupply: "Supply Type", dlMr: "MR Source Code",
+    dlSbm: "SBM Machine ID"
+  };
+  return DL_LISTS
+    .filter(id => dlSel[id] && !dlSel[id].size && !($(id + "Box") && $(id + "Box").classList.contains("hidden")))
+    .map(id => names[id]);
+}
+
+function dlMoney(n) {
+  return "Rs. " + Math.round(n).toLocaleString("en-IN");
+}
+
+/* COUNT CONSUMERS */
+async function previewDefaulterList() {
+  if (dlBusy) return;
+  const empty = dlEmptyListNames();
+  if (empty.length) {
+    return setStatus("dlStatusMsg", "Select at least one option in: " + empty.join(", ") + ".", "error");
+  }
+  dlBusy = true;
+  setStatus("dlStatusMsg", "");
+  showGlobalLoading("Counting consumers…", "Checking the Master Data against your filters.");
+  try {
+    const result = await dlCollect(dlReadFilters(), false);
+    setStatus(
+      "dlStatusMsg",
+      result.count.toLocaleString("en-IN") + " consumers · Total outstanding " + dlMoney(result.total) +
+      (result.count > DL_ROW_WARNING ? ". This is a large list; the PDF will take longer. Consider narrowing the filters." : ""),
+      result.count ? "ok" : "error"
+    );
+  } catch (e) {
+    console.error(e);
+    setStatus("dlStatusMsg", "Could not count. " + (e.message || ""), "error");
+  } finally {
+    dlBusy = false;
+    hideGlobalLoading();
+  }
+}
+
+/* ---------- PDF ---------- */
+
+function dlFilterSummary(f) {
+  const list = (label, set) => set ? label + ": " + Array.from(set).map(v => v === DL_BLANK ? "BLANK" : v).join(", ") : "";
+  const date = iso => formatListDate(iso);
+  const pay = {
+    ALL: "",
+    NEVER: "Last payment: never paid",
+    LONG: "Last payment: before " + date(f.longDate) + " (never-paid excluded)",
+    SINCE: f.sinceDate ? "Last payment: not paid since " + date(f.sinceDate) : ""
+  }[f.payMode];
+  const sortText = f.sort.length
+    ? "Sorted by: " + f.sort.map(s => (DL_SORT_FIELDS.find(x => x[0] === s.field) || ["", s.field])[1] + (s.dir === "desc" ? " (high to low)" : "")).join(", then ")
+    : "";
+  return [
+    list("SDO Code", f.sdo),
+    list("Substation", f.sub),
+    list("Feeder", f.feeder),
+    list("Village", f.village),
+    list("Connection Status", f.status),
+    list("Supply Category", f.supplyCat),
+    list("Supply Type", f.supply),
+    list("MR Source Code", f.mr),
+    list("SBM Machine ID", f.sbm),
+    f.loadMin !== null || f.loadMax !== null
+      ? "Sanctioned Load: " + (f.loadMin !== null ? f.loadMin : "any") + " to " + (f.loadMax !== null ? f.loadMax : "any") + " kW" : "",
+    f.outMin !== null ? "Outstanding at least " + dlMoney(f.outMin) : "",
+    pay,
+    f.docFrom || f.docTo ? "DOC: " + (f.docFrom ? date(f.docFrom) : "any") + " to " + (f.docTo ? date(f.docTo) : "any") : "",
+    f.npl && f.npl !== "ALL" ? "Office list: " + ({ "NEVER PAID": "Never paid", "LONG UNPAID": "Long unpaid", BOTH: "Never paid + Long unpaid" }[f.npl]) +
+      ({ ALL: "", PAID: " (paid after the list)", NOTPAID: " (not paid yet)" }[f.nplPaid] || "") : "",
+    sortText
+  ].filter(Boolean).join("  |  ") || "No filters (all consumers)";
+}
+
+function dlFileStamp() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "_" + p(d.getHours()) + "-" + p(d.getMinutes());
+}
+
+async function downloadDefaulterPdf() {
+
+  if (dlBusy) return;
+
+  if (!window.jspdf || !window.jspdf.jsPDF || !window.jspdf.jsPDF.API.autoTable) {
+    return setStatus("dlStatusMsg", "PDF library is not loaded. Please reload the app.", "error");
+  }
+
+  const empty = dlEmptyListNames();
+  if (empty.length) {
+    return setStatus("dlStatusMsg", "Select at least one option in: " + empty.join(", ") + ".", "error");
+  }
+
+  dlBusy = true;
+  const f = dlReadFilters();
+  const split = $("dlSplit") ? $("dlSplit").value : "ONE";
+  let loading = true;
+  showGlobalLoading("Preparing the list…", "Collecting consumers from the Master Data.");
+
+  try {
+
+    setStatus("dlStatusMsg", "");
+    const result = await dlCollect(f, true);
+
+    if (!result.count) {
+      setStatus("dlStatusMsg", "No consumers match these filters.", "error");
+      return;
+    }
+
+    /* v20.6: one combined PDF, or a separate PDF for each SDO / Substation / Feeder / Village */
+    const groups = dlSplitGroups(result.rows, split);
+
+    if (result.count > DL_ROW_WARNING || groups.length > DL_SPLIT_WARNING) {
+      hideGlobalLoading();
+      loading = false;
+      const ask = (groups.length > 1 ? groups.length.toLocaleString("en-IN") + " separate PDFs, " : "") +
+        result.count.toLocaleString("en-IN") + " consumers. This takes time. Continue?";
+      if (!confirm(ask)) {
+        setStatus("dlStatusMsg", "");
+        return;
+      }
+      showGlobalLoading("Creating PDF…", "");
+      loading = true;
+    }
+
+    const files = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      updateGlobalLoading(
+        groups.length > 1 ? "Creating PDF " + (i + 1) + " of " + groups.length + "…" : "Creating PDF…",
+        (g.label ? g.label + ": " : "") + "writing " + g.rows.length.toLocaleString("en-IN") + " consumers.");
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const doc = dlMakePdf(g.rows, g.total, f, g.label);
+      const fileBase = { "NEVER PAID": "Never_Paid_List_", "LONG UNPAID": "Long_Unpaid_List_", BOTH: "Never_Paid_Long_Unpaid_List_" }[f.npl] || "Defaulter_List_";
+      const pdfName = fileBase + (g.label ? dlSafeFileName(g.label) + "_" : "") + dlFileStamp() + ".pdf";
+      doc.save(pdfName);
+      files.push({ blob: doc.output("blob"), name: pdfName });
+      if (groups.length > 1) await new Promise(resolve => setTimeout(resolve, 700));   /* one download at a time */
+    }
+    rememberListPdf("dl", files.length === 1 ? files[0].blob : files, files.length === 1 ? files[0].name : "",
+      "Defaulter List");
+
+    setStatus(
+      "dlStatusMsg",
+      (files.length === 1
+        ? "PDF saved to the Download folder: "
+        : files.length + " PDFs saved to the Download folder (if the phone asks, allow downloading multiple files): ") +
+      result.count.toLocaleString("en-IN") + " consumers · " + dlMoney(result.total) + ".",
+      "ok"
+    );
+
+  } catch (e) {
+    console.error(e);
+    setStatus("dlStatusMsg", "Could not create the PDF. " + (e.message || ""), "error");
+  } finally {
+    dlBusy = false;
+    if (loading) hideGlobalLoading();
+  }
+}
+
+const DL_SPLIT_WARNING = 25;          /* ask first when more separate PDFs than this */
+const DL_SPLIT_FIELDS = {
+  sdo: "SDO Code",
+  substation: "Substation",
+  feeder: "Feeder",
+  village: "Village"
+};
+
+/* [{ label, rows, total }] - one group for ONE, else one per SDO / Substation / Feeder / Village (A to Z) */
+function dlSplitGroups(rows, split) {
+  const field = DL_SPLIT_FIELDS[split] ? split : "";
+  const sum = list => list.reduce((s, r) => s + (Number(r.outstanding) || 0), 0);
+  if (!field) return [{ label: "", rows: rows, total: sum(rows) }];
+  const map = new Map();
+  rows.forEach(r => {
+    const key = String(r[field] || "").trim() || "BLANK";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(r);                       /* keeps the chosen sort inside each file */
+  });
+  return Array.from(map.keys())
+    .sort((x, y) => x.localeCompare(y, "en", { numeric: true }))
+    .map(key => ({ label: DL_SPLIT_FIELDS[field] + " " + key, rows: map.get(key), total: sum(map.get(key)) }));
+}
+
+function dlSafeFileName(text) {
+  return String(text || "").replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60);
+}
+
+/* One defaulter PDF (S.No starts at 1 in every file). */
+function dlMakePdf(rows, total, f, label) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+
+  doc.setFontSize(14);
+  const listName = { "NEVER PAID": "NEVER PAID LIST", "LONG UNPAID": "LONG UNPAID LIST", BOTH: "NEVER PAID AND LONG UNPAID LIST" }[f.npl] || "DEFAULTER LIST";
+  doc.text(listName + (label ? " – " + label : "") + " – Fieldwork App", 10, 12);
+
+  doc.setFontSize(8);
+  const meta =
+    "Generated: " + shareDateText(new Date().toISOString()) +
+    "   By: " + (state.userName || "") + " (" + (state.userId || "") + ")" +
+    "   Consumers: " + rows.length.toLocaleString("en-IN") +
+    "   Total outstanding: " + dlMoney(total);
+  doc.text(meta, 10, 18);
+
+  const filterLines = doc.splitTextToSize("Filters: " + dlFilterSummary(f), 277);
+  doc.text(filterLines, 10, 23);
+  const startY = 25 + filterLines.length * 3.5;
+
+  const body = rows.map((r, i) => [
+    i + 1, r.account, r.name, r.father, r.address, r.village, r.substation, r.feeder, r.mrSource,
+    r.mobile, r.meter, r.loadText, r.supplyType, formatListDate(r.doc),
+    Math.round(r.outstanding).toLocaleString("en-IN"),
+    formatListDate(r.lastPay), r.lastPayAmount, r.npl, ""
+  ]);
+
+  doc.autoTable({
+    startY: startY,
+    margin: { left: 10, right: 10 },
+    head: [[
+      "S.No", "Account", "Name", "Father/Husband", "Address", "Village", "Substation", "Feeder", "MR Src",
+      "Mobile", "Meter", "Load", "Supply", "DOC", "Outstanding (Rs.)", "Last Pay Date", "Last Pay Amt", "List", "Remarks"
+    ]],
+    body: body,
+    theme: "grid",
+    styles: { fontSize: 6.5, cellPadding: 1, overflow: "linebreak", valign: "middle", lineColor: [120, 120, 120], lineWidth: 0.1, textColor: [0, 0, 0] },
+    headStyles: { fillColor: [21, 101, 192], textColor: 255, fontSize: 6.5 },
+    columnStyles: {
+      0: { cellWidth: 7, halign: "right" },
+      1: { cellWidth: 17 },
+      2: { cellWidth: 19 },
+      3: { cellWidth: 18 },
+      4: { cellWidth: 27 },
+      5: { cellWidth: 16 },
+      6: { cellWidth: 14 },
+      7: { cellWidth: 14 },
+      8: { cellWidth: 9 },
+      9: { cellWidth: 16 },
+      10: { cellWidth: 14 },
+      11: { cellWidth: 8 },
+      12: { cellWidth: 9 },
+      13: { cellWidth: 14 },
+      14: { cellWidth: 15, halign: "right" },
+      15: { cellWidth: 14 },
+      16: { cellWidth: 12, halign: "right" },
+      17: { cellWidth: 13 },
+      18: { cellWidth: 18, minCellHeight: 8 }
+    },
+    didDrawPage: () => {
+      doc.setFontSize(7);
+      doc.text(
+        "Page " + doc.internal.getNumberOfPages(),
+        doc.internal.pageSize.getWidth() - 25,
+        doc.internal.pageSize.getHeight() - 5
+      );
+    }
+  });
+  return doc;
+}
+
+
+/*
+ * =========================================================
+ * DISCONNECTED BUT UNPAID LIST (D3)
+ * =========================================================
+ * 1. Fetches the latest disconnection per account of the
+ *    user's subdivision from the server (Account ID, Disconnection
+ *    ID, Disconnection Status, User ID, User Name, Created At).
+ * 2. Everything else (name, father, village, substation, feeder,
+ *    supply type, load, meter, mobile, outstanding, last pay,
+ *    MR source, SBM ID, DOC...) comes from the phone's master.
+ * 3. Keeps consumers whose master Last Pay Date is before the
+ *    disconnection date (or never paid). Accounts not in the
+ *    master are kept and marked "Not in master".
+ * Filters (each switch list narrowing the next):
+ *   Disconnection Status -> User -> Connection Status -> SDO Code
+ *   -> Substation -> Feeder -> Village -> Supply Category ->
+ *   Supply Type -> MR Source Code -> SBM Machine ID
+ * plus Disconnection Date, Sanctioned Load, Outstanding, Last
+ * Payment Date filter and DOC (same rules as the Defaulter List).
+ */
+const DU_LIST_IDS = [
+  "duStatus", "duUser", "duConn", "duSdo", "duSub", "duFeeder",
+  "duVillage", "duSupplyCat", "duSupply", "duMr", "duSbm"
+];
+const DU_FIELDS = [
+  "status", "userLabel", "conn", "sdo", "sub", "feeder",
+  "village", "cat", "supply", "mr", "sbm"
+];
+const DU_LIST_NAMES = {
+  duStatus: "Disconnection Status", duUser: "User", duConn: "Connection Status",
+  duSdo: "SDO Code", duSub: "Substation", duFeeder: "Feeder", duVillage: "Village",
+  duSupplyCat: "Supply Category", duSupply: "Supply Type", duMr: "MR Source Code",
+  duSbm: "SBM Machine ID"
+};
+
+const DU_SORT_FIELDS = [
+  ["", "None"],
+  ["userLabel", "User"],
+  ["villageName", "Village"],
+  ["outstanding", "Outstanding"],
+  ["days", "Days Since Disconnection"],
+  ["discDate", "Disconnection Date"],
+  ["status", "Disconnection Status"],
+  ["substation", "Substation"],
+  ["feeder", "Feeder"],
+  ["supplyCat", "Supply Category"],
+  ["load", "Sanctioned Load"],
+  ["lastPay", "Last Pay Date"],
+  ["doc", "DOC"],
+  ["account", "Account ID"],
+  ["name", "Name"]
+];
+
+const DU_DEFAULT_SORT = [["userLabel", "asc"], ["villageName", "asc"], ["outstanding", "desc"], ["days", "desc"]];
+DU_SORT_FIELDS.splice(6, 0, ["promise", "Promise Date (phone list)"]);
+
+/*
+ * v19.9: the same screen shows two lists:
+ *   DISC  - Disconnected But Unpaid (latest disconnection of each account)
+ *   PHONE - Phone Promise Not Kept: latest phone call with a promise date; the date
+ *           has passed and the master shows no payment since the call.
+ */
+let duMode = "DISC";
+const duCache = { DISC: null, PHONE: null };
+const DU_MODE = {
+  DISC: {
+    title: "Disconnected But Unpaid List(विच्छेदित किन्तु अदत्त सूची)",
+    intro: "Disconnected consumers whose last payment in the Master Data is before the disconnection date. Uses the latest disconnection of each account. Consumer details come from the Master Data on this phone.(वे विच्छेदित उपभोक्ता जिनका मास्टर डेटा में अंतिम भुगतान विच्छेदन तिथि से पहले है। उपभोक्ता विवरण इस फ़ोन के मास्टर डेटा से लिया जाता है।)",
+    statusHead: "Disconnection Status(विच्छेदन स्थिति)",
+    dateLabel: "Disconnection Date(विच्छेदन तिथि)",
+    action: "disconnection_list", key: "disconnections",
+    loading: "Loading disconnections…",
+    statusName: "Disconnection Status", dateName: "Disconnection date",
+    dateSort: "Disconnection Date", daysSort: "Days Since Disconnection",
+    pdfTitle: "DISCONNECTED BUT UNPAID LIST – Fieldwork App",
+    file: "Disconnected_But_Unpaid_", share: "Disconnected But Unpaid List",
+    loaded: (n, k) => n + " disconnected accounts loaded; " + k + " have not paid since disconnection."
+  },
+  PHONE: {
+    title: "Phone Promise Not Kept List(फ़ोन पर वादा, भुगतान नहीं सूची)",
+    intro: "Consumers who promised on a phone call to pay by a date: the date has passed and the Master Data shows no payment since the call. Uses the latest call of each account.(फ़ोन कॉल पर भुगतान की तारीख दी, तारीख निकल गई और कॉल के बाद मास्टर डेटा में भुगतान नहीं।)",
+    statusHead: "Call Response(कॉल प्रतिक्रिया)",
+    dateLabel: "Call Date(कॉल तिथि)",
+    action: "phone_promise_list", key: "calls",
+    loading: "Loading phone calls…",
+    statusName: "Call Response", dateName: "Call date",
+    dateSort: "Call Date", daysSort: "Days Since Call",
+    pdfTitle: "PHONE PROMISE NOT KEPT LIST – Fieldwork App",
+    file: "Phone_Promise_Not_Kept_", share: "Phone Promise Not Kept List",
+    loaded: (n, k) => n + " phone promises loaded; " + k + " promise dates have passed without payment."
+  }
+};
+const duText = () => DU_MODE[duMode];
+
+/* Phone Calling responses are saved in Hindi; the PDF font has no Hindi letters. */
+const PHONE_RESPONSE_EN = {
+  "गलत नंबर": "Wrong number",
+  "कॉल रिसीव नहीं कर रहे": "Not receiving call",
+  "कुछ दिन बाद जमा करेंगे": "Will pay after some days",
+  "जमा नहीं करेंगे": "Will not pay",
+  "बिल गलत है": "Bill is wrong",
+  "घर पर बात करेंगे": "Will discuss at home",
+  "JE/SDO से बात करेंगे": "Will talk to JE/SDO",
+  "डबल कनेक्शन है": "Double connection",
+  "PD होना है": "PD to be done",
+  "बिल जमा है": "Bill already paid",
+  "कार्यालय आएंगे": "Will come to office",
+  "नंबर स्विच ऑफ है": "Number switched off",
+  "नंबर नॉट रीचेबल है": "Number not reachable",
+  "इनकमिंग कॉल उपलब्ध नहीं है": "Incoming calls not available"
+};
+
+function duSetModeTexts() {
+  const t = duText();
+  [["duTitle", t.title], ["duIntro", t.intro], ["duStatusHeadText", t.statusHead], ["duDateLabel", t.dateLabel]]
+    .forEach(([id, text]) => { if ($(id)) $(id).textContent = text; });
+  for (let i = 1; i <= 4; i++) {
+    const sel = $("duSort" + i);
+    if (!sel) continue;
+    Array.from(sel.options).forEach(o => {
+      if (o.value === "discDate") o.textContent = t.dateSort;
+      if (o.value === "days") o.textContent = t.daysSort;
+      if (o.value === "status") o.textContent = t.statusName;
+    });
+  }
+  /* Phone list: only "will pay after some days" calls have a promise date, so no response filter. */
+  if ($("duStatusBox")) $("duStatusBox").classList.toggle("hidden", duMode === "PHONE");
+  if (typeof applyLanguage === "function") applyLanguage();
+}
+
+let duRows = null;       /* unpaid rows after the last load */
+let duLoadedCount = 0;   /* disconnections received from the server */
+let duBusy = false;
+
+/* ---------- master lookup in one transaction ---------- */
+
+function duLookupMaster(accounts) {
+  return new Promise((resolve, reject) => {
+    const found = new Map();
+    const tx = state.masterDb.transaction(state.activeMasterStore, "readonly");
+    const store = tx.objectStore(state.activeMasterStore);
+    const index = store.index("acct_norm");
+
+    accounts.forEach(account => {
+      const raw = String(account || "").trim();
+      const req = store.get(raw);
+      req.onsuccess = () => {
+        if (req.result) {
+          found.set(raw, req.result);
+          return;
+        }
+        /* Not stored under the exact ID: try without leading zeros. */
+        const alt = index.get(normalizeAccountInput(raw));
+        alt.onsuccess = () => { if (alt.result) found.set(raw, alt.result); };
+      };
+    });
+
+    tx.oncomplete = () => resolve(found);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function duDaysSince(isoDate) {
+  if (!isoDate) return null;
+  const [y, m, d] = isoDate.split("-").map(Number);
+  const then = Date.UTC(y, m - 1, d);
+  const now = new Date();
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.max(0, Math.round((today - then) / 86400000));
+}
+
+function duBuildRow(disc, master) {
+  const account = String(disc.account_id || "").trim();
+  const c = master || { ACCT_ID: account, NAME: "Not in master" };
+  const userId = String(disc.user_id || "");
+
+  return Object.assign(dlRow(c), {
+    c: c,
+    inMaster: !!master,
+    account: master ? String(master.ACCT_ID || account) : account,
+    villageName: String(c.feeded_village_name || ""),
+    discDate: String(disc.date || ""),
+    days: duDaysSince(disc.date),
+    promise: String(disc.promise_date || ""),
+    status: dlVal(disc.status),
+    userLabel: dlVal(userId ? userId + (disc.user_name ? " - " + disc.user_name : "") : ""),
+
+    /* switch-list fields */
+    conn: dlVal(c.CONNECTION_STATUS),
+    sdo: dlVal(c.SDO_CODE),
+    sub: dlVal(c.SUBSTATION),
+    feederKey: dlVal(c.FEEDER),
+    village: dlVal(c.feeded_village_name),
+    cat: supplyCategory(c.SUPPLY_TYPE),
+    supply: dlVal(c.SUPPLY_TYPE),
+    mr: dlVal(c.MR_SOURCE_CD),
+    sbm: dlVal(c.SBM_MACHINE_ID)
+  });
+}
+
+/* Phone list: kept when the promise date has passed and nothing was paid since the call. */
+function duKeep(row) {
+  if (!duIsUnpaid(row)) return false;
+  if (duMode !== "PHONE") return true;
+  const now = new Date();
+  const today = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-" + String(now.getDate()).padStart(2, "0");
+  return !!row.promise && row.promise < today;
+}
+
+/* Unpaid = never paid, or last payment before the disconnection date. */
+function duIsUnpaid(row) {
+  if (!row.inMaster) return true;
+  if (!row.lastPay || row.lastPay < NEVER_PAID_BEFORE) return true;
+  return row.lastPay < row.discDate;
+}
+
+/* ---------- screen ---------- */
+
+function duInitSortSelects() {
+  for (let i = 1; i <= 4; i++) {
+    const field = $("duSort" + i);
+    const dir = $("duDir" + i);
+    if (!field || field.options.length) continue;
+    DU_SORT_FIELDS.forEach(([value, label]) => {
+      const o = document.createElement("option");
+      o.value = value;
+      o.textContent = label;
+      field.appendChild(o);
+    });
+    [["asc", "Ascending"], ["desc", "Descending"]].forEach(([value, label]) => {
+      const o = document.createElement("option");
+      o.value = value;
+      o.textContent = label;
+      dir.appendChild(o);
+    });
+    field.value = DU_DEFAULT_SORT[i - 1][0];
+    dir.value = DU_DEFAULT_SORT[i - 1][1];
+  }
+}
+
+function duUpdateBoxes() {
+  $("duDateBox").classList.toggle("hidden", $("duDateMode").value !== "BETWEEN");
+  $("duLoadBox").classList.toggle("hidden", $("duLoadMode").value !== "RANGE");
+  $("duDocBox").classList.toggle("hidden", $("duDocMode").value !== "BETWEEN");
+  const pay = $("duPayMode").value;
+  $("duLongBox").classList.toggle("hidden", pay !== "LONG");
+  $("duSinceBox").classList.toggle("hidden", pay !== "SINCE");
+}
+
+/* The feeder switch list uses feederKey (feeder is the PDF text). */
+function duField(i) {
+  return DU_FIELDS[i] === "feeder" ? "feederKey" : DU_FIELDS[i];
+}
+
+function duRefreshCascade(changedId) {
+
+  if (!duRows) return;
+
+  const from = changedId ? DU_LIST_IDS.indexOf(changedId) + 1 : 0;
+  let rows = duRows;
+
+  DU_LIST_IDS.forEach((id, i) => {
+    const field = duField(i);
+    if (i >= from) dlRenderChecklist(id, Array.from(new Set(rows.map(r => r[field]))));
+    const sel = dlChosen(id);
+    if (sel) rows = rows.filter(r => sel.has(r[field]));
+  });
+
+  [["duSubBox", "sub"], ["duFeederBox", "feederKey"], ["duMrBox", "mr"], ["duSbmBox", "sbm"]].forEach(([box, field]) => {
+    if ($(box)) $(box).classList.toggle("hidden", !duRows.some(r => r[field] !== DL_BLANK));
+  });
+}
+
+function duAfterListChange(id) {
+  if (DU_LIST_IDS.indexOf(id) < DU_LIST_IDS.length - 1) duRefreshCascade(id);
+}
+
+async function openDisconnectedUnpaidList(mode) {
+
+  if (!state.masterReady || !state.masterDb) {
+    alert("Master Data is not ready yet. Please wait for the master to finish loading.");
+    return;
+  }
+
+  mode = mode === "PHONE" ? "PHONE" : "DISC";
+  if (mode !== duMode && duBusy) return;
+  if (mode !== duMode) {
+    duCache[duMode] = duRows;
+    duMode = mode;
+    duRows = duCache[mode];
+    DU_LIST_IDS.forEach(id => { delete dlSel[id]; });
+    if (duRows) duRefreshCascade(null);
+    $("duFilters").classList.toggle("hidden", !duRows);
+    setStatus("duStatusMsg", "");
+  }
+
+  duInitSortSelects();
+  duSetModeTexts();
+  duUpdateBoxes();
+  showMainView("disconnectedUnpaidCard");
+  window.scrollTo(0, 0);
+
+  if (!duRows) await loadDisconnectedUnpaid();
+}
+
+function closeDisconnectedUnpaidList() {
+  if (duBusy) return;
+  showMainView("home");
+}
+
+/* LOAD / REFRESH FROM SERVER */
+async function loadDisconnectedUnpaid() {
+
+  if (duBusy) return;
+  duBusy = true;
+
+  const button = $("duLoadBtn");
+  if (button) button.disabled = true;
+
+  setStatus("duStatusMsg", "");
+  const t = duText();
+  const mode = duMode;
+  showGlobalLoading(t.loading, "Fetching the list from the server.");
+
+  try {
+
+    const result = await serverPostWithRetry(t.action);
+
+    if (!result.success) {
+      if (result.code === "AUTH") {
+        logout();
+        alert("Your login session has expired. Please login again.");
+        return;
+      }
+      throw new Error(result.message || "Could not load disconnections.");
+    }
+
+    const list = Array.isArray(result[t.key]) ? result[t.key] : [];
+
+    updateGlobalLoading(
+      "Matching with Master Data…",
+      "Adding consumer details for " + list.length.toLocaleString("en-IN") + " accounts."
+    );
+
+    const master = await duLookupMaster(list.map(d => d.account_id));
+    if (mode !== duMode) return;              /* the other list was opened meanwhile */
+
+    duLoadedCount = list.length;
+    duRows = list
+      .map(d => duBuildRow(d, master.get(String(d.account_id || "").trim())))
+      .filter(duKeep);
+    duCache[duMode] = duRows;
+
+    DU_LIST_IDS.forEach(id => { delete dlSel[id]; });
+    duRefreshCascade(null);
+    $("duFilters").classList.remove("hidden");
+
+    setStatus(
+      "duStatusMsg",
+      t.loaded(duLoadedCount.toLocaleString("en-IN"), duRows.length.toLocaleString("en-IN")),
+      "ok"
+    );
+
+  } catch (e) {
+    console.error(e);
+    setStatus("duStatusMsg", (e.message || "Could not load disconnections.") +
+      (duRows ? " The previously loaded list is still shown." : ""), "error");
+  } finally {
+    duBusy = false;
+    if (button) button.disabled = false;
+    hideGlobalLoading();
+  }
+}
+
+/* ---------- filtering ---------- */
+
+function duReadFilters() {
+
+  const num = id => {
+    const v = String($(id).value || "").trim();
+    return v === "" || isNaN(Number(v)) ? null : Number(v);
+  };
+  const shown = box => !$(box).classList.contains("hidden");
+
+  const sort = [];
+  for (let i = 1; i <= 4; i++) {
+    const field = $("duSort" + i).value;
+    if (field) sort.push({ field: field, dir: $("duDir" + i).value });
+  }
+
+  const dateBetween = $("duDateMode").value === "BETWEEN";
+  const loadRange = $("duLoadMode").value === "RANGE";
+  const docBetween = $("duDocMode").value === "BETWEEN";
+
+  return {
+    /* disconnection part */
+    discStatus: duMode === "PHONE" ? null : dlChosen("duStatus"),
+    user: dlChosen("duUser"),
+    dateFrom: dateBetween ? ($("duDateFrom").value || "") : "",
+    dateTo: dateBetween ? ($("duDateTo").value || "") : "",
+
+    /* master part: same shape as the Defaulter List filters */
+    master: {
+      status: dlChosen("duConn"),
+      sdo: dlChosen("duSdo"),
+      sub: shown("duSubBox") ? dlChosen("duSub") : null,
+      feeder: shown("duFeederBox") ? dlChosen("duFeeder") : null,
+      village: dlChosen("duVillage"),
+      supplyCat: dlChosen("duSupplyCat"),
+      supply: dlChosen("duSupply"),
+      mr: shown("duMrBox") ? dlChosen("duMr") : null,
+      sbm: shown("duSbmBox") ? dlChosen("duSbm") : null,
+      loadMin: loadRange ? num("duLoadMin") : null,
+      loadMax: loadRange ? num("duLoadMax") : null,
+      outMin: num("duOutMin"),
+      payMode: $("duPayMode").value,
+      longDate: $("duLongDate").value || "2023-03-31",
+      sinceDate: $("duSinceDate").value || "",
+      docFrom: docBetween ? ($("duDocFrom").value || "") : "",
+      docTo: docBetween ? ($("duDocTo").value || "") : ""
+    },
+
+    sort: sort
+  };
+}
+
+function duMatches(r, f) {
+  if (f.discStatus && !f.discStatus.has(r.status)) return false;
+  if (f.user && !f.user.has(r.userLabel)) return false;
+  if (f.dateFrom && r.discDate < f.dateFrom) return false;
+  if (f.dateTo && r.discDate > f.dateTo) return false;
+  return dlMatches(r.c, f.master);
+}
+
+function duEmptyListNames() {
+  return DU_LIST_IDS
+    .filter(id => dlSel[id] && !dlSel[id].size && !($(id + "Box") && $(id + "Box").classList.contains("hidden")))
+    .map(id => DU_LIST_NAMES[id]);
+}
+
+function duCollect(f) {
+  const rows = duRows.filter(r => duMatches(r, f));
+  if (f.sort.length) rows.sort((a, b) => dlCompare(a, b, f.sort));
+  const total = rows.reduce((n, r) => n + (r.inMaster ? r.outstanding : 0), 0);
+  return { rows: rows, count: rows.length, total: total };
+}
+
+function duCheckReady() {
+  if (!duRows) {
+    setStatus("duStatusMsg", "Load the disconnections first (needs internet).", "error");
+    return false;
+  }
+  const empty = duEmptyListNames();
+  if (empty.length) {
+    setStatus("duStatusMsg", "Select at least one option in: " + empty.join(", ") + ".", "error");
+    return false;
+  }
+  return true;
+}
+
+function previewDisconnectedUnpaid() {
+  if (!duCheckReady()) return;
+  const result = duCollect(duReadFilters());
+  setStatus(
+    "duStatusMsg",
+    result.count.toLocaleString("en-IN") + " consumers · Total outstanding " + dlMoney(result.total),
+    result.count ? "ok" : "error"
+  );
+}
+
+/* ---------- PDF ---------- */
+
+function duFilterSummary(f) {
+  const label = v => v === DL_BLANK ? "BLANK" : v;
+  const list = (name, set) => set ? name + ": " + Array.from(set).map(label).join(", ") : "";
+  const sortText = f.sort.length
+    ? "Sorted by: " + f.sort.map(s => ({ discDate: duText().dateSort, days: duText().daysSort, status: duText().statusName }[s.field] ||
+        (DU_SORT_FIELDS.find(x => x[0] === s.field) || ["", s.field])[1]) + (s.dir === "desc" ? " (high to low)" : "")).join(", then ")
+    : "";
+  const own = [
+    list(duText().statusName, f.discStatus),
+    list("User", f.user),
+    f.dateFrom || f.dateTo
+      ? duText().dateName + ": " + (f.dateFrom ? formatListDate(f.dateFrom) : "any") + " to " + (f.dateTo ? formatListDate(f.dateTo) : "any") : ""
+  ].filter(Boolean);
+
+  /* Master filters described the same way as in the Defaulter List. */
+  const masterText = dlFilterSummary(Object.assign({}, f.master, { sort: [] }));
+  if (masterText !== "No filters (all consumers)") own.push(masterText);
+  if (sortText) own.push(sortText);
+
+  return own.join("  |  ") || "No filters (all unpaid disconnected consumers)";
+}
+
+async function downloadDisconnectedUnpaidPdf() {
+
+  if (!duCheckReady() || duBusy) return;
+
+  if (!window.jspdf || !window.jspdf.jsPDF || !window.jspdf.jsPDF.API.autoTable) {
+    return setStatus("duStatusMsg", "PDF library is not loaded. Please reload the app.", "error");
+  }
+
+  const f = duReadFilters();
+  const result = duCollect(f);
+
+  if (!result.count) {
+    return setStatus("duStatusMsg", "No consumers match these filters.", "error");
+  }
+
+  if (result.count > DL_ROW_WARNING &&
+      !confirm(result.count.toLocaleString("en-IN") + " consumers match. A PDF this large takes time. Continue?")) {
+    return;
+  }
+
+  duBusy = true;
+  setStatus("duStatusMsg", "");
+  showGlobalLoading("Creating PDF…", "Writing " + result.count.toLocaleString("en-IN") + " consumers to the PDF.");
+
+  try {
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+    const text = v => (v === DL_BLANK ? "" : String(v == null ? "" : v));
+
+    doc.setFontSize(14);
+    doc.text(duText().pdfTitle, 10, 12);
+
+    doc.setFontSize(8);
+    doc.text(
+      "Generated: " + shareDateText(new Date().toISOString()) +
+      "   By: " + (state.userName || "") + " (" + (state.userId || "") + ")" +
+      "   Consumers: " + result.count.toLocaleString("en-IN") +
+      "   Total outstanding: " + dlMoney(result.total),
+      10, 18
+    );
+
+    /* The PDF font has no Hindi letters: keep the English part of "ENGLISH(हिंदी)" values. */
+    const en = v => {
+      let s = text(v);
+      if (PHONE_RESPONSE_EN[s.trim()]) return PHONE_RESPONSE_EN[s.trim()];
+      if (/[\u0900-\u097F]/.test(s)) {
+        s = s.replace(/\([^()]*[\u0900-\u097F][^()]*\)/g, "").replace(/[\u0900-\u097F]+/g, "").replace(/\s{2,}/g, " ").trim();
+      }
+      return s;
+    };
+    const filterLines = doc.splitTextToSize("Filters: " + en(duFilterSummary(f)), 277);
+    doc.text(filterLines, 10, 23);
+    const startY = 25 + filterLines.length * 3.5;
+
+    const body = result.rows.map((r, i) => [
+      i + 1, r.account, r.name, r.father, r.address, r.villageName, r.substation, r.feeder,
+      r.meter, r.mobile, r.loadText, r.supplyType,
+      formatListDate(r.discDate), en(r.status), en(r.userLabel),
+      duMode === "PHONE" ? formatListDate(r.promise) : (r.days === null ? "" : r.days),
+      r.inMaster ? Math.round(r.outstanding).toLocaleString("en-IN") : "",
+      formatListDate(r.lastPay), r.lastPayAmount, r.npl, ""
+    ]);
+
+    doc.autoTable({
+      startY: startY,
+      margin: { left: 10, right: 10 },
+      head: [[
+        "S.No", "Account", "Name", "Father/Husband", "Address", "Village", "Substation", "Feeder",
+        "Meter", "Mobile", "Load", "Supply",
+        duMode === "PHONE" ? "Call Date" : "Disc. Date",
+        duMode === "PHONE" ? "Response" : "Disc. Status", "User",
+        duMode === "PHONE" ? "Promise" : "Days",
+        "Outstanding (Rs.)", "Last Pay Date", "Last Pay Amt", "List", "Remarks"
+      ]],
+      body: body,
+      theme: "grid",
+
+      styles: { fontSize: 6, cellPadding: 1, overflow: "linebreak", valign: "middle", lineColor: [120, 120, 120], lineWidth: 0.1, textColor: [0, 0, 0] },
+
+      headStyles: { fillColor: [21, 101, 192], textColor: 255, fontSize: 6 },
+      columnStyles: {
+        0: { cellWidth: 6, halign: "right" },
+        1: { cellWidth: 16 },
+        2: { cellWidth: 18 },
+        3: { cellWidth: 16 },
+        4: { cellWidth: 24 },
+        5: { cellWidth: 14 },
+        6: { cellWidth: 12 },
+        7: { cellWidth: 12 },
+        8: { cellWidth: 13 },
+        9: { cellWidth: 15 },
+        10: { cellWidth: 8 },
+        11: { cellWidth: 8 },
+        12: { cellWidth: 13 },
+        13: { cellWidth: 14 },
+        14: { cellWidth: 15 },
+        15: duMode === "PHONE" ? { cellWidth: 14 } : { cellWidth: 7, halign: "right" },
+        16: { cellWidth: 14, halign: "right" },
+        17: { cellWidth: 13 },
+        18: { cellWidth: 11, halign: "right" },
+        19: { cellWidth: 12 },
+        20: { cellWidth: duMode === "PHONE" ? 8 : 12, minCellHeight: 8 }
+      },
+      didDrawPage: () => {
+        doc.setFontSize(7);
+        doc.text(
+          "Page " + doc.internal.getNumberOfPages(),
+          doc.internal.pageSize.getWidth() - 25,
+          doc.internal.pageSize.getHeight() - 5
+        );
+      }
+    });
+
+
+    const pdfName = duText().file + dlFileStamp() + ".pdf";
+    doc.save(pdfName);
+    rememberListPdf("du", doc.output("blob"), pdfName, duText().share);
+
+    setStatus(
+      "duStatusMsg",
+      "PDF saved to the Download folder: " + result.count.toLocaleString("en-IN") +
+      " consumers · " + dlMoney(result.total) + ".",
+      "ok"
+    );
+
+  } catch (e) {
+    console.error(e);
+    setStatus("duStatusMsg", "Could not create the PDF. " + (e.message || ""), "error");
+  } finally {
+    duBusy = false;
+    hideGlobalLoading();
+  }
+}
+
+
+/*
+ * Ask the browser to keep this app's data (login, master,
+ * saved/pending records) even when the phone is low on
+ * storage. No prompt on Android Chrome; silently ignored
+ * where not supported.
+ */
+function requestPersistentStorage() {
+  try {
+    if (!navigator.storage || !navigator.storage.persist) return;
+
+    navigator.storage.persisted()
+      .then(already => already || navigator.storage.persist())
+      .then(granted => console.log("Persistent storage:", granted ? "granted" : "not granted"))
+      .catch(err => console.warn("Persistent storage request failed", err));
+  } catch (e) {
+    console.warn("Persistent storage not available", e);
+  }
+}
+
+
+
+async function init() {
+
+  /*
+   * An earlier broken login could have saved the text
+   * "undefined" as token / user. Treat that as logged out.
+   */
+  if (
+    ["undefined", "null"].includes(state.sessionToken) ||
+    ["undefined", "null"].includes(state.userId)
+  ) {
+    logout();
+  }
+
+  try {
+
+
+
+    await openDB();
+
+
+    /*
+     * Village dropdowns: filled from the list saved on this
+     * phone (no network). See VILLAGE LIST section.
+     */
+    renderSavedVillageList();
+
+    updateCounts();
+
+
+    if (state.sessionToken && state.userId) {
+      // Restore the saved local session immediately. Server validation runs in
+      // the background so the user does not see the login screen on every launch.
+      showApp();
+      setMasterGate(!state.masterReady);
+
+      ensureVillageList();
+
+      /* Master setup starts once permissions are confirmed. */
+      ensureDevicePermissions().then(() => startMasterSetup());
+
+      // Restore the locally saved session directly. Do not run check_auth()
+      // during startup: the survey app is designed to work offline, and a
+      // startup network/auth check could incorrectly throw a valid local
+      // session back to the Login screen. Server authentication remains
+      // enforced by login() and the protected server requests.
+    } else {
+      showLogin();
+    }
+
+
+  } catch (e) {
+    console.error(e);
+    setStatus("searchStatus", e.message || "Could not load app data.", "error");
+
+    /*
+     * A startup error must never look like a logout.
+     * If a login is saved and the home screen is not shown yet,
+     * show it (the login stays saved) and tell the user.
+     */
+    if (
+      state.sessionToken &&
+      state.userId &&
+      $("appContent").classList.contains("hidden")
+    ) {
+      try {
+        showApp();
+        setMasterGate(!state.masterReady);
+        startMasterSetup();
+      } catch (e2) {
+        console.error(e2);
+      }
+
+      alert(
+        "Some app data could not be loaded. You are still logged in. " +
+        "If something does not work, please close and reopen the app.\n\n" +
+        "Details: " + (e.message || e)
+      );
+    }
+  }
+}
+
+
+
+
+function masterCellToString(value) {
+  if (value === null || value === undefined) return "";
+
+  if (value instanceof Date) {
+    /*
+     * Round to the nearest day: Excel dates can arrive a few
+     * minutes before midnight (time-zone history), which would
+     * otherwise show the previous day.
+     */
+    value=new Date(value.getTime()+12*60*60*1000);
+    const y=value.getFullYear();
+
+    const m=String(value.getMonth()+1).padStart(2,"0");
+    const d=String(value.getDate()).padStart(2,"0");
+    return `${y}-${m}-${d}`;
+  }
+
+  return String(value).trim();
+}
+
+/*
+ * =========================================================
+ * MASTER VALUE HELPERS (dates, load) — used by the lists
+ * =========================================================
+ * Dates in the master can be real Excel dates (stored as
+ * YYYY-MM-DD on import), text like 18/07/2023, 18-07-2023,
+ * 18.07.2023, or an Excel serial number. Day comes first.
+ * Blank, impossible (00/01/1900) or before 2010 = never paid.
+ */
+const NEVER_PAID_BEFORE = "2010-01-01";
+
+/* Returns "YYYY-MM-DD", or "" when blank / not a real date. */
+function parseMasterDate(value) {
+
+  const s = String(value == null ? "" : value).trim();
+  if (!s) return "";
+
+  let y, m, d, match;
+
+  if ((match = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/))) {
+    y = +match[1]; m = +match[2]; d = +match[3];
+  } else if ((match = s.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\b/))) {
+    d = +match[1]; m = +match[2]; y = +match[3];
+    if (match[3].length === 2) y += y < 50 ? 2000 : 1900;
+  } else if (/^\d{4,6}(\.\d+)?$/.test(s)) {
+    /* Excel serial number (days since 1899-12-30). */
+    const serial = Math.floor(Number(s));
+    if (serial < 1) return "";
+    const dt = new Date(Date.UTC(1899, 11, 30) + serial * 86400000);
+    y = dt.getUTCFullYear(); m = dt.getUTCMonth() + 1; d = dt.getUTCDate();
+  } else {
+    return "";
+  }
+
+  if (y < 1900 || m < 1 || m > 12 || d < 1) return "";
+  const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  if (d > daysInMonth) return "";
+
+  return y + "-" + String(m).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+}
+
+/* DD-MM-YYYY for lists and PDFs ("" when not a real date). */
+function formatListDate(value) {
+  const iso = parseMasterDate(value);
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  return d + "-" + m + "-" + y;
+}
+
+function isNeverPaid(lastPayDate) {
+  const iso = parseMasterDate(lastPayDate);
+  return !iso || iso < NEVER_PAID_BEFORE;
+}
+
+/* Sanctioned load as a number: "2", "2.5", "2 KW" -> 2 / 2.5. */
+function parseMasterLoad(value) {
+  const match = String(value == null ? "" : value).match(/\d+(\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+
+
+function xlsxToConsumer(row, header) {
+  const o={};
+
+  for (let i=0;i<header.length;i++) {
+    const key=String(header[i] ?? "").trim().toLowerCase();
+    o[key]=masterCellToString(row[i]);
+  }
+
+  /*
+   * Optional list columns are matched ignoring case, spaces,
+   * underscores and hidden characters (e.g. "MR_SOURCE_CD",
+   * "MR SOURCE CD", "Mr Source Cd" all match). Normalised once
+   * per file, not per row.
+   */
+  if (!header.__normalized) {
+    header.__normalized = header.map(h => String(h ?? "").toLowerCase().replace(/[^a-z0-9]/g, ""));
+  }
+  const n = {};
+  header.__normalized.forEach((k, i) => {
+    if (k && !(k in n)) n[k] = masterCellToString(row[i]);
+  });
+
+  const c={
+    ACCT_ID:o["acct_id"] || "",
+    SDO_CODE:o["sdo_code"] || "",
+    NAME:o["name"] || "",
+    FATHER_NAME:o["father_name"] || "",
+    ADDRESS:o["address"] || "",
+    feeded_village_name:n["feededvillagename"] || n["habitatname"] || "",
+
+    SUPPLY_TYPE:o["supply_type"] || "",
+    LOAD:o["load"] || "",
+    CONNECTION_STATUS:n["connectionstatus"] || n["constatus"] || "",
+    METER_NO:n["meterno"] || n["serialnbr"] || "",
+
+    TOTAL_OUTSTANDING:n["totaloutstanding"] || "",
+    CURRENT_READING:n["currentreading"] || n["closereading"] || "",
+    MOBILE_NUMBER:n["mobilenumber"] || n["mobileno"] || "",
+    
+    /* New master: UPDATED_LAST_PAY_*; older masters: LAST_PAY_* */
+    LAST_PAY_DATE:o["updated_last_pay_date"] || o["last_pay_date"] || "",
+
+    LAST_PAY_AMOUNT:o["updated_last_pay_amount"] || o["last_pay_amount"] || "",
+
+    /* Optional column: masters without it still import. */
+    CONSUMPTION_CURR_MNTH:o["consumption_curr_mnth"] || "",
+
+    /* Optional columns for the lists (Defaulter List etc.). */
+
+    SUBSTATION:o["substation"] || "",
+    FEEDER:o["feeder"] || "",
+    DOC:o["doc"] || "",
+      
+
+    MR_SOURCE_CD:n["mrsourcecd"] || n["metersourcecd"] || "",
+    CONSUMPTION_PREV_MNTH:n["consumptionprevmnth"] || "",
+    CONSUMPTION_PREV_TO_PREV_MNTH:n["consumptionprevtoprevmnth"] || "",
+
+    SBM_MACHINE_ID:n["sbmmachineid"] || "",
+
+    /* v18: last bill + Progress tab fields (optional columns) */
+    LAST_BILL_DATE:n["lastbilldate"] || "",
+    BILL_BASIS:n["billbasis"] || "",
+    METER_READ_REMARK:n["meterreadremark"] || "",
+    THIS_MONTH_TOTAL_PAY_AMT:n["thismonthtotalpayamt"] || "",
+    MASTER_TOTAL_PAY_AMT:n["mastertotalpayamt"] || "",
+    MASTER_LAST_PAY_DATE:n["masterlastpaydate"] || "",
+    MASTER_LAST_PAY_AMOUNT:n["masterlastpayamount"] || "",
+    BILLING_MONTH:n["billingmonth"] || "",
+    MASTER_MONTH:n["mastermonth"] || "",
+    REPORT_DATE:n["reportdate"] || "",
+    BASE_ID:n["baseid"] || "",
+
+    /* v20.4: Geo Location - smart meter (verified), last month's and this month's billing place */
+    SM_LAT:n["smlat"] || "",
+    SM_LNG:n["smlng"] || "",
+    PREV_LAT:n["prevlat"] || "",
+    PREV_LNG:n["prevlng"] || "",
+    CUR_LAT:n["curlat"] || "",
+    CUR_LNG:n["curlng"] || "",
+    /* v20.10: MR source of last month's billing (MR_SOURCE_CD = this month's once billed) */
+    PREV_MR_SOURCE:n["prevmrsource"],
+    /* v20.11: current assessment (last month / this month) and the office Never Paid / Long Unpaid list */
+    PREV_ASSESSMENT:n["prevassessment"],
+    CUR_ASSESSMENT:n["curassessment"],
+    NPL_TYPE:n["npltype"] || "",
+    NPL_PAY_DATE:n["nplpaydate"] || "",
+    NPL_OUTSTANDING:n["nploutstanding"] || "",
+    NPL_LIST_DATE:n["npllistdate"] || ""
+  };
+
+
+  c._acct_norm=String(c.ACCT_ID||"").replace(/\D/g,"").replace(/^0+/,"");
+  c._meter_norm=String(c.METER_NO||"").toUpperCase().replace(/\s+/g,"");
+
+  return c;
+}
+
+
+
+function setMasterGate(locked) {
+  if (locked) {
+    MAIN_VIEW_IDS.forEach(id => {
+      const el=$(id);
+      if (el) el.classList.add("hidden");
+    });
+  } else {
+    showMainView("home");
+  }
+
+  ["dashboardBtn","correctionBtn","adminBtn","homeBtn"].forEach(id => {
+    const el=$(id);
+    if (el) el.disabled=locked;
+  });
+
+  const logout=$("logoutBtn");
+  if (logout) logout.disabled=false;
+}
+
+
+
+function updateMasterSetupUI(
+  status,
+  count=0,
+  message="",
+  showContinue=false
+) {
+
+
+  masterNoticeProgress(status, message);       /* v19.8: "do not minimize, about N min" */
+
+  /* v18.4: background master update: no setup screen, just a progress line. */
+  if (state.masterQuiet) {
+    masterQuietProgress(status, count, message);
+    return;
+  }
+
+  const card=$("masterSetupCard");
+  if (!card) return;
+
+  card.classList.remove("hidden");
+
+
+
+  /* TRY AGAIN button: visible only in the error state. */
+  const retryBtn=$("masterSetupRetryBtn");
+  if (retryBtn) retryBtn.classList.toggle("hidden", status!=="error");
+
+
+
+  const safeCount=
+    Math.max(0, Number(count)||0);
+
+  if (status==="ready") {
+    $("masterSetupBar").style.width="100%";
+    $("masterSetupCount").textContent=
+      `${safeCount.toLocaleString()} consumers`;
+
+    const badge=$("masterSetupBadge");
+    const text=$("masterSetupText");
+
+    badge.textContent="READY";
+    badge.className="master-setup-badge ready";
+
+    text.textContent=
+      `${safeCount.toLocaleString()} consumers loaded successfully. You can now search consumers offline.`;
+
+    $("masterSetupContinueBtn")
+      .classList
+      .toggle("hidden", !showContinue);
+
+    setMasterGate(false);
+
+  } else if (status==="error") {
+
+    $("masterSetupBar").style.width="0%";
+    $("masterSetupCount").textContent=
+      safeCount > 0
+        ? `${safeCount.toLocaleString()} consumers`
+        : "";
+
+    const badge=$("masterSetupBadge");
+    const text=$("masterSetupText");
+
+    badge.textContent="ERROR";
+    badge.className="master-setup-badge error";
+
+    text.textContent=
+      message || "Master data could not be loaded.";
+
+    $("masterSetupContinueBtn")
+      .classList
+      .add("hidden");
+
+    setMasterGate(true);
+
+  } else {
+
+    const badge=$("masterSetupBadge");
+    const text=$("masterSetupText");
+
+    badge.textContent="LOADING";
+    badge.className="master-setup-badge loading";
+
+    text.textContent=
+      message ||
+      "Consumer master data is being prepared for offline use. Please keep the app open.";
+
+    $("masterSetupContinueBtn")
+      .classList
+      .add("hidden");
+
+    /*
+     * Do not show a fake fixed consumer denominator.
+     * Download/import progress is shown in the message itself.
+     */
+    $("masterSetupCount").textContent=
+      safeCount > 0
+        ? `${safeCount.toLocaleString()} consumers imported`
+        : "";
+
+    setMasterGate(true);
+  }
+}
+
+
+
+function closeMasterSetup() {
+  if (!state.masterReady) return;
+  $("masterSetupCard").classList.add("hidden");
+  setMasterGate(false);
+}
+
+
+async function startMasterSetup() {
+  try {
+    await openMasterDB();
+    updateMasterSetupUI("loading", 0, "Checking local master data…");
+    await ensureMasterData();
+  } catch(e) {
+    console.error(e);
+    state.masterReady=false;
+    updateMasterSetupUI("error", state.masterCount || 0, e.message || "Master data setup failed.");
+  }
+}
+
+
+async function ensureMasterData() {
+
+
+  await openMasterDB();
+
+  let count =
+    await countMasterConsumers();
+
+  /*
+   * Active store empty, but the other store still holds a master
+   * (the "active" note could not be read): use it instead of
+   * downloading again. Its file id is cleared so CHECK FOR MASTER
+   * DATA UPDATE offers the newest master if this one is older.
+   */
+  if (count === 0) {
+    const other = getInactiveMasterStore();
+    const otherCount = await countMasterConsumers(other);
+    if (otherCount > 0) {
+      state.activeMasterStore = other;
+      await saveMasterMeta(Object.assign({}, getLocalMasterMeta() || {}, {
+        master_file_id: "recovered",
+        consumer_count: otherCount
+      }));
+      count = otherCount;
+    }
+  }
+
+  if (count > 0) {
+    localStorage.setItem("fieldworkMasterImportedOnce", "YES");
+  } else if (localStorage.getItem("fieldworkMasterImportedOnce") === "YES") {
+    /* The phone had a master before: say why it downloads again. */
+    console.warn("Master Data missing on this device; downloading again.");
+    state.masterRemovedNotice = true;
+  }
+
+
+  /*
+   * If a valid local master already exists,
+   * allow the application to work offline.
+   *
+   * We do NOT contact the server automatically here.
+   */
+
+
+  if (count > 0) {
+
+    /*
+     * A non-empty active master store is sufficient
+     * to continue offline.
+     *
+     * Do NOT validate against any fixed account,
+     * meter number, or hard-coded consumer record.
+     *
+     * Consumer master contents can change monthly.
+     */
+
+    state.masterCount =
+      count;
+
+    state.masterReady =
+      true;
+
+    updateMasterSetupUI(
+      "ready",
+      count,
+      "",
+      false
+    );
+
+    closeMasterSetup();
+
+    return;
+
+  }
+
+
+
+
+  /*
+   * No usable local master exists.
+   * Initial installation therefore requires the
+   * currently assigned master from the backend.
+   */
+  state.masterReady =
+    false;
+
+
+  updateMasterSetupUI(
+    "loading",
+    0,
+    state.masterRemovedNotice
+      ? "The Master Data on this phone was removed (the phone may have cleared app storage). Downloading it again…"
+      : "Checking assigned Master Data…"
+  );
+
+  const masterInfo =
+
+    await checkAssignedMaster();
+
+  updateMasterSetupUI(
+    "loading",
+    0,
+    `Downloading ${masterInfo.file_name}…`
+  );
+
+  const buffer =
+    await downloadAssignedMaster(
+      masterInfo
+    );
+
+  const importedCount =
+    await importMasterIntoPending(
+      buffer,
+      masterInfo
+    );
+
+  state.masterReady =
+    true;
+
+  state.masterCount =
+    importedCount;
+
+  updateMasterSetupUI(
+    "ready",
+    importedCount,
+    "",
+    true
+  );
+
+  setStatus(
+    "searchStatus",
+    `${importedCount.toLocaleString()} consumers loaded locally. Search is ready.`,
+    "ok"
+  );
+
+}
+
+async function checkAndUpdateMasterData() {
+
+  if (!state.sessionToken) {
+    return;
+  }
+
+  const status =
+    $("masterUpdateStatus");
+
+  const details =
+    $("masterUpdateDetails");
+
+  const button =
+    $("checkMasterUpdateBtn");
+
+  if (button) {
+    button.disabled = true;
+  }
+
+  if (status) {
+    status.className =
+      "status";
+    status.textContent =
+      "Checking assigned Master Data…";
+  }
+
+  if (details) {
+    details.classList.add(
+      "hidden"
+    );
+  }
+
+  /*
+   * Hide a previously shown UPDATE button; it is shown
+   * again below only if a new master is available.
+   */
+  const staleUpdateButton =
+    $("downloadMasterUpdateBtn");
+
+  if (staleUpdateButton) {
+    staleUpdateButton.classList.add("hidden");
+  }
+
+  try {
+
+    await openMasterDB();
+
+    const remote =
+      await checkAssignedMaster();
+
+    const local =
+      getLocalMasterMeta();
+
+    if (
+      local &&
+      String(
+        local.master_file_id || ""
+      ) ===
+      String(
+        remote.master_file_id || ""
+      ) &&
+      String(local.parser_version || "") === MASTER_PARSER_VERSION
+    ) {
+
+      if (status) {
+
+        status.className =
+          "status ok";
+
+        status.textContent =
+          "Master Data is already up to date.";
+
+      }
+
+      if (details) {
+
+        details.classList.remove(
+          "hidden"
+        );
+
+        details.innerHTML =
+          `
+          <div><b>File:</b> ${escapeHtml(remote.file_name)}</div>
+          <div><b>Last Updated:</b> ${formatMasterDate(remote.last_updated)}</div>
+          <div><b>Local Consumers:</b> ${state.masterCount.toLocaleString()}</div>
+          <div><b>Source:</b> ${masterSourceLabel(remote)}</div>
+          `;
+
+      }
+
+      /* v18.7: the same tap also downloads new daily updates. */
+      if (status) {
+        status.textContent = "Master Data is up to date. Checking daily updates…";
+      }
+
+      await syncMasterUpdates(true, true);
+
+      const synced = getLocalMasterMeta() || {};
+
+      if (status) {
+        status.textContent = synced.base_id
+          ? "Master Data is up to date. " + updatesSummaryText(synced) + "."
+          : "Master Data is already up to date.";
+      }
+
+      return;
+
+    }
+
+    /*
+     * A different Drive file is assigned.
+     */
+    if (details) {
+
+      details.classList.remove(
+        "hidden"
+      );
+
+      details.innerHTML =
+        `
+        <div><b>Current Local Master:</b>
+          ${escapeHtml(local?.file_name || "Older/unknown master")}
+        </div>
+
+        <div><b>New Master:</b>
+          ${escapeHtml(remote.file_name)}
+        </div>
+
+        <div><b>New Master Updated:</b>
+          ${formatMasterDate(remote.last_updated)}
+        </div>
+
+        <div><b>New File Size:</b>
+          ${formatBytes(remote.file_size)}
+        </div>
+        <div><b>Source:</b>
+          ${masterSourceLabel(remote)}
+        </div>
+
+        <div class="master-update-warning">
+          A new Master Data file is assigned to your subdivision.
+          Your existing local master will remain available until
+          the new file is successfully downloaded and verified.
+        </div>
+        `;
+
+    }
+
+    if (status) {
+
+      status.className =
+        "status";
+
+      status.textContent =
+        "New Master Data is available.";
+
+    }
+
+    const updateButton =
+      $("downloadMasterUpdateBtn");
+
+    if (updateButton) {
+
+      updateButton.classList.remove(
+        "hidden"
+      );
+
+      updateButton.disabled =
+        false;
+
+    }
+
+  } catch(e) {
+
+    console.error(e);
+
+    if (status) {
+
+      status.className =
+        "status error";
+
+      status.textContent =
+        e.message ||
+        "Could not check Master Data.";
+
+    }
+
+  } finally {
+
+    if (button) {
+      button.disabled = false;
+    }
+
+  }
+
+}
+
+/*
+ * Where the assigned master is served from.
+ * master_check returns source:"R2" for R2 masters;
+ * Drive responses have no source field.
+ */
+function masterSourceLabel(info) {
+  return info && info.source === "R2"
+    ? "Cloud Storage (R2)"
+    : "Google Drive";
+}
+
+/*
+ * After a manual update ends with a usable master:
+ * close the setup card and bring the Master Data card
+ * (with its status message) into view.
+ */
+function finishMasterUpdateUI() {
+
+  closeMasterSetup();
+
+  const card =
+    $("masterUpdateCard");
+
+  if (card && !card.classList.contains("hidden")) {
+    card.scrollIntoView({
+      behavior: "smooth",
+      block: "center"
+    });
+  }
+
+}
+
+
+
+async function performMasterUpdate() {
+
+  const checkButton =
+    $("checkMasterUpdateBtn");
+
+  const updateButton =
+    $("downloadMasterUpdateBtn");
+
+  const status =
+    $("masterUpdateStatus");
+
+  try {
+
+    if (checkButton) {
+      checkButton.disabled = true;
+    }
+
+    if (updateButton) {
+      updateButton.disabled = true;
+    }
+
+    updateMasterSetupUI(
+      "loading",
+      0,
+      "Checking new Master Data…"
+    );
+
+    const remote =
+      await checkAssignedMaster();
+
+    const local =
+      getLocalMasterMeta();
+
+    if (
+      local &&
+      String(
+        local.master_file_id || ""
+      ) ===
+      String(
+        remote.master_file_id || ""
+      ) &&
+      String(local.parser_version || "") === MASTER_PARSER_VERSION
+    ) {
+
+      if (status) {
+
+        status.className =
+          "status ok";
+
+        status.textContent =
+          "Master Data is already up to date.";
+
+      }
+
+      updateMasterSetupUI(
+        "ready",
+        state.masterCount,
+        "",
+        false
+      );
+      closeMasterSetup();
+      return;
+
+
+
+
+
+
+    }
+
+    updateMasterSetupUI(
+      "loading",
+      0,
+      `Downloading ${remote.file_name}…`
+    );
+
+    const buffer =
+      await downloadAssignedMaster(
+        remote
+      );
+
+    const importedCount =
+      await importMasterIntoPending(
+        buffer,
+        remote
+      );
+
+    state.masterReady =
+      true;
+
+    state.masterCount =
+      importedCount;
+
+    if (status) {
+
+      status.className =
+        "status ok";
+
+      status.textContent =
+        `Master Data updated successfully. ${importedCount.toLocaleString()} consumers are now available offline.`;
+
+    }
+
+    const details =
+      $("masterUpdateDetails");
+
+    if (details) {
+
+      details.classList.remove(
+        "hidden"
+      );
+
+      details.innerHTML =
+        `
+        <div><b>Active Master:</b>
+          ${escapeHtml(remote.file_name)}
+        </div>
+
+        <div><b>Consumers:</b>
+          ${importedCount.toLocaleString()}
+        </div>
+
+        <div><b>Updated:</b>
+          ${formatMasterDate(remote.last_updated)}
+        </div>
+        <div><b>Source:</b>
+          ${masterSourceLabel(remote)}
+        </div>
+        `;
+
+    }
+
+
+
+    updateMasterSetupUI(
+      "ready",
+      importedCount,
+      "",
+      false
+    );
+
+      /*
+       * Update finished: hide the update button (nothing left
+       * to update), close the setup card, show Master Data card.
+       */
+    if (updateButton) {
+    updateButton.classList.add("hidden");
+    }
+
+    finishMasterUpdateUI();
+
+  } catch(e) {
+
+
+    console.error(e);
+
+    if (status) {
+
+      status.className =
+        "status error";
+
+      status.textContent =
+        e.message ||
+        "Master Data update failed. Existing local master has been retained.";
+
+    }
+
+    /*
+     * IMPORTANT:
+     * Do not alter state.activeMasterStore here.
+     * The old master therefore remains active.
+     */
+    state.masterReady =
+      (state.masterCount > 0);
+
+    updateMasterSetupUI(
+      state.masterReady
+        ? "ready"
+        : "error",
+      state.masterCount,
+      state.masterReady
+        ? ""
+        : (
+          e.message ||
+          "Master Data update failed."
+        ),
+      false
+    );
+
+    /*
+     * Old master is still active: close the setup card so the
+     * user sees the error message in the Master Data card.
+     */
+    if (state.masterReady) {
+      finishMasterUpdateUI();
+    }
+
+  } finally {
+
+    if (checkButton) {
+      checkButton.disabled = false;
+    }
+
+    if (updateButton) {
+      updateButton.disabled = false;
+    }
+
+  }
+
+}
+
+
+function formatMasterDate(value) {
+
+  if (!value) {
+    return "—";
+  }
+
+  const d =
+    new Date(value);
+
+  if (
+    isNaN(
+      d.getTime()
+    )
+  ) {
+    return String(value);
+  }
+
+  return d.toLocaleString(
+    "en-IN",
+    {
+      dateStyle:"medium",
+      timeStyle:"short"
+    }
+  );
+
+}
+
+
+function formatBytes(bytes) {
+
+  const n =
+    Number(bytes) || 0;
+
+  if (n < 1024) {
+    return `${n} B`;
+  }
+
+  if (n < 1024 * 1024) {
+    return `${(n / 1024).toFixed(1)} KB`;
+  }
+
+  if (n < 1024 * 1024 * 1024) {
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+
+}
+
+
+
+function loadVillagesOfflineFirst() {
+
+  const cached = localStorage.getItem("kuthondVillageDataV2");
+
+  if (cached) {
+    try {
+      const data = JSON.parse(cached);
+
+      if (Array.isArray(data)) {
+        return Promise.resolve(data);
+      }
+    } catch(e) {}
+  }
+
+  return fetch("village.json", {cache:"no-store"})
+    .then(r => {
+      if (!r.ok) {
+        throw new Error("Could not load village.json");
+      }
+      return r.json();
+    })
+    .then(v => {
+
+      if (!Array.isArray(v)) {
+        throw new Error("Invalid village.json format.");
+      }
+
+      localStorage.setItem(
+        "kuthondVillageDataV2",
+        JSON.stringify(v)
+      );
+
+      return v;
+    });
+}
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("ConsumerMobileApp", 5);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+
+      // KEEP THE EXISTING "records" STORE AS THE STABLE DOOR-TO-DOOR
+      // SURVEY STORE. Existing survey records are not moved or rewritten.
+      if (!db.objectStoreNames.contains("records")) {
+        const store = db.createObjectStore("records", {keyPath:"id", autoIncrement:true});
+        store.createIndex("account_id", "account_id", {unique:false});
+        store.createIndex("upload_status", "upload_status", {unique:false});
+      }
+
+      // New field-work activities use separate local stores.
+      if (!db.objectStoreNames.contains("disconnections")) {
+        const store = db.createObjectStore("disconnections", {keyPath:"id", autoIncrement:true});
+        store.createIndex("account_id", "account_id", {unique:false});
+        store.createIndex("upload_status", "upload_status", {unique:false});
+      }
+      if (!db.objectStoreNames.contains("rechecks")) {
+        const store = db.createObjectStore("rechecks", {keyPath:"id", autoIncrement:true});
+        store.createIndex("account_id", "account_id", {unique:false});
+        store.createIndex("upload_status", "upload_status", {unique:false});
+      }
+      if (!db.objectStoreNames.contains("phoneCalls")) {
+        const store = db.createObjectStore("phoneCalls", {keyPath:"id", autoIncrement:true});
+        store.createIndex("account_id", "account_id", {unique:false});
+        store.createIndex("upload_status", "upload_status", {unique:false});
+      }
+
+      // Earlier test versions temporarily stored new activities in "records".
+      // Move only those activity records to their dedicated stores. Stable
+      // survey records remain untouched.
+      if (e.oldVersion < 5 && db.objectStoreNames.contains("records")) {
+        const tx = e.target.transaction;
+        const surveyStore = tx.objectStore("records");
+        const disStore = tx.objectStore("disconnections");
+        const recheckStore = tx.objectStore("rechecks");
+        const callStore = tx.objectStore("phoneCalls");
+        surveyStore.openCursor().onsuccess = ev => {
+          const cursor = ev.target.result;
+          if (!cursor) return;
+          const r = cursor.value;
+          const type = String(r.activity_type || "").trim().toUpperCase();
+          if (type === "DISCONNECTION") {
+            const copy = Object.assign({}, r);
+            delete copy.id;
+            disStore.add(copy);
+            cursor.delete();
+          } else if (type === "RECHECK") {
+            const copy = Object.assign({}, r);
+            delete copy.id;
+            recheckStore.add(copy);
+            cursor.delete();
+          } else if (type === "PHONE_CALLING") {
+            const copy = Object.assign({}, r);
+            delete copy.id;
+            callStore.add(copy);
+            cursor.delete();
+          }
+          cursor.continue();
+        };
+      }
+    };
+    req.onsuccess = e => { state.db = e.target.result; resolve(); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function openMasterDB() {
+
+  return new Promise((resolve, reject) => {
+
+    const req =
+      indexedDB.open(
+        "KuthondMasterData",
+        2
+      );
+
+    req.onupgradeneeded = e => {
+
+      const db = e.target.result;
+
+      function createMasterStore(name) {
+
+        if (
+          !db.objectStoreNames.contains(name)
+        ) {
+
+          const master =
+            db.createObjectStore(
+              name,
+              {keyPath:"ACCT_ID"}
+            );
+
+          master.createIndex(
+            "acct_norm",
+            "_acct_norm",
+            {unique:false}
+          );
+
+          master.createIndex(
+            "meter_norm",
+            "_meter_norm",
+            {unique:false}
+          );
+
+        }
+
+      }
+
+      createMasterStore(
+        "masterConsumers"
+      );
+
+      createMasterStore(
+        "masterConsumersPending"
+      );
+
+      if (
+        !db.objectStoreNames.contains(
+          "masterMeta"
+        )
+      ) {
+
+        db.createObjectStore(
+          "masterMeta",
+          {keyPath:"key"}
+        );
+
+      }
+
+    };
+
+    req.onsuccess = e => {
+
+      state.masterDb =
+        e.target.result;
+
+      /*
+       * Existing installations already have
+       * masterConsumers. It remains the default
+       * active store until metadata says otherwise.
+       */
+      state.activeMasterStore =
+        "masterConsumers";
+
+      try {
+
+        const tx =
+          state.masterDb.transaction(
+            "masterMeta",
+            "readonly"
+          );
+
+        const request =
+          tx.objectStore("masterMeta")
+            .get("active");
+
+        request.onsuccess = () => {
+
+          if (
+            request.result &&
+            (
+              request.result.store ===
+              "masterConsumers"
+              ||
+              request.result.store ===
+              "masterConsumersPending"
+            )
+          ) {
+
+            state.activeMasterStore =
+              request.result.store;
+
+          }
+
+          resolve();
+
+        };
+
+        request.onerror = () => resolve();
+
+      } catch (err) {
+
+        resolve();
+
+      }
+
+    };
+
+    req.onerror = () => {
+
+      reject(
+        req.error ||
+        new Error(
+          "Could not open local master database."
+        )
+      );
+
+    };
+
+  });
+
+}
+
+
+
+
+function saveMasterMeta(meta) {
+
+  return new Promise((resolve,reject)=>{
+
+    const tx =
+      state.masterDb.transaction(
+        "masterMeta",
+        "readwrite"
+      );
+
+    tx.objectStore("masterMeta")
+      .put(
+        Object.assign(
+          {key:"current"},
+          meta
+        )
+      );
+
+    tx.objectStore("masterMeta")
+      .put({
+        key:"active",
+        store:state.activeMasterStore
+      });
+
+    tx.oncomplete = () => {
+
+      state.masterMeta =
+        Object.assign({},meta);
+
+      localStorage.setItem(
+        "kuthondMasterMeta",
+        JSON.stringify(meta)
+      );
+
+      resolve();
+
+    };
+
+    tx.onerror = () =>
+      reject(
+        tx.error ||
+        new Error(
+          "Could not save master metadata."
+        )
+      );
+
+  });
+
+}
+
+
+function getLocalMasterMeta() {
+
+  if (state.masterMeta) {
+    return state.masterMeta;
+  }
+
+  try {
+
+    const raw =
+      localStorage.getItem(
+        "kuthondMasterMeta"
+      );
+
+    if (raw) {
+      state.masterMeta =
+        JSON.parse(raw);
+    }
+
+  } catch(e) {
+
+    state.masterMeta = null;
+
+  }
+
+  return state.masterMeta;
+
+}
+
+
+function getInactiveMasterStore() {
+
+  return state.activeMasterStore ===
+    "masterConsumers"
+      ? "masterConsumersPending"
+      : "masterConsumers";
+
+}
+
+
+
+async function activateMasterStore(
+  storeName,
+  meta
+) {
+
+  state.activeMasterStore =
+    storeName;
+
+  /* New master: Defaulter List must re-read its filter options. */
+  dlOptions = null;
+
+  await saveMasterMeta(meta);
+
+  state.masterCount =
+    await countMasterConsumers(
+      storeName
+    );
+
+  state.masterReady =
+    state.masterCount > 0;
+
+}
+
+
+
+async function checkAssignedMaster() {
+
+  /*
+   * master_check is read-only, so it is safe to retry.
+   * Only delivery failures (Google 404 HTML page, network
+   * errors) are retried. A real backend answer with
+   * success:false is NOT retried.
+   */
+  const maxAttempts = 3;
+
+  let result = null;
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+
+    try {
+
+      result =
+        await serverPost(
+          "master_check",
+          {
+            r2_capable: true
+          }
+        );
+
+      break;
+
+    } catch (err) {
+
+      console.error(
+        `master_check attempt ${attempt} failed`,
+        err
+      );
+
+      if (attempt === maxAttempts) {
+        throw new Error(
+          "Could not reach the server to check Master Data. " +
+          "Please check your internet connection and try again."
+        );
+      }
+
+      await new Promise(
+        resolve => setTimeout(resolve, 3000 * attempt)
+      );
+
+    }
+
+  }
+
+  if (!result.success) {
+    throw new Error(
+      result.message ||
+      "Could not check assigned Master Data."
+    );
+  }
+
+  return result;
+
+}
+
+function base64ToUint8Array(base64) {
+
+  const binary =
+    atob(base64);
+
+  const bytes =
+    new Uint8Array(
+      binary.length
+    );
+
+  for (
+    let i=0;
+    i<binary.length;
+    i++
+  ) {
+
+    bytes[i] =
+      binary.charCodeAt(i);
+
+  }
+
+  return bytes;
+
+}
+
+/*
+ * =========================================================
+ * R2 DIRECT MASTER DOWNLOAD
+ * =========================================================
+ * Used only when master_check returns download_url.
+ * - streams the file with progress
+ * - cancels an attempt if no data arrives for 60 seconds
+ * - up to 3 attempts before reporting failure
+ * - returns exactly totalSize bytes (Uint8Array),
+ *   the same type the existing import already receives
+ */
+/*
+ * =========================================================
+ * v19.8 MONTHLY MASTER: BACKGROUND DOWNLOAD + CLEAR NOTICE
+ * =========================================================
+ * Chrome on Android (Background Fetch): the monthly master downloads
+ * like a normal file download, with a notification, even when the app
+ * is minimized or the screen is off. The service worker keeps the file
+ * in the cache "fieldwork-master-bg" until the app loads it.
+ * Anywhere else, or if that fails, it downloads in the app as before,
+ * and a notice says: do not minimize the app, about N minutes left.
+ */
+const MASTER_BG_CACHE = "orai-fieldwork-master-bg";
+const MASTER_BG_STALL_MS = 120000;          /* no progress for 2 minutes while the app is open -> in-app download */
+const MASTER_IMPORT_MB_PER_SEC = 0.7;       /* rough loading speed, only for the "about N min" text */
+
+function masterBgId(info) {
+  return "master-" + String(info.master_file_id || "").replace(/[^A-Za-z0-9]+/g, "-").slice(-100);
+}
+
+function masterBgUrl(id) {
+  return new URL("./__master-bg/" + encodeURIComponent(id), location.href).href;
+}
+
+/* The file of a finished background download (right size), or null. */
+async function masterBgCached(info, totalSize) {
+  try {
+    if (!("caches" in window)) return null;
+    const cache = await caches.open(MASTER_BG_CACHE);
+    const res = await cache.match(masterBgUrl(masterBgId(info)));
+    if (!res) return null;
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length === totalSize) return bytes;
+    await cache.delete(masterBgUrl(masterBgId(info)));       /* wrong size: not usable */
+  } catch (e) {
+    console.warn("Background master cache", e);
+  }
+  return null;
+}
+
+async function masterBgClear() {
+  try { if ("caches" in window) await caches.delete(MASTER_BG_CACHE); } catch (e) {}
+}
+
+function minutesText(seconds) {
+  const m = Math.max(1, Math.ceil(seconds / 60));
+  return "about " + m + " min" + (m === 1 ? "" : "s");
+}
+
+/* The notice under the header (stays until the master is loaded or fails). */
+function masterNotice(text, kind) {
+  let el = $("masterNotice");
+  if (!el) {
+    /* v19.9: a small line between the "Logged in as" card and the first card below it */
+    const card = $("loggedUserName") && $("loggedUserName").closest(".card");
+    if (!card) return;
+    el = document.createElement("div");
+    el.id = "masterNotice";
+    el.setAttribute("role", "status");
+    card.insertAdjacentElement("afterend", el);
+  }
+  if (!text) { el.classList.add("hidden"); return; }
+  clearTimeout(masterNotice.hideTimer);
+  const colors = {
+    ok: "background:#e7f6ec;border:1px solid #16a34a;color:#14532d",
+    warn: "background:#fff7df;border:1px solid #e09a00;color:#6b3b00",
+    info: "background:#e0f7f4;border:1px solid #0d9488;color:#0f5f58",
+    error: "background:#fde8e8;border:1px solid #d92d20;color:#8a1c12"
+  };
+  el.style.cssText = "margin:0 0 12px;padding:6px 10px;border-radius:8px;font-size:12px;" +
+    "font-weight:600;line-height:1.35;" + (colors[kind] || colors.warn);
+  el.textContent = text;
+  el.classList.remove("hidden");
+}
+
+const masterLoadTimer = { started: 0, pct: 0 };
+
+/* v20.1: a notice that goes away by itself (daily update done / up to date) */
+function masterNoticeBrief(text, kind, ms) {
+  masterNotice(text, kind);
+  masterNotice.hideTimer = setTimeout(() => masterNotice(""), ms || 6000);
+}
+
+/* Turns the download / loading progress into the notice (called from updateMasterSetupUI). */
+function masterNoticeProgress(status, message) {
+  if (status === "ready" || status === "error") { masterNotice(""); masterLoadTimer.started = 0; return; }
+  if (status !== "loading") return;
+  const m = String(message || "").match(/^Importing Master Data… (\d+)%/);
+  if (!m) return;
+  const pct = Number(m[1]);
+  if (!masterLoadTimer.started || pct < masterLoadTimer.pct) {
+    masterLoadTimer.started = Date.now();
+  }
+  masterLoadTimer.pct = pct;
+  const elapsed = (Date.now() - masterLoadTimer.started) / 1000;
+  const left = pct >= 3 && elapsed > 2 ? elapsed * (100 - pct) / pct : 60;
+  masterNotice("Loading new monthly master " + pct + "% — keep the app open, " + minutesText(left) + " left. " +
+    "(ऐप खुला रखें)", "warn");
+}
+
+/* In-app download progress -> notice with minutes left (download + loading). */
+function masterNoticeDownload(received, totalSize, startedAt) {
+  const elapsed = (Date.now() - startedAt) / 1000;
+  const speed = elapsed > 3 && received > 512 * 1024 ? received / elapsed : 0.5 * 1024 * 1024;
+  const left = (totalSize - received) / speed + totalSize / (MASTER_IMPORT_MB_PER_SEC * 1024 * 1024);
+  const pct = Math.min(100, Math.round(100 * received / Math.max(totalSize, 1)));
+  masterNotice("New monthly master downloading " + pct + "% — do not minimize the app, " + minutesText(left) + " left. " +
+    "(ऐप मिनिमाइज़ न करें)", "warn");
+}
+
+/*
+ * Background download (Chrome on Android). Returns the file bytes, or null
+ * when the browser cannot do it or it failed (then the app downloads it itself).
+ */
+async function masterBgDownload(info, totalSize, label) {
+  const ready = await masterBgCached(info, totalSize);
+  if (ready) return ready;                                   /* finished while the app was closed */
+
+  if (!("serviceWorker" in navigator) || !window.BackgroundFetchManager || !info.download_url) return null;
+
+  let reg = null;
+  try {
+    reg = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise(resolve => setTimeout(() => resolve(null), 4000))
+    ]);
+  } catch (e) { reg = null; }
+  if (!reg || !reg.backgroundFetch) return null;
+
+  const id = masterBgId(info);
+  let bg = null;
+  try {
+    bg = await reg.backgroundFetch.get(id);
+    if (!bg) {
+      bg = await reg.backgroundFetch.fetch(id, [info.download_url], {
+        title: "Fieldwork App: monthly Master Data",
+        downloadTotal: totalSize,
+        icons: [{ src: "./icons/icon-192.png", sizes: "192x192", type: "image/png" }]
+      });
+    }
+  } catch (e) {
+    console.warn("Background download not possible here", e);
+    return null;
+  }
+
+  let lastBytes = -1;
+  let lastMoveAt = Date.now();
+  let successAt = 0;
+
+  while (true) {
+    const done = await masterBgCached(info, totalSize);
+    if (done) return done;
+
+    if (bg.result === "failure") {
+      console.warn("Background master download failed:", bg.failureReason);
+      return null;
+    }
+    if (bg.result === "success") {
+      if (!successAt) successAt = Date.now();
+      if (Date.now() - successAt > 20000) return null;       /* saved file not usable */
+    }
+
+    if (bg.downloaded !== lastBytes) {
+      lastBytes = bg.downloaded;
+      lastMoveAt = Date.now();
+    } else if (document.visibilityState === "visible" && Date.now() - lastMoveAt > MASTER_BG_STALL_MS) {
+      try { await bg.abort(); } catch (e) {}
+      return null;                                           /* stuck: download in the app instead */
+    }
+
+    const pct = Math.min(100, Math.round(100 * (bg.downloaded || 0) / Math.max(totalSize, 1)));
+    const text = "New monthly master downloading in background " + pct + "% — you may minimize; " +
+      "open the app when done to load it. (बैकग्राउंड में डाउनलोड)";
+    masterNotice(text, "info");
+    updateMasterSetupUI("loading", 0,
+      `Downloading ${label} in the background… ${formatBytes(bg.downloaded || 0)} / ${formatBytes(totalSize)}`);
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+}
+
+/* Change this when xlsxToConsumer reads new columns: phones then reload the master once. */
+const MASTER_PARSER_VERSION = "4";
+const MASTER_R2_MAX_ATTEMPTS = 3;
+const MASTER_R2_STALL_MS = 60000;
+
+async function downloadMasterFromR2(
+  masterInfo,
+  totalSize
+) {
+
+  const label =
+    masterInfo.file_name || "Master Data";
+
+  /* v19.8: a finished background download, or one started now (Chrome on Android) */
+  const bgBytes = await masterBgDownload(masterInfo, totalSize, label);
+  if (bgBytes) {
+    await masterBgClear();                     /* the bytes are in memory now; free the space */
+    return bgBytes;
+  }
+
+  let lastError = null;
+
+  for (
+    let attempt = 1;
+    attempt <= MASTER_R2_MAX_ATTEMPTS;
+    attempt++
+  ) {
+
+    try {
+
+      return await downloadMasterFromR2Once(
+        masterInfo.download_url,
+        totalSize,
+        label
+      );
+
+    } catch (err) {
+
+      lastError = err;
+
+      console.error(
+        `R2 master download attempt ${attempt} failed`,
+        err
+      );
+
+      if (attempt < MASTER_R2_MAX_ATTEMPTS) {
+
+        updateMasterSetupUI(
+          "loading",
+          0,
+          `Network problem while downloading ${label}. Retrying (${attempt + 1}/${MASTER_R2_MAX_ATTEMPTS})…`
+        );
+
+        await new Promise(
+          resolve => setTimeout(resolve, 5000 * attempt)
+        );
+
+      }
+
+    }
+
+  }
+
+  throw new Error(
+    "Master Data download failed after " +
+    MASTER_R2_MAX_ATTEMPTS +
+    " attempts. " +
+    (lastError && lastError.message ? lastError.message : "")
+  );
+
+}
+
+async function downloadMasterFromR2Once(
+  url,
+  totalSize,
+  label
+) {
+
+  const controller =
+    new AbortController();
+
+  let stallTimer = null;
+
+  const resetStall = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(
+      () => controller.abort(),
+      MASTER_R2_STALL_MS
+    );
+  };
+
+  resetStall();
+
+  try {
+
+    const response =
+      await fetch(url, {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal
+      });
+
+    if (!response.ok) {
+      throw new Error(
+        `Master Data server returned HTTP ${response.status}.`
+      );
+    }
+
+    const bytes =
+      new Uint8Array(totalSize);
+
+    let received = 0;
+
+    if (response.body && response.body.getReader) {
+
+      const reader =
+        response.body.getReader();
+
+      let lastUiUpdate = 0;
+      const startedAt = Date.now();
+      masterNoticeDownload(0, totalSize, startedAt);
+
+      while (true) {
+
+        const { done, value } =
+          await reader.read();
+
+        if (done) break;
+
+        resetStall();
+
+        if (received + value.length > totalSize) {
+          throw new Error(
+            "Master Data download is larger than expected."
+          );
+        }
+
+        bytes.set(value, received);
+        received += value.length;
+
+        const now = Date.now();
+
+        if (now - lastUiUpdate > 500) {
+          lastUiUpdate = now;
+          masterNoticeDownload(received, totalSize, startedAt);
+          updateMasterSetupUI(
+            "loading",
+            0,
+            `Downloading ${label} from Cloud Storage (R2)… ${formatBytes(received)} / ${formatBytes(totalSize)}`
+
+          );
+        }
+
+      }
+
+    } else {
+
+      /*
+       * Fallback for browsers without streaming support.
+       */
+      const whole =
+        new Uint8Array(
+          await response.arrayBuffer()
+        );
+
+      if (whole.length > totalSize) {
+        throw new Error(
+          "Master Data download is larger than expected."
+        );
+      }
+
+      bytes.set(whole, 0);
+      received = whole.length;
+
+    }
+
+    if (received !== totalSize) {
+      throw new Error(
+        "Master Data download is incomplete. " +
+        "Received " + received +
+        " bytes out of " + totalSize + "."
+      );
+    }
+
+    return bytes;
+
+  } catch (err) {
+
+    if (err && err.name === "AbortError") {
+      throw new Error(
+        "Master Data download stopped responding (no data for 60 seconds)."
+      );
+    }
+
+    throw err;
+
+  } finally {
+
+    clearTimeout(stallTimer);
+
+  }
+
+}
+
+
+async function downloadAssignedMaster(
+  masterInfo
+) {
+
+  const totalSize =
+    Number(
+      masterInfo.file_size
+    ) || 0;
+
+  if (!totalSize) {
+    throw new Error(
+      "Assigned Master File is empty."
+    );
+  }
+    /*
+   * R2 MODE: master_check returned a signed direct link.
+   * Download straight from R2. The Base64 path below is
+   * used only for subdivisions still served from Drive.
+   */
+  if (masterInfo.download_url) {
+    return await downloadMasterFromR2(
+      masterInfo,
+      totalSize
+    );
+  }
+
+  updateMasterSetupUI(
+    "loading",
+    0,
+
+    `Downloading ${masterInfo.file_name || "Master Data"} from Google Drive… Please wait.`
+  );
+
+  const result =
+    await serverPost(
+      "master_download",
+      {
+        master_file_id:
+          masterInfo.master_file_id
+      }
+    );
+
+  if (!result.success) {
+
+    throw new Error(
+      result.message ||
+      "Master Data download failed."
+    );
+
+  }
+
+  /*
+   * The server must return the same
+   * file size that master_check reported.
+   */
+  if (
+    Number(result.total_size) !==
+    totalSize
+  ) {
+
+    throw new Error(
+      "Master Data file size changed during download. " +
+      "Expected " + totalSize +
+      " bytes but server returned " +
+      result.total_size +
+      " bytes."
+    );
+
+  }
+
+  /*
+   * Decode the single Base64 response.
+   */
+  const bytes =
+    base64ToUint8Array(
+      result.data || ""
+    );
+
+  if (!bytes.length) {
+
+    throw new Error(
+      "Master Data download returned no file data."
+    );
+
+  }
+
+  /*
+   * Final client-side size verification.
+   */
+  if (
+    bytes.length !==
+    totalSize
+  ) {
+
+    throw new Error(
+      "Master Data download is incomplete. " +
+      "Received " + bytes.length +
+      " bytes out of " + totalSize + "."
+    );
+
+  }
+
+  return bytes;
+
+}
+
+async function importMasterIntoPending(
+  buffer,
+  masterInfo
+) {
+
+  /*
+   * v18.6: the Excel file is read in a background worker and its rows
+   * come here 5,000 at a time, so the screen does not freeze and much
+   * less memory is used. Browsers without workers read it here.
+   */
+  const reader =
+    await openMasterRowReader(buffer);
+
+  buffer = null;
+
+  const first =
+    await reader.next();
+
+  if (!first.rows.length) {
+    reader.close();
+    throw new Error(
+      "Consumer master XLSX is empty."
+    );
+  }
+
+  const header =
+    first.rows[0].map(x =>
+      String(
+        x ?? ""
+      )
+      .trim()
+      .toLowerCase()
+    );
+
+  const expected = [
+    ["acct_id"],
+    ["sdo_code"],
+    ["name"],
+    ["father_name"],
+    ["address"],
+    ["feeded village name", "habitat_name"],
+    ["supply_type"],
+    ["load"],
+    ["connection status", "con_status"],
+    ["meter no", "serial_nbr"],
+    ["total outstanding", "total_outstanding"],
+    ["current reading", "close_reading"],
+    ["mobile number", "mobile_no"],
+    ["last_pay_date", "updated_last_pay_date"],
+    ["last_pay_amount", "updated_last_pay_amount"]
+  ];
+
+  const normalizedHeader =
+    header.map(h => h.replace(/[^a-z0-9]/g, ""));
+
+  if (
+    !expected.every(
+      names => names.some(
+        h => normalizedHeader.includes(h.replace(/[^a-z0-9]/g, ""))
+      )
+    )
+
+  ) {
+
+    throw new Error(
+      "Master data columns do not match the approved XLSX file."
+    );
+
+  }
+
+  const pendingStore =
+    getInactiveMasterStore();
+
+  /*
+   * Clear only the inactive store.
+   *
+   * The currently active master remains untouched.
+   */
+  await clearMasterConsumers(
+    pendingStore
+  );
+
+  const sourceRows =
+    Math.max(reader.total - 1, 0);
+
+  let total = 0;
+  let seen = 0;
+  let chunk = first.rows.slice(1);
+  let done = first.done;
+
+  try {
+    while (true) {
+
+      let batch = [];
+
+      for (const row of chunk) {
+
+        seen++;
+
+        if (
+          !row ||
+          !row.some(v => String(v ?? "").trim() !== "")
+        ) {
+          continue;
+        }
+
+        const c =
+          xlsxToConsumer(
+            row,
+            header
+          );
+
+        if (!c.ACCT_ID) {
+          continue;
+        }
+
+        batch.push(c);
+
+        if (batch.length >= 500) {
+          await putMasterBatch(batch, pendingStore);
+          total += batch.length;
+          batch = [];
+        }
+      }
+
+      if (batch.length) {
+        await putMasterBatch(batch, pendingStore);
+        total += batch.length;
+      }
+
+      const pct =
+        sourceRows > 0
+          ? Math.min(100, Math.round((seen / sourceRows) * 100))
+          : 0;
+
+      updateMasterSetupUI(
+        "loading",
+        total,
+        `Importing Master Data… ${pct}%`
+      );
+
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            0
+          )
+      );
+
+      if (done) break;
+
+      const next =
+        await reader.next();
+
+      chunk = next.rows;
+      done = next.done;
+    }
+  } finally {
+    reader.close();
+  }
+
+
+
+
+  const importedCount =
+    await countMasterConsumers(
+      pendingStore
+    );
+
+  if (
+    importedCount <= 0
+  ) {
+
+    throw new Error(
+      "Master data import produced no consumer records."
+    );
+
+  }
+
+  /*
+   * Verify the imported store using the same
+   * account/meter index structure used by the app.
+   */
+
+/*
+ * Verify the imported store using an actual record
+ * from the newly imported master.
+ *
+ * Do not use fixed consumer/account sentinels because
+ * the master population changes over time.
+ */
+  let verificationRecord = null;
+  await new Promise((resolve, reject) => {
+
+    const tx =
+      state.masterDb.transaction(
+        pendingStore,
+        "readonly"
+      );
+
+    const store =
+      tx.objectStore(pendingStore);
+
+    const request =
+      store.openCursor();
+
+    request.onsuccess = () => {
+
+      const cursor =
+        request.result;
+
+      if (cursor) {
+        verificationRecord =
+          cursor.value;
+      }
+
+      resolve();
+    };
+
+    request.onerror = () => {
+      reject(
+        request.error ||
+        new Error(
+          "Could not verify imported Master Data."
+        )
+      );
+    };
+
+  });
+
+  if (
+    !verificationRecord ||
+    !verificationRecord.ACCT_ID
+  ) {
+
+    throw new Error(
+      "Master data verification failed. No valid consumer record was found after import."
+    );
+
+  }
+
+  const indexedRecord =
+    await getMasterByIndex(
+      "acct_norm",
+      verificationRecord._acct_norm,
+      pendingStore
+    );
+
+  if (
+    !indexedRecord ||
+    String(indexedRecord.ACCT_ID) !==
+    String(verificationRecord.ACCT_ID)
+  ) {
+
+    throw new Error(
+      "Master data verification failed. The imported account index could not be verified."
+    );
+
+  }
+
+
+
+  /*
+   * Only after complete import + validation do we
+   * activate the new store.
+   */
+  await activateMasterStore(
+    pendingStore,
+    {
+      master_file_id:
+        masterInfo.master_file_id,
+
+      file_name:
+        masterInfo.file_name,
+
+      file_size:
+        masterInfo.file_size,
+
+      last_updated:
+        masterInfo.last_updated,
+
+      imported_at:
+        new Date().toISOString(),
+
+      consumer_count:
+        importedCount,
+
+      parser_version:
+        MASTER_PARSER_VERSION,
+
+      /* v18.4: daily updates start from this master */
+      base_id:
+        String(verificationRecord.BASE_ID || ""),
+      updates_seq: 0,
+      report_date:
+        String(verificationRecord.REPORT_DATE || ""),
+      billing_month:
+        String(verificationRecord.BILLING_MONTH || ""),
+      master_month:
+        String(verificationRecord.MASTER_MONTH || "")
+    }
+  );
+
+  return importedCount;
+
+}
+
+function countMasterConsumers(
+  storeName = state.activeMasterStore
+) {
+
+  return new Promise((resolve,reject)=>{
+
+    const req =
+      state.masterDb
+        .transaction(
+          storeName,
+          "readonly"
+        )
+        .objectStore(storeName)
+        .count();
+
+    req.onsuccess = () =>
+      resolve(req.result);
+
+    req.onerror = () =>
+      reject(req.error);
+
+  });
+
+}
+
+
+function clearMasterConsumers(
+  storeName = state.activeMasterStore
+) {
+
+  return new Promise((resolve,reject)=>{
+
+    const tx =
+      state.masterDb.transaction(
+        storeName,
+        "readwrite"
+      );
+
+    tx.objectStore(storeName)
+      .clear();
+
+    tx.oncomplete = () =>
+      resolve();
+
+    tx.onerror = () =>
+      reject(
+        tx.error ||
+        new Error(
+          "Could not reset local master data."
+        )
+      );
+
+  });
+
+}
+
+
+function putMasterBatch(
+  batch,
+  storeName = state.activeMasterStore
+) {
+
+  return new Promise((resolve,reject)=>{
+
+    if (!batch.length) {
+      return resolve();
+    }
+
+    const tx =
+      state.masterDb.transaction(
+        storeName,
+        "readwrite"
+      );
+
+    const store =
+      tx.objectStore(storeName);
+
+    for (const c of batch) {
+      store.put(c);
+    }
+
+    tx.oncomplete = () =>
+      resolve();
+
+    tx.onerror = () =>
+      reject(
+        tx.error ||
+        new Error(
+          "Master data storage failed."
+        )
+      );
+
+  });
+
+}
+
+
+/*
+ * =========================================================
+ * ACCOUNT ID INPUT
+ * =========================================================
+ * Master account IDs have no leading zeros (Excel removes
+ * them), but users often type them (e.g. 0123456789).
+ * Searches use digits only, without leading zeros.
+ */
+function normalizeAccountInput(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  const stripped = digits.replace(/^0+/, "");
+  return stripped || digits;
+}
+
+/*
+ * Master lookup by typed account ID: tries the ID without
+ * leading zeros first, then exactly as typed (digits only),
+ * in case a master row ever keeps its leading zeros.
+ */
+async function getMasterByAccountInput(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return null;
+
+  const stripped = normalizeAccountInput(digits);
+
+  const c = await getMasterByIndex("acct_norm", stripped);
+
+  if (c || stripped === digits) return c;
+
+  return await getMasterByIndex("acct_norm", digits);
+}
+
+
+function getMasterByIndex(
+  indexName,
+  value,
+  storeName = state.activeMasterStore
+) {
+
+  return new Promise((resolve,reject)=>{
+
+    const tx =
+      state.masterDb.transaction(
+        storeName,
+        "readonly"
+      );
+
+    const req =
+      tx.objectStore(storeName)
+        .index(indexName)
+        .get(value);
+
+    req.onsuccess = () =>
+      resolve(
+        req.result || null
+      );
+
+    req.onerror = () =>
+      reject(req.error);
+
+  });
+
+}
+
+async function findLocalDuplicate(accountId) {
+  const records = await getAllRecords();
+  return records.find(r => String(r.account_id) === String(accountId)) || null;
+}
+
+function clearDuplicateWarning() {
+  state.duplicateInfo = null;
+  $("duplicateWarning").classList.add("hidden");
+  $("duplicateWarning").innerHTML = "";
+  $("saveBtn").disabled = false;
+  $("saveBtn").style.opacity = "1";
+}
+
+function showDuplicateWarning(r, source="local") {
+  state.duplicateInfo = r;
+  $("duplicateWarning").innerHTML =
+    `<strong>⚠️ Consumer Already Recorded</strong>
+     Account ID: <b>${escapeHtml(r.account_id || "")}</b><br>
+     Collected by: <b>${escapeHtml(r.user_name || r.user_id || "Unknown")}</b><br>
+     Date: ${escapeHtml(formatDate(r.created_at))}<br>
+     Mobile: ${escapeHtml(r.mobile_number || "")}<br>
+     Meter Condition: ${escapeHtml(r.meter_condition || "")}`;
+  $("duplicateWarning").classList.remove("hidden");
+  $("saveBtn").disabled = true;
+  $("saveBtn").style.opacity = ".5";
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[ch]));
+}
+
+
+
+
+function formatDate(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? value : d.toLocaleString();
+}
+
+function formatLastPayDate(value) {
+  if (!value) return "";
+
+  const s = String(value).trim();
+
+  // Standard YYYY-MM-DD format
+  const match = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) {
+    return `${match[3]}-${match[2]}-${match[1]}`;
+  }
+
+  return s;
+}
+
+
+function firstField(obj, names) {
+  for (const name of names) {
+    if (obj && obj[name] !== undefined && obj[name] !== null && String(obj[name]).trim() !== "") {
+      return String(obj[name]).trim();
+    }
+  }
+  return "";
+}
+
+function normalizedConsumerValue(c, aliases) {
+  const keys=Object.keys(c||{});
+  const norm=s=>String(s||"").toLowerCase().replace(/[^a-z0-9]/g,"");
+  const wanted=new Set(aliases.map(norm));
+  for (const k of keys) {
+    if (wanted.has(norm(k))) return c[k];
+  }
+  return "";
+}
+
+function getConsumerConnectionStatus(c) {
+  return normalizedConsumerValue(c, [
+    "CONNECTION_STATUS","connection status","CONNECTION STATUS",
+    "CONNECTIONSTATUS","connection_status"
+  ]);
+}
+
+function outstandingNumber(value) {
+  const n=Number(String(value||"").replace(/,/g,"").replace(/[₹\s]/g,""));
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function updateOutstandingAlert(value) {
+  const alert=$("outstandingAlert");
+  if (!alert) return;
+
+  const amount=outstandingNumber(value);
+
+  // No warning when there is no valid positive outstanding.
+  if (!Number.isFinite(amount) || amount <= 0) {
+    alert.classList.add("hidden");
+    alert.innerHTML="";
+    return;
+  }
+
+  let thresholdLabel="";
+  if (amount > 50000) thresholdLabel="₹50,000 से अधिक";
+  else if (amount > 20000) thresholdLabel="₹20,000 से अधिक";
+  else if (amount > 10000) thresholdLabel="₹10,000 से अधिक";
+  else if (amount > 5000) thresholdLabel="₹5,000 से अधिक";
+  else if (amount > 1000) thresholdLabel="₹1,000 से अधिक";
+  else thresholdLabel="₹1,000 तक";
+
+  const exactAmount=amount.toLocaleString("en-IN",{maximumFractionDigits:2});
+
+  alert.innerHTML =
+    '<strong>⚠️ उपभोक्ता को सूचित करें</strong>' +
+    '<br>उपभोक्ता का बकाया <b>' + thresholdLabel + '</b> है ' +
+    '(वर्तमान बकाया: <b>₹' + exactAmount + '</b>)। ' +
+    'कृपया उपभोक्ता को बिल जमा करने हेतु सूचित करें, अन्यथा नियमानुसार विद्युत आपूर्ति विच्छेदित की जा सकती है।';
+
+  alert.classList.remove("hidden");
+}
+
+function getConsumerMeterNo(c) {
+  return normalizedConsumerValue(c, [
+    "METER_NO","meter no","meter no.","METER NUMBER","METER_NUMBER"
+  ]);
+}
+
+function getConsumerReading(c) {
+  return firstField(c, ["CURRENT_READING","CURRENTREADING","READING","METER_READING","CURRENT_METER_READING"]);
+}
+
+function getConsumerOutstanding(c) {
+  return normalizedConsumerValue(c, [
+    "TOTAL_OUTSTANDING","total outstanding","total outstanding ",
+    "TOTAL OUTSTANDING ","OUTSTANDING","OUTSTANDING_AMOUNT"
+  ]);
+}
+
+function displayOrUnavailable(value) {
+  return value || "Not available in consumer data";
+}
+
+function resetExistingForm() {
+  const alert=$("outstandingAlert");
+  if (alert) alert.classList.add("hidden");
+  $("village").value="";
+  $("natureOfSupply").value="";
+  $("houseCondition").value="";
+  $("consumerPaymentResponse").value="";
+  $("consumerPaymentDate").value="";
+  $("consumerPaymentDateWrap").classList.add("hidden");
+  $("meterCondition").value="";
+  $("acInstalled").value="";
+  $("mobile").value="";
+  setExistingMobilePlaceholder(
+  "Enter 10 digit mobile number",
+  "10 अंकों का मोबाइल नंबर" );
+  $("existingRemarks").value="";
+  $("houseLocked").checked=false;
+  $("mobileRefused").checked=false;
+
+  $("mobile").disabled=false;
+
+  /* Clear the previous "Survey saved" message for the next consumer. */
+  if ($("saveStatus")) setStatus("saveStatus","");
+
+  ["feeder","dt","theftPossibility","siteReading","siteMaxDemand"].forEach(id=>{
+
+    if ($(id)) $(id).value="";
+  });
+  fillDtDropdown("dt","feeder");
+
+  $("saveBtn").disabled=false;
+
+  $("saveBtn").style.opacity="1";
+  clearDuplicateWarning();
+  state.doorSurveyGps=null;
+}
+
+
+function makeActivityId(prefix) {
+  const d=new Date();
+  const stamp=d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0")+"-"+Date.now();
+  return prefix+"-"+stamp+"-"+Math.floor(Math.random()*1000);
+}
+
+function activityTypeOf(r) {
+  if (r && r.activity_type) return String(r.activity_type).toUpperCase();
+  return "SURVEY";
+}
+
+function activityIdentity(r) {
+  const type=activityTypeOf(r);
+  const user=String(r.user_id||"").trim().toLowerCase();
+  if (type==="DISCONNECTION") return "DISCONNECTION|"+String(r.disconnection_id||"").trim();
+  if (type==="RECHECK") return "RECHECK|"+String(r.recheck_id||"").trim();
+  if (type==="PHONE_CALLING") return "PHONE_CALLING|"+String(r.calling_id||"").trim();
+  if (String(r.survey_type||"").toUpperCase()==="CONNECTION NOT IN DATABASE") {
+    return "SURVEY_NEW|"+user+"|"+String(r.survey_id||"").trim();
+  }
+  return "SURVEY_EXISTING|"+user+"|"+String(r.account_id||"").trim();
+}
+
+
+/*
+ * MAP button for an activity card: opens Google Maps at the
+ * record's GPS point. Empty when there are no valid coordinates.
+ */
+function activityMapLink(r) {
+  const lat = Number(r.latitude);
+  const lng = Number(r.longitude);
+  if (!isFinite(lat) || !isFinite(lng) || (lat === 0 && lng === 0) ||
+      Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+    return "";
+  }
+  const url = "https://www.google.com/maps/search/?api=1&query=" + lat + "," + lng;
+  return `<a class="secondary" href="${url}" target="_blank" rel="noopener" ` +
+    `style="display:inline-block;text-align:center;text-decoration:none;padding:13px 14px;border-radius:8px;font-weight:700">` +
+    `VIEW ON MAP(नक्शे पर देखें)</a>`;
+}
+
+
+function getActivityDisplayName(r) {
+  const type=activityTypeOf(r);
+  if(type==="DISCONNECTION") return "Disconnection";
+  if(type==="RECHECK") return "Recheck";
+  if(type==="PHONE_CALLING") return "Phone Calling";
+  return String(r.survey_type||"DOOR-TO-DOOR SURVEY").toUpperCase()==="CONNECTION NOT IN DATABASE"
+    ? "Door-to-Door Survey — Connection Not in Database"
+    : "Door-to-Door Survey — Existing Consumer";
+}
+
+async function getAllFromStore(storeName) {
+  return new Promise((resolve,reject)=>{
+    const tx=state.db.transaction(storeName,"readonly");
+    const req=tx.objectStore(storeName).getAll();
+    req.onsuccess=()=>resolve(req.result||[]);
+    req.onerror=()=>reject(req.error);
+  });
+}
+
+async function getAllActivityRecords() {
+  const [disconnections,rechecks,phoneCalls]=await Promise.all([
+    getAllFromStore("disconnections"),
+    getAllFromStore("rechecks"),
+    getAllFromStore("phoneCalls")
+  ]);
+  return [...disconnections,...rechecks,...phoneCalls];
+}
+
+async function searchLocalActivities(accountId) {
+  const [surveyRecords,activityRecords]=await Promise.all([getAllRecords(),getAllActivityRecords()]);
+  return [...surveyRecords,...activityRecords].filter(r=>String(r.account_id||"").trim()===String(accountId).trim());
+}
+
+function renderActivityCards(records) {
+  const box=$("activityResults");
+  if(!records.length){ box.innerHTML='<div class="muted">No activity found for this Account ID.</div>'; return; }
+  const sorted=[...records].sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0));
+  box.innerHTML=sorted.map((r,i)=>{
+    const type=activityTypeOf(r);
+    const details=[];
+    if(type==="DISCONNECTION"){
+      if(r.consumer_name) details.push("Name: "+r.consumer_name);
+      if(r.address) details.push("Address: "+r.address);
+      if(r.outstanding) details.push("Total Outstanding: "+r.outstanding);
+      else if(r.total_outstanding) details.push("Total Outstanding: "+r.total_outstanding);
+      if(r.committed_payment_date) details.push("Committed Payment Date: "+r.committed_payment_date);
+      if(r.payment_mode) details.push("Payment Mode: "+r.payment_mode);
+      if(r.disconnection_status) details.push("Status: "+r.disconnection_status);
+      if(r.meter_status) details.push("Meter Status: "+r.meter_status);
+      if(r.house_condition) details.push("House Condition: "+r.house_condition);
+    } else if(type==="SURVEY"){
+      if(r.consumer_name) details.push("Name: "+r.consumer_name);
+      if(r.address) details.push("Address: "+r.address);
+      if(r.mobile_number) details.push("Mobile: "+r.mobile_number);
+      if(r.survey_status) details.push("Status: "+r.survey_status);
+    } else if(type==="RECHECK"){
+      if(r.consumer_name) details.push("Name: "+r.consumer_name);
+      if(r.address) details.push("Address: "+r.address);
+      if(r.mobile_number) details.push("Mobile: "+r.mobile_number);
+      if(r.outstanding) details.push("Total Outstanding: "+r.outstanding);
+      else if(r.total_outstanding) details.push("Total Outstanding: "+r.total_outstanding);
+      if(r.present_status) details.push("Present Status: "+r.present_status);
+      if(r.payment_mode) details.push("Payment Mode: "+r.payment_mode);
+      if(r.meter_status) details.push("Current Meter Status: "+r.meter_status);
+    } else {
+      if(r.consumer_name) details.push("Name: "+r.consumer_name);
+      if(r.address) details.push("Address: "+r.address);
+      if(r.mobile_number) details.push("Mobile: "+r.mobile_number);
+      if(r.outstanding) details.push("Total Outstanding: "+r.outstanding);
+      else if(r.total_outstanding) details.push("Total Outstanding: "+r.total_outstanding);
+      if(r.call_response) details.push("Response: "+r.call_response);
+      if(r.committed_payment_date) details.push("Committed Payment Date: "+r.committed_payment_date);
+      else if(r.payment_date) details.push("Payment Date: "+r.payment_date);
+    }
+    const admin=state.isAdmin===true || state.userId.toLowerCase()==="admin";
+    const key=escapeHtml(activityIdentity(r));
+    return `<div class="activity-card" data-activity-key="${key}">
+      <h3>${escapeHtml(getActivityDisplayName(r))}</h3>
+      <div class="activity-meta">${escapeHtml(formatDate(r.created_at))} · ${escapeHtml(r.user_name||r.user_id||"Unknown")}</div>
+      ${r.last_updated_by_name ? `<div class="activity-meta">Last Updated By: ${escapeHtml(r.last_updated_by_name)}${r.last_updated_at ? ` · ${escapeHtml(formatDate(r.last_updated_at))}` : ""}</div>` : ""}
+      <div>${details.map(x=>`<div>${escapeHtml(x)}</div>`).join("")}</div>
+      <div class="activity-actions"><button type="button" class="secondary activity-view-btn" data-index="${i}">VIEW</button>${admin?`<button type="button" class="primary activity-correction-btn" data-index="${i}">CORRECTION</button>`:""}${activityMapLink(r)}</div>
+
+    </div>`;
+  });
+  box.querySelectorAll('.activity-view-btn').forEach(btn=>btn.addEventListener('click',()=>{
+    const r=sorted[Number(btn.dataset.index)];
+    openConfirmation("Activity Record",activityConfirmationItems(r),()=>{});
+    // Make the confirmation read-only: restore button label and disable save.
+    $("confirmSaveBtn").classList.add("hidden");
+    $("cancelConfirmBtn").textContent="CLOSE";
+  }));
+  box.querySelectorAll('.activity-correction-btn').forEach(btn=>btn.addEventListener('click',()=>{
+    const r=sorted[Number(btn.dataset.index)];
+    openActivityCorrection(r);
+  }));
+}
+
+function activityConfirmationItems(r){
+  const items=[
+    ["Activity",getActivityDisplayName(r)],
+    ["Account ID",r.account_id||""],
+    ["Consumer",r.consumer_name||""],
+    ["User",r.user_name||r.user_id||""],
+    ["Created At",formatDate(r.created_at)]
+  ];
+  const skip=new Set(["activity_type","id","upload_status","user_id","user_name","account_id","consumer_name","created_at"]);
+  if(r.last_updated_by_name) items.push(["Last Updated By",r.last_updated_by_name]);
+  if(r.last_updated_at) items.push(["Last Updated At",formatDate(r.last_updated_at)]);
+  Object.keys(r||{}).forEach(k=>{
+    if(skip.has(k)||k.endsWith("_id")||k.startsWith("last_updated_")||!r[k]) return;
+    const label=k.replaceAll("_"," ").replace(/\\b\\w/g,m=>m.toUpperCase());
+    items.push([label,String(r[k])]);
+  });
+  return items.slice(0,24);
+}
+
+function openActivitySearch(){
+  showMainView("activitySearchCard");
+  $("activityAccountId").value="";
+  $("activitySearchStatus").textContent="";
+  $("activityScopeNotice").classList.add("hidden");
+  $("activityResults").innerHTML="";
+  $("activityAccountId").focus();
+}
+
+function closeActivitySearch(){
+  $("activityAccountId").value="";
+  $("activityResults").innerHTML="";
+  $("activitySearchStatus").textContent="";
+  $("activityScopeNotice").classList.add("hidden");
+}
+
+async function searchAccountActivity(){
+
+  const accountId=normalizeAccountInput($("activityAccountId").value.trim());
+  if(!accountId) return setStatus("activitySearchStatus","Enter Account ID.","error");
+
+  setStatus("activitySearchStatus","Searching local activity...");
+
+  showGlobalLoading(
+    "Searching Activity...",
+    "Searching local records and server activity. Please wait."
+  );
+
+  closeConfirmation();
+  try{
+    const local=await searchLocalActivities(accountId);
+    let combined=[...local], online=false;
+    if(navigator.onLine && state.sessionToken){
+      try{
+        const result=await serverPost("account_activity",{account_id:accountId});
+        if(result.success){ combined=combined.concat(result.records||[]); online=true; }
+      }catch(e){ online=false; }
+    }
+    const map=new Map();
+    for(const r of combined){ const key=activityIdentity(r); if(!map.has(key)) map.set(key,r); }
+    const final=[...map.values()];
+    $("activityScopeNotice").classList.remove("hidden");
+    $("activityScopeNotice").textContent=online
+      ? "Showing local records combined with global server activity. Duplicate records are shown only once."
+      : "Showing activity from this device only. Connect to the internet to view activity history from all devices.";
+    setStatus("activitySearchStatus",`${final.length} activity record(s) found.`,"ok");
+    // keep result list for correction handlers
+    state.activityResults=final;
+    renderActivityCards(final);
+    hideGlobalLoading();
+
+  }catch(e){
+        hideGlobalLoading();
+        setStatus("activitySearchStatus","Could not search activity records.","error"); }
+}
+
+function activityCorrectionIsAdmin(){
+  return state.isAdmin===true || state.userId.toLowerCase()==="admin";
+}
+
+function activityCorrectionStoreName(record){
+  const type=activityTypeOf(record);
+  if(type==="DISCONNECTION") return "disconnections";
+  if(type==="RECHECK") return "rechecks";
+  if(type==="PHONE_CALLING") return "phoneCalls";
+  return "records";
+}
+
+function activityCorrectionIdMatches(record, candidate){
+  const type=activityTypeOf(record);
+  if(type==="DISCONNECTION") return String(candidate.disconnection_id||"").trim()===String(record.disconnection_id||"").trim();
+  if(type==="RECHECK") return String(candidate.recheck_id||"").trim()===String(record.recheck_id||"").trim();
+  if(type==="PHONE_CALLING") return String(candidate.calling_id||"").trim()===String(record.calling_id||"").trim();
+  const user=String(record.user_id||"").trim().toLowerCase();
+  if(String(record.survey_type||"").toUpperCase()==="CONNECTION NOT IN DATABASE")
+    return String(candidate.user_id||"").trim().toLowerCase()===user && String(candidate.survey_id||"").trim()===String(record.survey_id||"").trim();
+  return String(candidate.user_id||"").trim().toLowerCase()===user && String(candidate.account_id||"").trim()===String(record.account_id||"").trim();
+}
+
+function activityCorrectionSelect(id, label, value, options){
+  return `<label for="${id}">${escapeHtml(label)}</label><select id="${id}"><option value="">Select</option>${options.map(o=>`<option value="${escapeHtml(o)}"${String(value||"")===o?' selected':''}>${escapeHtml(o)}</option>`).join("")}</select>`;
+}
+
+/*
+ * =========================================================
+ * SURVEY CORRECTION: Feeder, DT, Theft, Site Reading, MD
+ * =========================================================
+ */
+const THEFT_OPTIONS_BASE = [
+  "EXTRA CABLE OTHER THAN SERVICE CABLE",
+  "BYPASS IN SERVICE CABLE",
+  "METER SHUNT DOUBT",
+  "NO METER INSTALLED",
+  "NO THEFT"
+];
+
+function isNewConnectionSurvey(record) {
+  return String(record.survey_type || "").toUpperCase() === "CONNECTION NOT IN DATABASE";
+}
+
+function theftOptionsFor(record) {
+  return isNewConnectionSurvey(record)
+    ? ["DIRECT CABLE WITHOUT CONNECTION", ...THEFT_OPTIONS_BASE]
+    : THEFT_OPTIONS_BASE;
+}
+
+/* Older new-connection records kept the site reading in current_reading. */
+function surveyCorrectionSiteReading(record) {
+  if (Object.prototype.hasOwnProperty.call(record, "site_reading")) {
+    return record.site_reading || "";
+  }
+  return isNewConnectionSurvey(record) ? (record.current_reading || "") : "";
+}
+
+function ensureSelectOption(select, value, text) {
+  if (!select || !value) return;
+  if (!Array.from(select.options).some(o => o.value === value)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = text;
+    select.appendChild(option);
+  }
+  select.value = value;
+}
+
+function setupCorrectionFeederDt(record) {
+
+  const feederSelect = $("activityCorrFeeder");
+  const dtSelect = $("activityCorrDt");
+  if (!feederSelect || !dtSelect) return;
+
+  fillFeederDropdowns(getSavedFeeders());
+
+  if (record.feeder) {
+    ensureSelectOption(
+      feederSelect,
+      (record.feeder_substation || "") + "||" + record.feeder,
+      record.feeder === "NOT KNOWN" ? NOT_KNOWN_TEXT : referenceDisplayText(record.feeder)
+    );
+    fillDtDropdown("activityCorrDt", "activityCorrFeeder");
+    ensureSelectOption(
+      dtSelect,
+      record.dt,
+      record.dt === "NOT KNOWN" ? NOT_KNOWN_TEXT : referenceDisplayText(record.dt)
+    );
+  }
+
+  feederSelect.addEventListener("change", () => {
+    dtSelect.value = "";
+    fillDtDropdown("activityCorrDt", "activityCorrFeeder");
+  });
+
+}
+
+
+function renderActivityCorrectionForm(record){
+  const type=activityTypeOf(record);
+  const box=$("activityCorrectionResult");
+  const common=`
+    <div class="correction-info">
+      <div><span>Activity</span><b>${escapeHtml(getActivityDisplayName(record))}</b></div>
+      <div><span>Account ID</span><b>${escapeHtml(record.account_id||"")}</b></div>
+      <div><span>Consumer</span><b>${escapeHtml(record.consumer_name||"")}</b></div>
+      <div><span>Original User</span><b>${escapeHtml(record.user_name||record.user_id||"Unknown")}</b></div>
+      <div><span>Original Date</span><b>${escapeHtml(formatDate(record.created_at))}</b></div>
+    </div>`;
+
+  let fields=common;
+  if(type==="DISCONNECTION"){
+    fields+=activityCorrectionSelect("activityCorrStatus","Disconnection Status",record.disconnection_status,["DISCONNECTED","HOUSE LOCK AND DISCONNECTED","TIME GIVEN FOR PAYMENT","PAID"]);
+    fields+=activityCorrectionSelect("activityCorrPaymentMode","Payment Mode",record.payment_mode,["PAID ONLINE AT SITE","PAID OFFLINE AT COUNTER","PAYMENT RECEIVED BY LINEMAN"]);
+    /* v20.17: fields added to the form in v20.11 */
+    fields+=`<label for="activityCorrPaidAmount">Amount Paid, Rs. (recorded by user)</label><input id="activityCorrPaidAmount" inputmode="decimal" value="${escapeHtml(record.paid_amount||"")}">`;
+    fields+=`<label for="activityCorrCommitDate">Committed Payment Date</label><input id="activityCorrCommitDate" type="date" value="${escapeHtml(record.committed_payment_date||"")}">`;
+    fields+=activityCorrectionSelect("activityCorrMeterStatus","Current Meter Status",record.meter_status,["OK","DAMAGED","NOT INSTALLED","BURNT","UNMETERED"]);
+    fields+=`<label for="activityCorrReading">Site Reading</label><input id="activityCorrReading" value="${escapeHtml(record.current_reading||"")}">`;
+    fields+=`<label for="activityCorrMobile">Mobile Number</label><input id="activityCorrMobile" inputmode="numeric" maxlength="10" value="${escapeHtml(record.mobile_number||"")}">`;
+    fields+=`<div class="check-row"><label><input id="activityCorrMobileRefused" type="checkbox"${String(record.mobile_refused||"").toUpperCase()==="YES"?" checked":""}>Consumer refused to give mobile number</label></div>`;
+    fields+=activityCorrectionSelect("activityCorrHouse","House Condition",record.house_condition,["kutcha house","Pucca normal house","Pucca Good house","Luxury (Rich) house"]);
+    fields+=`<label for="activityCorrRemarks">Remark</label><textarea id="activityCorrRemarks" rows="3">${escapeHtml(record.remarks||"")}</textarea>`;
+  } else if(type==="RECHECK"){
+    fields+=activityCorrectionSelect("activityCorrStatus","Present Status",record.present_status,["STILL DISCONNECTED","FOUND CONNECTED","HOUSE LOCKED","PAYMENT MADE"]);
+    fields+=activityCorrectionSelect("activityCorrPaymentMode","Payment Mode",record.payment_mode,["PAID ONLINE AT SITE","PAID OFFLINE AT COUNTER","PAYMENT RECEIVED BY LINEMAN"]);
+    fields+=activityCorrectionSelect("activityCorrMeterStatus","Current Meter Status",record.meter_status,["OK","DAMAGED","NOT INSTALLED","BURNT","UNMETERED"]);
+    fields+=`<label for="activityCorrReading">Site Reading</label><input id="activityCorrReading" value="${escapeHtml(record.current_reading||"")}">`;
+    fields+=`<label for="activityCorrMobile">Mobile Number</label><input id="activityCorrMobile" inputmode="numeric" maxlength="10" value="${escapeHtml(record.mobile_number||"")}">`;
+    fields+=`<label for="activityCorrRemarks">Remark</label><textarea id="activityCorrRemarks" rows="3">${escapeHtml(record.remarks||"")}</textarea>`;
+  } else if(type==="PHONE_CALLING"){
+    fields+=`<label for="activityCorrMobile">Mobile Number</label><input id="activityCorrMobile" inputmode="numeric" maxlength="10" value="${escapeHtml(record.mobile_number||"")}">`;
+
+    fields+=activityCorrectionSelect("activityCorrResponse","Call Response",record.call_response,["गलत नंबर","कॉल रिसीव नहीं कर रहे","कुछ दिन बाद जमा करेंगे","जमा नहीं करेंगे","बिल गलत है","घर पर बात करेंगे","JE/SDO से बात करेंगे","डबल कनेक्शन है","PD होना है","बिल जमा है","कार्यालय आएंगे","नंबर स्विच ऑफ है","नंबर नॉट रीचेबल है","इनकमिंग कॉल उपलब्ध नहीं है","अमान्य नंबर","अन्य"]);
+    fields+=`<label for="activityCorrCommitDate">Committed Payment Date</label><input id="activityCorrCommitDate" type="date" value="${escapeHtml(record.committed_payment_date||record.payment_date||"")}">`;
+    fields+=`<label for="activityCorrRemarks">Remark</label><textarea id="activityCorrRemarks" rows="3">${escapeHtml(record.remarks||"")}</textarea>`;
+  } else {
+
+    fields+=activityCorrectionSelect("activityCorrVillage","Village",record.village,[...new Set([record.village||"", ...Array.from($("village").options).map(o=>o.value).filter(Boolean)])].filter(Boolean));
+    fields+=`<label for="activityCorrFeeder">Feeder</label><select id="activityCorrFeeder"><option value="">Select feeder</option></select>`;
+    fields+=`<label for="activityCorrDt">DT</label><select id="activityCorrDt"><option value="">Select DT</option></select>`;
+    fields+=activityCorrectionSelect("activityCorrMeterStatus","Meter Condition",record.meter_condition,["OK","DAMAGED","NOT INSTALLED"]);
+    fields+=`<label for="activityCorrSiteReading">Site Reading</label><input id="activityCorrSiteReading" inputmode="decimal" value="${escapeHtml(surveyCorrectionSiteReading(record))}">`;
+    fields+=`<label for="activityCorrSiteMd">Site Max Demand</label><input id="activityCorrSiteMd" inputmode="decimal" value="${escapeHtml(record.site_max_demand||"")}">`;
+    fields+=activityCorrectionSelect("activityCorrTheft","Theft Possibility",record.theft_possibility,theftOptionsFor(record));
+
+
+    fields+=activityCorrectionSelect("activityCorrAc","AC Installed",record.ac_installed,["YES","NO"]);
+    fields+=`<label for="activityCorrMobile">Mobile Number</label><input id="activityCorrMobile" inputmode="numeric" maxlength="10" value="${escapeHtml(record.mobile_number||"")}">`;
+    fields+=`<label for="activityCorrRemarks">Remark</label><textarea id="activityCorrRemarks" rows="3">${escapeHtml(record.remarks||"")}</textarea>`;
+  }
+  box.innerHTML=fields+`<button id="activityCorrectionSaveBtn" class="primary" type="button">SAVE CORRECTION</button><div id="activityCorrectionStatus" class="status"></div>`;
+  box.classList.remove("hidden");
+  $("correctionResult").classList.add("hidden");
+  $("correctionSearchStatus").textContent="";
+
+  setupCorrectionFeederDt(record);
+  $("activityCorrectionSaveBtn").addEventListener("click",()=>prepareActivityCorrectionSave(record));
+}
+
+async function openActivityCorrection(record){
+  if(!activityCorrectionIsAdmin()) return;
+  showMainView("correctionCard");
+  $("correctionAccountId").value=record.account_id||"";
+  $("activityCorrectionResult").classList.add("hidden");
+  $("correctionResult").classList.add("hidden");
+  $("correctionSearchStatus").textContent="";
+  renderActivityCorrectionForm(record);
+}
+
+function prepareActivityCorrectionSave(original){
+  const type=activityTypeOf(original);
+  const corrected=Object.assign({},original);
+  corrected.upload_status="PENDING";
+
+  if(type==="DISCONNECTION"){
+    corrected.disconnection_status=$("activityCorrStatus").value;
+    corrected.payment_mode=$("activityCorrPaymentMode").value;
+    corrected.committed_payment_date=$("activityCorrCommitDate").value;
+    corrected.meter_status=$("activityCorrMeterStatus").value;
+    corrected.current_reading=$("activityCorrReading").value.trim();
+    corrected.mobile_number=$("activityCorrMobile").value.replace(/\D/g,"");
+    corrected.house_condition=$("activityCorrHouse").value;
+    corrected.remarks=$("activityCorrRemarks").value.trim();
+    if(!corrected.disconnection_status) return setStatus("activityCorrectionStatus","Select disconnection status.","error");
+    if(corrected.disconnection_status==="PAID" && !corrected.payment_mode) return setStatus("activityCorrectionStatus","Select payment mode.","error");
+    if(corrected.disconnection_status==="TIME GIVEN FOR PAYMENT" && !corrected.committed_payment_date) return setStatus("activityCorrectionStatus","Select committed payment date.","error");
+    if(!corrected.meter_status) return setStatus("activityCorrectionStatus","Select current meter status.","error");
+    if(corrected.mobile_number && !/^\d{10}$/.test(corrected.mobile_number)) return setStatus("activityCorrectionStatus","Enter a valid 10 digit mobile number.","error");
+    if(!corrected.house_condition) return setStatus("activityCorrectionStatus","Select house condition.","error");
+    /* v20.17: amount paid (only for Paid) and consumer refused (only for Disconnected) */
+    const paidText=$("activityCorrPaidAmount").value.replace(/,/g,"").trim();
+    if(paidText && !(Number(paidText)>0)) return setStatus("activityCorrectionStatus","Amount paid must be a number.","error");
+    const wasPaidWithAmount=String(original.disconnection_status||"").toUpperCase()==="PAID" && String(original.paid_amount||"").trim()!=="";
+    if(corrected.disconnection_status==="PAID" && !paidText && (wasPaidWithAmount || String(original.disconnection_status||"").toUpperCase()!=="PAID"))
+      return setStatus("activityCorrectionStatus","Enter the amount paid.","error");
+    corrected.paid_amount=corrected.disconnection_status==="PAID" ? paidText : "";
+    const refused=corrected.disconnection_status==="DISCONNECTED" && $("activityCorrMobileRefused").checked;
+    if(refused && corrected.mobile_number) return setStatus("activityCorrectionStatus","Consumer refused is ticked: clear the mobile number, or untick it.","error");
+    corrected.mobile_refused=refused ? "YES" : "NO";
+  } else if(type==="RECHECK"){
+    corrected.present_status=$("activityCorrStatus").value;
+    corrected.payment_mode=$("activityCorrPaymentMode").value;
+    corrected.meter_status=$("activityCorrMeterStatus").value;
+    corrected.current_reading=$("activityCorrReading").value.trim();
+    corrected.mobile_number=$("activityCorrMobile").value.replace(/\D/g,"");
+    corrected.remarks=$("activityCorrRemarks").value.trim();
+    if(!corrected.present_status) return setStatus("activityCorrectionStatus","Select present status.","error");
+    if(corrected.present_status==="PAYMENT MADE" && !corrected.payment_mode) return setStatus("activityCorrectionStatus","Select payment mode.","error");
+    if(corrected.present_status==="FOUND CONNECTED" && !corrected.meter_status) return setStatus("activityCorrectionStatus","Select current meter status.","error");
+    if(corrected.mobile_number && !/^\d{10}$/.test(corrected.mobile_number)) return setStatus("activityCorrectionStatus","Enter a valid 10 digit mobile number.","error");
+  } else if(type==="PHONE_CALLING"){
+    corrected.mobile_number=$("activityCorrMobile").value.replace(/\D/g,"");
+    corrected.call_response=$("activityCorrResponse").value;
+    corrected.committed_payment_date=$("activityCorrCommitDate").value;
+    corrected.payment_date=corrected.committed_payment_date;
+    corrected.remarks=$("activityCorrRemarks").value.trim();
+    if(!/^\d{10}$/.test(corrected.mobile_number)) return setStatus("activityCorrectionStatus","Enter a valid 10 digit mobile number.","error");
+    if(!corrected.call_response) return setStatus("activityCorrectionStatus","Select call response.","error");
+    if(corrected.call_response==="कुछ दिन बाद जमा करेंगे" && !corrected.committed_payment_date) return setStatus("activityCorrectionStatus","Enter committed payment date.","error");
+  } else {
+    corrected.village=$("activityCorrVillage").value;
+    corrected.meter_condition=$("activityCorrMeterStatus").value;
+    corrected.ac_installed=$("activityCorrAc").value;
+    corrected.mobile_number=$("activityCorrMobile").value.replace(/\D/g,"");
+    corrected.remarks=$("activityCorrRemarks").value.trim();
+    // Survey cards use activity_type="SURVEY" for the activity-search UI.
+    // Record the admin who performed the correction without changing the original owner.
+    corrected.last_updated_by_user_id=state.userId||"";
+    corrected.last_updated_by_name=state.userName||state.userId||"";
+    corrected.last_updated_at=new Date().toISOString();
+    if(!corrected.village) return setStatus("activityCorrectionStatus","Select village.","error");
+    if(!corrected.meter_condition) return setStatus("activityCorrectionStatus","Select meter condition.","error");
+    if(!corrected.ac_installed) return setStatus("activityCorrectionStatus","Select AC Installed: YES or NO.","error");
+    if(!/^\d{10}$/.test(corrected.mobile_number)) return setStatus("activityCorrectionStatus","Enter a valid 10 digit mobile number.","error");
+
+    /*
+     * New survey fields. Mandatory for records saved with them;
+     * optional for older records. Fields left empty on older
+     * records are not sent, so existing sheet cells stay as they are.
+     */
+    const hadNewFields=Object.prototype.hasOwnProperty.call(original,"feeder");
+    const feederValue=$("activityCorrFeeder").value;
+    const dtValue=$("activityCorrDt").value;
+    const theftValue=$("activityCorrTheft").value;
+    const siteReading=$("activityCorrSiteReading").value.trim();
+    const siteMd=$("activityCorrSiteMd").value.trim();
+
+    if(hadNewFields && !feederValue) return setStatus("activityCorrectionStatus","Select feeder.","error");
+    if((hadNewFields || feederValue) && !dtValue) return setStatus("activityCorrectionStatus","Select DT.","error");
+    if(hadNewFields && !theftValue) return setStatus("activityCorrectionStatus","Select theft possibility.","error");
+    if(!isValidOptionalNumber(siteReading)) return setStatus("activityCorrectionStatus","Site reading must be a number.","error");
+    if(!isValidOptionalNumber(siteMd)) return setStatus("activityCorrectionStatus","Site max demand must be a number.","error");
+
+    if(feederValue){
+      const feederInfo=parseFeederValue(feederValue);
+      corrected.feeder_substation=feederInfo.substation;
+      corrected.feeder=feederInfo.feeder;
+      corrected.dt=dtValue;
+    }
+    if(theftValue) corrected.theft_possibility=theftValue;
+
+    const hadSiteFields=Object.prototype.hasOwnProperty.call(original,"site_reading");
+    if(hadNewFields || hadSiteFields || siteReading || siteMd){
+      corrected.site_reading=siteReading;
+      corrected.site_max_demand=siteMd;
+      /* Older new-connection record: reading moves from Master to Site Reading. */
+      if(isNewConnectionSurvey(original) && !hadSiteFields) corrected.current_reading="";
+    }
+  }
+
+  const items=[
+    ["Activity",getActivityDisplayName(corrected)],
+    ["Account ID",corrected.account_id||""],
+    ["Consumer",corrected.consumer_name||""],
+    ["Total Outstanding",corrected.outstanding||"—"]
+  ];
+  if(type==="DISCONNECTION") items.push(["Disconnection Status",corrected.disconnection_status], ["Payment Mode",corrected.payment_mode||"—"], ["Amount Paid",corrected.paid_amount ? "₹"+corrected.paid_amount : "—"], ["Committed Payment Date",corrected.committed_payment_date||"—"], ["Meter Status",corrected.meter_status], ["Site Reading",corrected.current_reading||"—"], ["Mobile",corrected.mobile_refused==="YES" ? "Not provided - Consumer Refused" : (corrected.mobile_number||"—")], ["House Condition",corrected.house_condition], ["Remark",corrected.remarks||"—"]);
+  else if(type==="RECHECK") items.push(["Present Status",corrected.present_status], ["Payment Mode",corrected.payment_mode||"—"], ["Current Meter Status",corrected.meter_status||"—"], ["Site Reading",corrected.current_reading||"—"], ["Mobile",corrected.mobile_number||"—"], ["Remark",corrected.remarks||"—"]);
+  else if(type==="PHONE_CALLING") items.push(["Mobile",corrected.mobile_number], ["Call Response",corrected.call_response], ["Committed Payment Date",corrected.committed_payment_date||"—"], ["Remark",corrected.remarks||"—"]);
+
+  else items.push(["Village",corrected.village], ["Feeder",corrected.feeder?feederDisplay(corrected):"—"], ["DT",corrected.dt||"—"], ["Meter Condition",corrected.meter_condition], ["Site Reading",corrected.site_reading||"—"], ["Site Max Demand",corrected.site_max_demand||"—"], ["Theft Possibility",corrected.theft_possibility||"—"], ["AC Installed",corrected.ac_installed], ["Mobile",corrected.mobile_number], ["Remark",corrected.remarks||"—"]);
+  openConfirmation("Confirm Correction",items,()=>saveActivityCorrectionLocal(corrected));
+}
+
+async function saveActivityCorrectionLocal(corrected){
+  const storeName=activityCorrectionStoreName(corrected);
+  try{
+    const existing=await getAllFromStore(storeName);
+    const match=existing.find(r=>activityCorrectionIdMatches(corrected,r));
+    const record=Object.assign({},corrected);
+    if(match && match.id!==undefined) record.id=match.id;
+    await new Promise((resolve,reject)=>{
+      const tx=state.db.transaction(storeName,"readwrite");
+      tx.objectStore(storeName).put(record);
+      tx.oncomplete=resolve;
+      tx.onerror=()=>reject(tx.error||new Error("Could not save correction."));
+    });
+    closeConfirmation();
+    $("activityCorrectionResult").classList.add("hidden");
+    $("correctionStatus").textContent="";
+    if(Array.isArray(state.activityResults)) {
+      state.activityResults=state.activityResults.map(r=>activityIdentity(r)===activityIdentity(record) ? record : r);
+      renderActivityCards(state.activityResults);
+      showMainView("activitySearchCard");
+      setStatus("activitySearchStatus","Correction saved locally and marked Pending Upload. Upload it from the Home screen.","ok");
+    } else {
+      setStatus("correctionSearchStatus","Correction saved locally and marked Pending Upload. Upload it from the Home screen.","ok");
+    }
+    await updateCounts();
+  }catch(e){
+    setStatus("activityCorrectionStatus",e.message||"Could not save correction.","error");
+  }
+}
+
+function resetPhoneCallingForm(){
+  const ids=["phoneAccountId","phoneMobile","phoneResponse","phonePaymentDate","phoneRemarks"];
+  ids.forEach(id=>{
+    const el=$(id);
+    if(!el) return;
+    el.value="";
+  });
+  $("phoneConsumerCard").classList.add("hidden");
+  $("phoneFormFields").classList.add("hidden");
+  $("phonePaymentDateWrap").classList.add("hidden");
+  $("phoneCallBtn").disabled=true;
+  $("phoneSearchStatus").textContent="";
+  $("phoneSaveStatus").textContent="";
+  state.phoneCurrent=null;
+}
+
+function openPhoneCalling(){
+  resetPhoneCallingForm();
+  showMainView("phoneCallingCard");
+  $("phoneAccountId").focus();
+}
+
+async function searchPhoneConsumer(){
+  if(!state.sessionToken) return showLogin();
+  if(!state.masterReady) return setStatus("phoneSearchStatus","Master data is still loading. Please wait until it finishes.","error");
+
+  const raw=$("phoneAccountId").value.trim();
+  if(!raw) return setStatus("phoneSearchStatus","Enter an Account ID.","error");
+
+  let c=null;
+  try{
+
+    c=await getMasterByAccountInput(raw);
+
+  }catch(e){
+    return setStatus("phoneSearchStatus","Local master data is not available. Please reopen the app.","error");
+  }
+
+  if(!c){
+    state.phoneCurrent=null;
+    $("phoneConsumerCard").classList.add("hidden");
+    $("phoneFormFields").classList.add("hidden");
+    $("phoneCallBtn").disabled=true;
+    return setStatus("phoneSearchStatus","Consumer not found. Make sure the Account ID is exactly as shown in the source data.","error");
+  }
+
+  state.phoneCurrent=c;
+  $("phoneAcct").textContent=c.ACCT_ID||"";
+  $("phoneName").textContent=c.NAME||"";
+  $("phoneFather").textContent=c.FATHER_NAME||"";
+  $("phoneAddress").textContent=c.ADDRESS||"";
+  $("phoneSupply").textContent=c.SUPPLY_TYPE||"";
+  $("phoneLoad").textContent=c.LOAD||"";
+  $("phoneSdoCode").textContent =c.SDO_CODE || "";
+  $("phoneFeededVillage").textContent =c.feeded_village_name || "";
+  $("phoneLastPayDate").textContent =formatLastPayDate(c.LAST_PAY_DATE);
+  $("phoneLastPayAmount").textContent =c.LAST_PAY_AMOUNT || "";
+  if ($("phoneConsumptionCurr")) $("phoneConsumptionCurr").textContent =
+
+    consumptionText(c); showLastBill(c);
+
+  $("phoneOutstanding").textContent=displayOrUnavailable(getConsumerOutstanding(c));
+
+  const mobile=String(c.MOBILE_NUMBER||"").trim();
+  $("phoneMobile").value=mobile;
+  $("phoneCallBtn").disabled=!/^\d{10}$/.test(mobile);
+  $("phoneConsumerCard").classList.remove("hidden");
+  $("phoneFormFields").classList.remove("hidden");
+  $("phoneResponse").value="";
+  $("phonePaymentDate").value="";
+  $("phoneRemarks").value="";
+  $("phonePaymentDateWrap").classList.add("hidden");
+  setStatus("phoneSearchStatus","Consumer found. Verify the mobile number before calling.","ok");
+}
+
+function updatePhoneConditionalFields(){
+  const response=$("phoneResponse").value;
+  $("phonePaymentDateWrap").classList.toggle("hidden",response!=="कुछ दिन बाद जमा करेंगे");
+  if(response!=="कुछ दिन बाद जमा करेंगे") $("phonePaymentDate").value="";
+}
+
+function callPhoneNumber(){
+  const mobile=$("phoneMobile").value.trim();
+  if(!/^\d{10}$/.test(mobile)) return setStatus("phoneSaveStatus","Enter a valid 10 digit mobile number before calling.","error");
+  window.location.href="tel:"+mobile;
+}
+
+function preparePhoneCallSave(){
+  const c=state.phoneCurrent;
+  if(!c) return setStatus("phoneSaveStatus","Search an Account ID first.","error");
+
+  const mobile=$("phoneMobile").value.trim();
+  const response=$("phoneResponse").value;
+  const paymentDate=$("phonePaymentDate").value;
+  const remarks=$("phoneRemarks").value.trim();
+
+  if(!/^\d{10}$/.test(mobile)) return setStatus("phoneSaveStatus","Enter a valid 10 digit mobile number.","error");
+  if(!response) return setStatus("phoneSaveStatus","Select a call response.","error");
+  if(response==="कुछ दिन बाद जमा करेंगे" && !paymentDate) return setStatus("phoneSaveStatus","Enter the date by which the consumer will pay.","error");
+  if(response==="अन्य" && !remarks) return setStatus("phoneSaveStatus","Remarks are mandatory for 'अन्य'.","error");
+
+  const record={
+    activity_type:"PHONE_CALLING",
+    calling_id:makeActivityId("CALL"),
+    user_id:state.userId,
+    user_name:state.userName,
+    account_id:c.ACCT_ID||"",
+    consumer_name:c.NAME||"",
+    father_name:c.FATHER_NAME||"",
+    address:c.ADDRESS||"",
+    supply_type:c.SUPPLY_TYPE||"",
+    load:c.LOAD||"",
+
+    sdo_code:c.SDO_CODE || "",
+    feeded_village_name:c.feeded_village_name || "",
+    connection_status:c.CONNECTION_STATUS || "",
+    last_pay_date:c.LAST_PAY_DATE || "",
+    last_pay_amount:c.LAST_PAY_AMOUNT || "",
+
+    outstanding:getConsumerOutstanding(c),
+    mobile_number:mobile,
+    call_response:response,
+    committed_payment_date:paymentDate,
+    payment_date:paymentDate,
+    remarks:remarks,
+    created_at:new Date().toISOString(),
+    upload_status:"PENDING"
+  };
+
+  openConfirmation("Confirm Phone Calling",[
+    ["Account ID",record.account_id],
+    ["Consumer",record.consumer_name],
+    ["Address",record.address],
+    ["Total Outstanding",record.outstanding||"—"],
+    ["Mobile Number",record.mobile_number],
+    ["Call Response",record.call_response],
+    ["Committed Payment Date",record.committed_payment_date||"—"],
+    ["Remarks",record.remarks||"—"]
+  ],()=>savePhoneCallLocal(record));
+}
+
+function savePhoneCallLocal(record){
+  return new Promise(resolve=>{
+    const tx=state.db.transaction("phoneCalls","readwrite");
+    tx.objectStore("phoneCalls").add(record);
+    tx.oncomplete=()=>{
+      closeConfirmation();
+      resetPhoneCallingForm();
+      showMainView("home");
+      setStatus("phoneSaveStatus","Phone call response saved locally. Ready for the next entry.","ok");
+      updateCounts();
+      resolve(true);
+    };
+    tx.onerror=()=>{
+      closeConfirmation();
+      setStatus("phoneSaveStatus","Could not save phone call response.","error");
+      resolve(false);
+    };
+  });
+}
+
+
+function resetRecheckForm(){
+  ["recheckAccountId","recheckStatus","recheckPaymentMode","recheckMeterStatus","recheckReading","recheckMobile","recheckRemarks"].forEach(id=>{
+    const el=$(id);
+    if(!el) return;
+    el.value="";
+  });
+  $("recheckPaymentModeWrap").classList.add("hidden");
+  $("recheckConsumerCard").classList.add("hidden");
+  $("recheckFormFields").classList.add("hidden");
+  $("recheckSearchStatus").textContent="";
+  const recheckResults=$("recheckSearchResults");
+  if(recheckResults){
+      recheckResults.innerHTML="";
+      recheckResults.classList.add("hidden");
+  }
+
+  $("recheckSearchType").value="ACCOUNT";
+  $("recheckVillageFilter").value="";
+  $("recheckSaveStatus").textContent="";
+  clearActivityVideo("RECHECK");
+  if (state) {
+
+    state.recheckCurrent=null;
+    state.recheckGps=null;
+  }
+}
+
+
+
+function openRecheck(){
+  resetRecheckForm();
+  showMainView("recheckCard");
+  updateModuleSearchPlaceholder("recheckSearchType","recheckAccountId");
+  $("recheckAccountId").focus();
+}
+
+function updateModuleSearchPlaceholder(typeId,inputId){
+  const typeEl=$(typeId);
+  const input=$(inputId);
+
+  if(!typeEl || !input) return;
+
+  const placeholders={
+    ACCOUNT:{
+      en:"Enter account ID",
+      hi:"खाता संख्या दर्ज करें"
+    },
+    NAME:{
+      en:"Enter consumer name",
+      hi:"उपभोक्ता का नाम दर्ज करें"
+    },
+    FATHER_NAME:{
+      en:"Enter father name",
+      hi:"पिता का नाम दर्ज करें"
+    },
+    MOBILE:{
+      en:"Enter mobile number",
+      hi:"मोबाइल नंबर दर्ज करें"
+    },
+    METER:{
+      en:"Enter meter number",
+      hi:"मीटर नंबर दर्ज करें"
+    }
+  };
+
+  const item=placeholders[typeEl.value] || placeholders.ACCOUNT;
+
+  input.dataset.languagePlaceholderOriginal =
+    item.en+"("+item.hi+")";
+
+  input.placeholder =
+    currentLanguage==="hi"
+      ? item.hi
+      : item.en;
+}
+
+function showModuleSearchResults(results,boxId,onSelect){
+
+  const box=$(boxId);
+
+  if(!box) return;
+
+  box.innerHTML="";
+
+  if(!results.length){
+    box.classList.add("hidden");
+    return;
+  }
+
+  results.forEach(c=>{
+
+    const card=document.createElement("div");
+
+    card.className="search-result-card";
+
+    card.innerHTML=`
+      <div><strong>Account ID:</strong> ${escapeHtml(c.ACCT_ID || "")}</div>
+      <div><strong>Name:</strong> ${escapeHtml(c.NAME || "")}</div>
+      <div><strong>Father/Husband:</strong> ${escapeHtml(c.FATHER_NAME || "")}</div>
+      <div><strong>Address:</strong> ${escapeHtml(c.ADDRESS || "")}</div>
+      <div><strong>Village:</strong> ${escapeHtml(c.feeded_village_name || "")}</div>
+      <div><strong>Mobile:</strong> ${escapeHtml(c.MOBILE_NUMBER || "")}</div>
+      <div><strong>Meter:</strong> ${escapeHtml(c.METER_NO || "")}</div>
+    `;
+
+    card.addEventListener("click",()=>{
+      box.innerHTML="";
+      box.classList.add("hidden");
+      onSelect(c);
+    });
+
+    box.appendChild(card);
+  });
+
+  box.classList.remove("hidden");
+}
+
+
+async function searchRecheckConsumer(){
+
+  const searchType=$("recheckSearchType").value;
+  const rawValue=$("recheckAccountId").value.trim();
+  const village=$("recheckVillageFilter").value.trim();
+
+  if(!rawValue){
+    return setStatus(
+      "recheckSearchStatus",
+      "Enter a search value.",
+      "error"
+    );
+  }
+
+  if(!state.masterReady){
+    return setStatus(
+      "recheckSearchStatus",
+      "Master data is still loading. Please wait.",
+      "error"
+    );
+  }
+
+  let results=[];
+  showGlobalLoading(
+    "Searching...",
+    "Searching consumer data. Please wait."
+  );
+
+
+  try{
+
+    if(searchType==="ACCOUNT"){
+
+      const normalized=rawValue.replace(/\D/g,"");
+
+
+      const c=await getMasterByAccountInput(
+          normalized
+      );
+
+    if(c){
+          if(
+            village &&
+            String(c.feeded_village_name || "")
+              .trim()
+              .toLowerCase() !== village.toLowerCase()
+          ){
+            results=[];
+          }else{
+            results=[c];
+          }
+      }
+    }else{
+      results=await findMasterConsumers(
+        searchType,
+        rawValue,
+        village
+      );
+
+    }
+
+  }catch(e){
+
+    console.error(e);
+    hideGlobalLoading();
+
+    return setStatus(
+      "recheckSearchStatus",
+      "Could not read local consumer data.",
+      "error"
+    );
+  }
+
+  if(!results.length){
+
+    state.recheckCurrent=null;
+
+    $("recheckConsumerCard").classList.add("hidden");
+    $("recheckFormFields").classList.add("hidden");
+
+    showModuleSearchResults(
+      [],
+      "recheckSearchResults",
+      ()=>{}
+    );
+    hideGlobalLoading();
+
+    return setStatus(
+      "recheckSearchStatus",
+      "No matching consumer found.",
+      "error"
+    );
+  }
+
+  if(results.length>1){
+
+    $("recheckConsumerCard").classList.add("hidden");
+    $("recheckFormFields").classList.add("hidden");
+
+    showModuleSearchResults(
+      results,
+      "recheckSearchResults",
+      selectRecheckConsumerFromSearch
+    );
+    hideGlobalLoading();
+
+    return setStatus(
+      "recheckSearchStatus",
+      `${results.length} consumers found. Select the correct consumer.`,
+      "ok"
+    );
+  }
+
+  selectRecheckConsumerFromSearch(results[0]);
+  hideGlobalLoading();
+}
+
+function selectRecheckConsumerFromSearch(c){
+
+  state.recheckCurrent=c;
+
+  $("rcAcct").textContent=c.ACCT_ID||"";
+  $("rcName").textContent=c.NAME||"";
+  $("rcFather").textContent=c.FATHER_NAME||"";
+  $("rcAddress").textContent=c.ADDRESS||"";
+  $("rcSupply").textContent=c.SUPPLY_TYPE||"";
+  $("rcLoad").textContent=c.LOAD||"";
+  $("rcSdoCode").textContent=c.SDO_CODE||"";
+  $("rcFeededVillage").textContent=c.feeded_village_name||"";
+  $("rcLastPayDate").textContent=formatLastPayDate(c.LAST_PAY_DATE);
+  $("rcLastPayAmount").textContent=c.LAST_PAY_AMOUNT||"";
+  if ($("rcConsumptionCurr")) $("rcConsumptionCurr").textContent =
+    consumptionText(c); showLastBill(c);
+
+  $("rcMeterNo").textContent=
+    displayOrUnavailable(getConsumerMeterNo(c));
+
+  $("rcOutstanding").textContent=
+    displayOrUnavailable(getConsumerOutstanding(c));
+
+  $("recheckConsumerCard").classList.remove("hidden");
+  $("recheckFormFields").classList.remove("hidden");
+
+  setStatus(
+    "recheckSearchStatus",
+    "Consumer found. Fill the rechecking details.",
+    "ok"
+  );
+
+  captureRecheckGps();
+}
+
+function captureRecheckGps(){
+  state.recheckGps=null;
+  if(!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(pos=>{
+    state.recheckGps={
+      latitude:pos.coords.latitude,
+      longitude:pos.coords.longitude,
+      accuracy:pos.coords.accuracy
+    };
+  },()=>{}, {enableHighAccuracy:true,timeout:8000,maximumAge:60000});
+}
+
+function updateRecheckConditionalFields(){
+  const status=$("recheckStatus").value;
+  $("recheckPaymentModeWrap").classList.toggle("hidden",status!=="PAYMENT MADE");
+  if(status!=="PAYMENT MADE") $("recheckPaymentMode").value="";
+}
+
+function prepareRecheckSave(){
+  if(state.deviceHasCamera===false) return setStatus("recheckSaveStatus","This device does not have a camera, so this form cannot be submitted.","error");
+  const c=state.recheckCurrent;
+
+  if(!c) return setStatus("recheckSaveStatus","Search an Account ID first.","error");
+
+  const status=$("recheckStatus").value;
+  const paymentMode=$("recheckPaymentMode").value;
+  const meter=$("recheckMeterStatus").value;
+  const reading=$("recheckReading").value.trim();
+  const mobile=$("recheckMobile").value.replace(/\D/g,"");
+  const remarks=$("recheckRemarks").value.trim();
+
+  if(!status) return setStatus("recheckSaveStatus","Select present status.","error");
+  if(status==="PAYMENT MADE" && !paymentMode) return setStatus("recheckSaveStatus","Select payment mode.","error");
+  if(status==="FOUND CONNECTED" && !meter) return setStatus("recheckSaveStatus","Select current meter status.","error");
+  if(mobile && !/^\d{10}$/.test(mobile)) return setStatus("recheckSaveStatus","Enter a valid 10 digit mobile number.","error");
+  const videoProblem=checkActivityVideo("RECHECK",c,isVideoRequired("RECHECK",status));
+
+  if(videoProblem) return setStatus("recheckSaveStatus",videoProblem,"error");
+  const video=getActivityVideo("RECHECK");
+
+  const record={
+    activity_type:"RECHECK",
+
+    recheck_id:makeActivityId("RECHK"),
+    user_id:state.userId,
+    user_name:state.userName,
+    account_id:c.ACCT_ID||"",
+    consumer_name:c.NAME||"",
+    father_name:c.FATHER_NAME||"",
+    address:c.ADDRESS||"",
+    supply_type:c.SUPPLY_TYPE||"",
+    load:c.LOAD||"",
+
+    sdo_code:c.SDO_CODE || "",
+    feeded_village_name:c.feeded_village_name || "",
+    connection_status:c.CONNECTION_STATUS || "",
+    last_pay_date:c.LAST_PAY_DATE || "",
+    last_pay_amount:c.LAST_PAY_AMOUNT || "",
+    outstanding:getConsumerOutstanding(c),
+    present_status:status,
+    payment_mode:paymentMode,
+    payment_date:"",
+    office_list:officeListName(c),
+    meter_status:meter,
+    current_reading:reading,
+    mobile_number:mobile,
+    remarks:remarks,
+    latitude:state.recheckGps?state.recheckGps.latitude:"",
+    longitude:state.recheckGps?state.recheckGps.longitude:"",
+    gps_accuracy:state.recheckGps?state.recheckGps.accuracy:"",
+    created_at:new Date().toISOString(),
+    upload_status:"PENDING"
+  };
+
+  if(video) attachVideoToRecord(record,video);
+  openConfirmation("Confirm Recheck",[
+    ["Account ID",record.account_id],
+    ["Consumer",record.consumer_name],
+    ["Address",record.address],
+    ["Total Outstanding",record.outstanding||"—"],
+    ["Present Status",record.present_status],
+    ["Payment Mode",record.payment_mode||"—"],
+    ["Current Meter Status",record.meter_status||"—"],
+    ["Site Reading",record.current_reading||"—"],
+    ["Mobile Number",record.mobile_number||"—"],
+    ["Remark",record.remarks||"—"],
+    ["Video",video?videoSummary(video):"Not required"]
+
+  ],async()=>{
+    if(video) downloadActivityVideo(video);
+    const sharing=shareAtConfirm(record,video);   /* opens WhatsApp sharing now, from the CONFIRM tap */
+    const saved=await saveRecheckLocal(record);
+
+    if(saved && video) await keepVideoForUpload(record,video);
+    if(saved) afterSaveShare(record,video,sharing);
+  });
+
+}
+
+function saveRecheckLocal(record){
+  return new Promise(resolve=>{
+    const tx=state.db.transaction("rechecks","readwrite");
+    tx.objectStore("rechecks").add(record);
+    tx.oncomplete=()=>{
+      closeConfirmation();
+      resetRecheckForm();
+      showMainView("home");
+      updateCounts();
+      resolve(true);
+    };
+    tx.onerror=()=>{
+      closeConfirmation();
+      setStatus("recheckSaveStatus","Could not save recheck.","error");
+      resolve(false);
+    };
+  });
+}
+
+function resetDisconnectionForm(){
+  ["disconnectAccountId","disconnectStatus","disconnectPaymentMode","disconnectCommitDate","disconnectMeterStatus","disconnectReading","disconnectMobile","disconnectHouseCondition","disconnectRemarks"].forEach(id=>{const el=$(id); if(!el)return; if(el.tagName==="SELECT")el.value=""; else el.value="";});
+  $("disconnectPaymentModeWrap").classList.add("hidden");
+  $("disconnectCommitDateWrap").classList.add("hidden");
+  /* v20.11 */
+  if ($("disconnectPaidAmount")) $("disconnectPaidAmount").value = "";
+  if ($("disconnectMobileRefused")) { $("disconnectMobileRefused").checked = false; $("disconnectMobile").disabled = false; }
+  if ($("disconnectMobileRefusedWrap")) $("disconnectMobileRefusedWrap").classList.add("hidden");
+  $("disconnectConsumerCard").classList.add("hidden");
+  $("disconnectFormFields").classList.add("hidden");
+  $("disconnectSearchStatus").textContent="";
+  const disconnectResults=$("disconnectSearchResults");
+  if(disconnectResults){
+      disconnectResults.innerHTML="";
+      disconnectResults.classList.add("hidden");
+  }
+
+  $("disconnectSearchType").value="ACCOUNT";
+  $("disconnectVillageFilter").value="";
+  $("disconnectSaveStatus").textContent="";
+  state.disconnectCurrent=null; state.disconnectGps=null;
+  clearActivityVideo("DISCONNECTION");
+
+}
+
+function openDisconnection(){
+  resetDisconnectionForm();
+  showMainView("disconnectionCard");
+  updateModuleSearchPlaceholder("disconnectSearchType","disconnectAccountId");
+  $("disconnectAccountId").focus();
+}
+
+
+async function searchDisconnectionConsumer(){
+
+  const searchType=$("disconnectSearchType").value;
+  const rawValue=$("disconnectAccountId").value.trim();
+  const village=$("disconnectVillageFilter").value.trim();
+
+  if(!rawValue){
+    return setStatus(
+      "disconnectSearchStatus",
+      "Enter a search value.",
+      "error"
+    );
+  }
+
+  if(!state.masterReady){
+    return setStatus(
+      "disconnectSearchStatus",
+      "Master data is still loading. Please wait.",
+      "error"
+    );
+  }
+
+  let results=[];
+
+  showGlobalLoading(
+    "Searching...",
+    "Searching consumer data. Please wait."
+  );
+
+  try{
+
+    if(searchType==="ACCOUNT"){
+
+      const normalized=rawValue.replace(/\D/g,"");
+
+
+      const c=await getMasterByAccountInput(
+          normalized
+      );
+
+
+      if(c){
+
+          if(
+            village &&
+            String(c.feeded_village_name || "")
+              .trim()
+              .toLowerCase() !== village.toLowerCase()
+          ){
+            results=[];
+          }else{
+            results=[c];
+          }
+      }
+    }else{
+
+      results=await findMasterConsumers(
+        searchType,
+        rawValue,
+        village
+      );
+
+    }
+
+  }catch(e){
+
+    console.error(e);
+    hideGlobalLoading();
+
+    return setStatus(
+      "disconnectSearchStatus",
+      "Could not read local consumer data.",
+      "error"
+    );
+  }
+
+  if(!results.length){
+
+    state.disconnectCurrent=null;
+
+    $("disconnectConsumerCard").classList.add("hidden");
+    $("disconnectFormFields").classList.add("hidden");
+
+    showModuleSearchResults(
+      [],
+      "disconnectSearchResults",
+      ()=>{}
+    );
+
+    hideGlobalLoading();
+
+    return setStatus(
+      "disconnectSearchStatus",
+      "No matching consumer found.",
+      "error"
+    );
+  }
+
+  if(results.length>1){
+
+    $("disconnectConsumerCard").classList.add("hidden");
+    $("disconnectFormFields").classList.add("hidden");
+
+    showModuleSearchResults(
+      results,
+      "disconnectSearchResults",
+      selectDisconnectionConsumerFromSearch
+    );
+
+    hideGlobalLoading();
+    return setStatus(
+      "disconnectSearchStatus",
+      `${results.length} consumers found. Select the correct consumer.`,
+      "ok"
+    );
+  }
+
+  selectDisconnectionConsumerFromSearch(results[0]);
+  hideGlobalLoading();
+
+}
+
+function selectDisconnectionConsumerFromSearch(c){
+
+  state.disconnectCurrent=c;
+
+  $("dcAcct").textContent=c.ACCT_ID||"";
+  $("dcName").textContent=c.NAME||"";
+  $("dcFather").textContent=c.FATHER_NAME||"";
+  $("dcAddress").textContent=c.ADDRESS||"";
+  $("dcSupply").textContent=c.SUPPLY_TYPE||"";
+  $("dcLoad").textContent=c.LOAD||"";
+  $("dcSdoCode").textContent=c.SDO_CODE||"";
+  $("dcFeededVillage").textContent=c.feeded_village_name||"";
+  $("dcLastPayDate").textContent=formatLastPayDate(c.LAST_PAY_DATE);
+  $("dcLastPayAmount").textContent=c.LAST_PAY_AMOUNT||"";
+  if ($("dcConsumptionCurr")) $("dcConsumptionCurr").textContent =
+    consumptionText(c); showLastBill(c);
+
+
+  $("dcMeterNo").textContent=
+    displayOrUnavailable(getConsumerMeterNo(c));
+
+  $("dcOutstanding").textContent=
+    displayOrUnavailable(getConsumerOutstanding(c));
+
+  $("disconnectConsumerCard").classList.remove("hidden");
+  $("disconnectFormFields").classList.remove("hidden");
+
+  setStatus(
+    "disconnectSearchStatus",
+    "Consumer found. Fill the disconnection details.",
+    "ok"
+  );
+
+  captureDisconnectionGps();
+}
+
+function captureDisconnectionGps(){
+  state.disconnectGps=null;
+  if(!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(pos=>{
+    state.disconnectGps={latitude:pos.coords.latitude,longitude:pos.coords.longitude,accuracy:pos.coords.accuracy};
+  },()=>{}, {enableHighAccuracy:true,timeout:8000,maximumAge:60000});
+}
+
+function captureDoorSurveyGps(){
+  state.doorSurveyGps=null;
+
+  if(!navigator.geolocation) return;
+
+  navigator.geolocation.getCurrentPosition(pos=>{
+    state.doorSurveyGps={
+      latitude:pos.coords.latitude,
+      longitude:pos.coords.longitude,
+      accuracy:pos.coords.accuracy
+    };
+  },()=>{},{
+    enableHighAccuracy:true,
+    timeout:8000,
+    maximumAge:60000
+  });
+}
+
+function updateDisconnectionConditionalFields(){
+  const status=$("disconnectStatus").value;
+  $("disconnectPaymentModeWrap").classList.toggle("hidden",status!=="PAID");
+  $("disconnectCommitDateWrap").classList.toggle("hidden",status!=="TIME GIVEN FOR PAYMENT");
+  if(status!=="PAID") $("disconnectPaymentMode").value="";
+  if(status!=="TIME GIVEN FOR PAYMENT") $("disconnectCommitDate").value="";
+  /* v20.11: amount for Paid; "refused" only for Disconnected (Paid / Time given need the mobile number) */
+  if(status!=="PAID" && $("disconnectPaidAmount")) $("disconnectPaidAmount").value="";
+  if($("disconnectMobileRefusedWrap")){
+    $("disconnectMobileRefusedWrap").classList.toggle("hidden",status!=="DISCONNECTED");
+    if(status!=="DISCONNECTED"){ $("disconnectMobileRefused").checked=false; $("disconnectMobile").disabled=false; }
+  }
+}
+function updateDisconnectMobileRefused(){
+  const refused=$("disconnectMobileRefused").checked;
+  if(refused) $("disconnectMobile").value="";
+  $("disconnectMobile").disabled=refused;
+}
+
+function prepareDisconnectionSave(){
+  if(state.deviceHasCamera===false) return setStatus("disconnectSaveStatus","This device does not have a camera, so this form cannot be submitted.","error");
+  const c=state.disconnectCurrent;
+
+  if(!c) return setStatus("disconnectSaveStatus","Search an Account ID first.","error");
+  const status=$("disconnectStatus").value;
+  const paymentMode=$("disconnectPaymentMode").value;
+  const commitDate=$("disconnectCommitDate").value;
+  const meter=$("disconnectMeterStatus").value;
+  const reading=$("disconnectReading").value.trim();
+  const mobile=$("disconnectMobile").value.replace(/\D/g,"");
+  const house=$("disconnectHouseCondition").value;
+  const remarks=$("disconnectRemarks").value.trim();
+  if(!status) return setStatus("disconnectSaveStatus","Select disconnection status.","error");
+  if(status==="PAID" && !paymentMode) return setStatus("disconnectSaveStatus","Select payment mode.","error");
+  if(status==="TIME GIVEN FOR PAYMENT" && !commitDate) return setStatus("disconnectSaveStatus","Select committed payment date.","error");
+  if(!meter) return setStatus("disconnectSaveStatus","Select current meter status.","error");
+  /* v20.11: mobile number needed for Paid and Time Given; for Disconnected unless the consumer refused */
+  const mobileRefused=status==="DISCONNECTED" && !!($("disconnectMobileRefused") && $("disconnectMobileRefused").checked);
+  const paidAmountText=$("disconnectPaidAmount") ? $("disconnectPaidAmount").value.replace(/,/g,"").trim() : "";
+  if(status==="PAID" && !(Number(paidAmountText)>0)) return setStatus("disconnectSaveStatus","Enter the amount paid.","error");
+  const houseLock=status==="HOUSE LOCK AND DISCONNECTED";      /* v20.17: nobody at home, mobile number if known */
+  if(houseLock && mobile && !/^\d{10}$/.test(mobile)) return setStatus("disconnectSaveStatus","Enter a valid 10 digit mobile number, or leave it empty.","error");
+  if(!houseLock && !mobileRefused && !/^\d{10}$/.test(mobile)) return setStatus("disconnectSaveStatus",
+    status==="DISCONNECTED" ? "Enter a valid 10 digit mobile number, or tick Consumer Refused." : "Enter a valid 10 digit mobile number.","error");
+  if(!house) return setStatus("disconnectSaveStatus","Select house condition.","error");
+  const videoProblem=checkActivityVideo("DISCONNECTION",c,isVideoRequired("DISCONNECTION",status));
+
+  if(videoProblem) return setStatus("disconnectSaveStatus",videoProblem,"error");
+  const video=getActivityVideo("DISCONNECTION");
+  const record={
+
+    activity_type:"DISCONNECTION",
+    disconnection_id:makeActivityId("DISC"),
+    user_id:state.userId,user_name:state.userName,
+    account_id:c.ACCT_ID,consumer_name:c.NAME||"",father_name:c.FATHER_NAME||"",address:c.ADDRESS||"",supply_type:c.SUPPLY_TYPE||"",load:c.LOAD||"",sdo_code:c.SDO_CODE || "",
+    feeded_village_name:c.feeded_village_name || "",
+    connection_status:c.CONNECTION_STATUS || "",
+    last_pay_date:c.LAST_PAY_DATE || "",
+    last_pay_amount:c.LAST_PAY_AMOUNT || "",
+    disconnection_status:status,payment_mode:paymentMode,committed_payment_date:commitDate,
+    outstanding:getConsumerOutstanding(c),
+    meter_status:meter,current_reading:reading,mobile_number:mobile,house_condition:house,remarks,
+    paid_amount:status==="PAID" ? paidAmountText : "",
+    mobile_refused:mobileRefused ? "YES" : "NO",
+    office_list:officeListName(c),
+    master_data_up_to:String((getLocalMasterMeta() || {}).report_date || ""),
+    latitude:state.disconnectGps?state.disconnectGps.latitude:"",longitude:state.disconnectGps?state.disconnectGps.longitude:"",gps_accuracy:state.disconnectGps?state.disconnectGps.accuracy:"",
+    created_at:new Date().toISOString(),upload_status:"PENDING"
+  };
+
+  if(video) attachVideoToRecord(record,video);
+  openConfirmation("Confirm Disconnection",[
+    ["Account ID",record.account_id],["Consumer",record.consumer_name],["Disconnection Status",record.disconnection_status],
+    ["Payment Mode",record.payment_mode||"—"],["Amount Paid",record.paid_amount ? "₹"+record.paid_amount : "—"],
+    ["Committed Payment Date",record.committed_payment_date||"—"],["Meter Status",record.meter_status],
+    ["Site Reading",record.current_reading||"—"],["Mobile",mobileRefused ? "Not provided - Consumer Refused" : (record.mobile_number||"—")],["House Condition",record.house_condition],["Remark",record.remarks||"—"],
+    ["Video",video?videoSummary(video):"Not required"]
+  ],async()=>{
+    if(video) downloadActivityVideo(video);
+    const sharing=shareAtConfirm(record,video);   /* opens WhatsApp sharing now, from the CONFIRM tap */
+    const saved=await saveActivityLocalRecord(record,"disconnectSaveStatus");
+
+    if(saved && video) await keepVideoForUpload(record,video);
+    if(saved) afterSaveShare(record,video,sharing);
+  });
+
+}
+
+function saveActivityLocalRecord(record,statusId){
+  const type=String(record.activity_type||"").trim().toUpperCase();
+  const storeName=type==="DISCONNECTION" ? "disconnections" : type==="RECHECK" ? "rechecks" : type==="PHONE_CALLING" ? "phoneCalls" : "records";
+  return new Promise(resolve=>{
+    const tx=state.db.transaction(storeName,"readwrite");
+    tx.objectStore(storeName).add(record);
+    tx.oncomplete=()=>{
+      closeConfirmation(); resetDisconnectionForm(); showMainView("home");
+      setStatus(statusId,"Disconnection saved locally. Ready for the next entry.","ok");
+      updateCounts(); resolve(true);
+    };
+    tx.onerror=()=>{closeConfirmation();setStatus(statusId,"Could not save disconnection.","error");resolve(false);};
+  });
+}
+
+function closeAllSurveyForms() {
+  $("existingSearchCard").classList.add("hidden");
+  $("consumerCard").classList.add("hidden");
+  $("entryCard").classList.add("hidden");
+  $("newSurveyCard").classList.add("hidden");
+  resetRecheckForm();
+  showMainView("home");
+  $("searchStatus").textContent="";
+  $("newSaveStatus").textContent="";
+  state.current=null;
+  resetExistingForm();
+  resetNewSurveyForm();
+  resetDisconnectionForm();
+  resetPhoneCallingForm();
+  closeActivitySearch();
+}
+
+function goHome() {
+  closeConfirmation();
+  closeAllSurveyForms();
+  showMainView("home");
+  window.scrollTo({top:0, behavior:"smooth"});
+}
+
+function updateExistingSearchPlaceholder() {
+  const type = $("searchType").value;
+  const input = $("accountId");
+
+  if (!input) return;
+
+  const placeholders = {
+    ACCOUNT: {
+      en: "Enter account ID",
+      hi: "खाता संख्या दर्ज करें"
+    },
+    NAME: {
+      en: "Enter consumer name",
+      hi: "उपभोक्ता का नाम दर्ज करें"
+    },
+    FATHER_NAME: {
+      en: "Enter father name",
+      hi: "पिता का नाम दर्ज करें"
+    },
+    MOBILE: {
+      en: "Enter mobile number",
+      hi: "मोबाइल नंबर दर्ज करें"
+    },
+    METER: {
+      en: "Enter meter number",
+      hi: "मीटर नंबर दर्ज करें"
+    }
+  };
+
+  const item = placeholders[type] || placeholders.ACCOUNT;
+
+  input.dataset.languagePlaceholderOriginal =
+    item.en + "(" + item.hi + ")";
+
+  input.placeholder =
+    currentLanguage === "hi"
+      ? item.hi
+      : item.en;
+}
+
+function showExistingSurvey() {
+  showMainView("existingSearchCard");
+  $("accountId").value="";
+  $("searchStatus").textContent="";
+  updateExistingSearchPlaceholder();
+  $("accountId").focus();
+}
+
+
+
+function showNewSurvey() {
+  showMainView("newSurveyCard");
+  $("newSaveStatus").textContent="";
+  captureDoorSurveyGps();
+  $("newConnectionType").focus();
+}
+
+function setExistingMobilePlaceholder(english, hindi) {
+  const mobile=$("mobile");
+  if (!mobile) return;
+
+  const bilingual=english+"("+hindi+")";
+
+  mobile.dataset.languagePlaceholderOriginal=bilingual;
+  mobile.setAttribute("placeholder", bilingual);
+
+  applyLanguageToPlaceholders();
+}
+
+function updateExistingSpecialOptions() {
+  const locked=$("houseLocked").checked;
+  const refused=$("mobileRefused").checked;
+
+  if (locked) {
+    $("mobileRefused").checked=false;
+    $("mobileRefused").disabled=true;
+    $("mobile").value="";
+    $("mobile").disabled=true;
+    setExistingMobilePlaceholder(
+      "House Locked - Mobile Number Not Available",
+      "मकान बंद - मोबाइल नंबर उपलब्ध नहीं"
+    );
+  } else {
+    $("mobileRefused").disabled=false;
+    $("mobile").disabled=refused;
+  }
+
+  if (refused) {
+    $("houseLocked").checked=false;
+    $("houseLocked").disabled=true;
+    $("mobile").value="";
+    $("mobile").disabled=true;
+    setExistingMobilePlaceholder(
+      "Consumer Refused - Mobile Number Not Provided",
+      "उपभोक्ता ने मोबाइल नंबर देने से मना किया"
+    );
+  } else {
+    $("houseLocked").disabled=false;
+    if (!locked) {
+      $("mobile").disabled=false;
+      setExistingMobilePlaceholder(
+        "Enter 10 digit mobile number",
+        "10 अंकों का मोबाइल नंबर"
+      );
+    }
+  }
+}
+
+function surveyStatusForExisting() {
+  if ($("houseLocked").checked) return "HOUSE LOCKED";
+  if ($("mobileRefused").checked) return "MOBILE REFUSED";
+  return "CONSUMER FOUND";
+}
+
+function makeConfirmationDetails(items) {
+  return items.map(([label,value]) =>
+    `<div><b>${escapeHtml(label)}:</b> ${escapeHtml(value || "—")}</div>`
+  ).join("");
+}
+
+function openConfirmation(title, items, callback) {
+  $("confirmTitle").textContent=title;
+  $("confirmDetails").innerHTML=makeConfirmationDetails(items);
+
+  // Reset the confirmation controls every time a new confirmation opens.
+  // Account Activity VIEW hides CONFIRM & SAVE; survey confirmation must restore it.
+  $("confirmSaveBtn").classList.remove("hidden");
+  $("cancelConfirmBtn").textContent="CANCEL";
+
+  $("confirmModal").classList.remove("hidden");
+  state.pendingConfirmation=callback;
+}
+
+function closeConfirmation() {
+  $("confirmModal").classList.add("hidden");
+  state.pendingConfirmation=null;
+}
+
+function findMasterConsumers(searchType, searchValue, villageValue) {
+
+  return new Promise((resolve, reject) => {
+
+    const results = [];
+
+    const tx = state.masterDb.transaction(
+      state.activeMasterStore,
+      "readonly"
+    );
+
+    const store =
+      tx.objectStore(
+        state.activeMasterStore
+      );
+
+
+    const search = String(searchValue || "")
+      .trim()
+      .toLowerCase();
+
+    const village = String(villageValue || "")
+      .trim()
+      .toLowerCase();
+
+    const request = store.openCursor();
+
+    request.onsuccess = event => {
+
+      const cursor = event.target.result;
+
+      if (!cursor) {
+        resolve(results);
+        return;
+      }
+
+      const c = cursor.value;
+
+      // Village filter
+      if (village) {
+
+        const consumerVillage =
+          String(c.feeded_village_name || "")
+            .trim()
+            .toLowerCase();
+
+        if (consumerVillage !== village) {
+          cursor.continue();
+          return;
+        }
+      }
+
+      let fieldValue = "";
+
+      if (searchType === "NAME") {
+        fieldValue =
+          String(c.NAME || "")
+            .trim()
+            .toLowerCase();
+
+      } else if (searchType === "MOBILE") {
+        fieldValue =
+          String(c.MOBILE_NUMBER || "")
+            .replace(/\D/g,"");
+
+      } else if (searchType === "METER") {
+        fieldValue =
+          String(c.METER_NO || "")
+            .toLowerCase()
+            .replace(/\s+/g,"");
+      } else if (searchType === "FATHER_NAME") {
+          fieldValue =
+            String(c.FATHER_NAME || "")
+              .trim()
+              .toLowerCase();
+      }
+
+      let matches = false;
+
+      if (searchType === "NAME") {
+
+        matches = fieldValue.includes(search);
+
+      } else if (searchType === "MOBILE") {
+
+        matches = fieldValue.includes(
+          search.replace(/\D/g,"")
+        );
+
+      } else if (searchType === "METER") {
+
+        matches = fieldValue.includes(
+          search.replace(/\s+/g,"")
+        );
+      } else if (searchType === "FATHER_NAME") {
+
+          matches = fieldValue.includes(search);
+      }
+
+
+      if (matches) {
+        results.push(c);
+      }
+
+      cursor.continue();
+    };
+
+    request.onerror = () => {
+      reject(request.error);
+    };
+
+  });
+}
+
+
+async function searchConsumer() {
+
+  updateOutstandingAlert("");
+
+  if (!state.sessionToken) return showLogin();
+
+  if (!state.masterReady) {
+    return setStatus(
+      "searchStatus",
+      "Master data is still loading. Please wait until it finishes.",
+      "error"
+    );
+  }
+
+  const searchType = $("searchType").value;
+
+  const rawValue =
+    $("accountId").value.trim();
+
+  const village =
+    $("villageFilter").value.trim();
+
+  if (!rawValue) {
+    return setStatus(
+      "searchStatus",
+      "Enter a search value.",
+      "error"
+    );
+  }
+
+  let results = [];
+
+  showGlobalLoading(
+    "Searching...",
+    "Searching consumer data. Please wait."
+  );
+
+
+  try {
+
+    // ACCOUNT ID remains exact
+    if (searchType === "ACCOUNT") {
+
+      const normalized =
+        rawValue.replace(/\D/g,"");
+
+
+      const c =
+        await getMasterByAccountInput(
+          normalized
+        );
+
+
+
+
+      if (c) {
+
+        if (
+          village &&
+          String(c.feeded_village_name || "")
+            .trim()
+            .toLowerCase() !==
+          village.toLowerCase()
+        ) {
+          results = [];
+        } else {
+          results = [c];
+        }
+      }
+
+    } else {
+
+      results =
+        await findMasterConsumers(
+          searchType,
+          rawValue,
+          village
+        );
+    }
+
+
+  } catch (e) {
+
+    console.error(e);
+    hideGlobalLoading();
+
+    return setStatus(
+      "searchStatus",
+      "Local master data is not available. Please reopen the app.",
+      "error"
+    );
+  }
+
+  // No result
+  if (!results.length) {
+
+    state.current = null;
+
+    $("consumerCard").classList.add("hidden");
+    $("entryCard").classList.add("hidden");
+
+    hideGlobalLoading();
+    return setStatus(
+      "searchStatus",
+      "No matching consumer found.",
+      "error"
+    );
+  }
+
+  // Multiple results
+  if (results.length > 1) {
+
+    showConsumerSearchResults(results);
+
+    $("consumerCard").classList.add("hidden");
+    $("entryCard").classList.add("hidden");
+
+    hideGlobalLoading();
+    return setStatus(
+      "searchStatus",
+      `${results.length} consumers found. Select the correct consumer.`,
+      "ok"
+    );
+  }
+
+  // Exactly one result
+  selectConsumerFromSearch(results[0]);
+  hideGlobalLoading();
+}
+
+function showConsumerSearchResults(results) {
+
+  let box = $("searchResults");
+
+  if (!box) {
+
+    box = document.createElement("div");
+
+    box.id = "searchResults";
+
+    box.className = "search-results";
+
+    $("searchStatus").insertAdjacentElement(
+      "afterend",
+      box
+    );
+  }
+
+  box.innerHTML = "";
+
+  results.forEach((c, index) => {
+
+    const card =
+      document.createElement("div");
+
+    card.className = "search-result-card";
+
+    card.innerHTML = `
+      <div><strong>Account ID:</strong> ${escapeHtml(c.ACCT_ID || "")}</div>
+      <div><strong>Name:</strong> ${escapeHtml(c.NAME || "")}</div>
+      <div><strong>Father/Husband:</strong> ${escapeHtml(c.FATHER_NAME || "")}</div>
+      <div><strong>Address:</strong> ${escapeHtml(c.ADDRESS || "")}</div>
+      <div><strong>Village:</strong> ${escapeHtml(c.feeded_village_name || "")}</div>
+      <div><strong>Mobile:</strong> ${escapeHtml(c.MOBILE_NUMBER || "")}</div>
+      <div><strong>Meter:</strong> ${escapeHtml(c.METER_NO || "")}</div>
+    `;
+
+    card.addEventListener(
+      "click",
+      () => selectConsumerFromSearch(c)
+    );
+
+    box.appendChild(card);
+  });
+}
+
+
+
+function selectConsumerFromSearch(c) {
+
+  const box = $("searchResults");
+
+  if (box) {
+    box.innerHTML = "";
+  }
+
+  clearDuplicateWarning();
+
+  state.current = c;
+
+  $("dAcct").textContent =
+    c.ACCT_ID || "";
+
+  $("dName").textContent =
+    c.NAME || "";
+
+  $("dFather").textContent =
+    c.FATHER_NAME || "";
+
+  $("dAddress").textContent =
+    c.ADDRESS || "";
+
+  $("dSupply").textContent =
+    c.SUPPLY_TYPE || "";
+
+  $("dLoad").textContent =
+    c.LOAD || "";
+
+  $("dSdoCode").textContent =
+    c.SDO_CODE || "";
+
+  $("dFeededVillage").textContent =
+    c.feeded_village_name || "";
+
+
+  $("dLastPayDate").textContent =
+  formatLastPayDate(c.LAST_PAY_DATE);
+
+  $("dLastPayAmount").textContent =
+    c.LAST_PAY_AMOUNT || "";
+
+  if ($("dConsumptionCurr")) $("dConsumptionCurr").textContent =
+    consumptionText(c); showLastBill(c);
+
+
+  $("dConnectionStatus").textContent =
+    displayOrUnavailable(
+      getConsumerConnectionStatus(c)
+    );
+
+  $("dMeterNo").textContent =
+    displayOrUnavailable(
+      getConsumerMeterNo(c)
+    );
+
+  $("dCurrentReading").textContent =
+    displayOrUnavailable(
+      getConsumerReading(c)
+    );
+
+  $("dOutstanding").textContent =
+    displayOrUnavailable(
+      getConsumerOutstanding(c)
+    );
+
+  showMainView("consumerCard");
+
+  $("existingSearchCard")
+    .classList.remove("hidden");
+
+  $("entryCard")
+    .classList.remove("hidden");
+
+  resetExistingForm();
+
+  updateOutstandingAlert(
+    getConsumerOutstanding(c)
+  );
+
+  captureDoorSurveyGps();
+
+  findLocalDuplicate(c.ACCT_ID)
+    .then(localDuplicate => {
+
+      if (localDuplicate) {
+
+        showDuplicateWarning(
+          localDuplicate,
+          "local"
+        );
+
+        setStatus(
+          "searchStatus",
+          "This consumer is already recorded on this phone.",
+          "error"
+        );
+
+        return;
+      }
+
+      setStatus(
+        "searchStatus",
+        "Consumer found. Verify the details.",
+        "ok"
+      );
+    });
+}
+
+async function prepareExistingSave() {
+  if (!state.current) return;
+  if (state.duplicateInfo) return;
+
+  const localDuplicate=await findLocalDuplicate(state.current.ACCT_ID);
+  if (localDuplicate) {
+    showDuplicateWarning(localDuplicate,"local");
+    return;
+  }
+
+  const village=$("village").value;
+  const natureOfSupply=$("natureOfSupply").value;
+  const houseCondition=$("houseCondition").value;
+  const consumerPaymentResponse=$("consumerPaymentResponse").value;
+  const consumerPaymentDate=$("consumerPaymentDate").value;
+  const meterCondition=$("meterCondition").value;
+  const acInstalled=$("acInstalled").value;
+  const mobile=$("mobile").value.replace(/\D/g,"");
+  const remarks=$("existingRemarks").value.trim();
+  const locked=$("houseLocked").checked;
+  const refused=$("mobileRefused").checked;
+  const status=surveyStatusForExisting();
+
+
+  if (!village) return setStatus("saveStatus","Select village.","error");
+
+  const feederValue=$("feeder").value;
+  const dt=$("dt").value;
+  const theft=$("theftPossibility").value;
+  const siteReading=$("siteReading").value.trim();
+  const siteMaxDemand=$("siteMaxDemand").value.trim();
+  if (!feederValue) return setStatus("saveStatus","Select feeder.","error");
+  if (!dt) return setStatus("saveStatus","Select DT.","error");
+  if (!theft) return setStatus("saveStatus","Select theft possibility.","error");
+  if (!isValidOptionalNumber(siteReading)) return setStatus("saveStatus","Site reading must be a number.","error");
+  if (!isValidOptionalNumber(siteMaxDemand)) return setStatus("saveStatus","Site max demand must be a number.","error");
+  const feederInfo=parseFeederValue(feederValue);
+
+  if (!natureOfSupply) return setStatus("saveStatus","Select Nature of Supply.","error");
+
+
+  if (!houseCondition) return setStatus("saveStatus","Select House Condition.","error");
+  if (!consumerPaymentResponse) {return setStatus("saveStatus","उपभोक्ता द्वारा भुगतान के संबंध में प्रतिक्रिया चुनें.","error");}
+  if (consumerPaymentResponse === "कुछ दिन बाद जमा करेंगे" && !consumerPaymentDate) {return setStatus("saveStatus","भुगतान की संभावित दिनांक चुनें.","error");}
+  if (!meterCondition) return setStatus("saveStatus","Select meter condition.","error");
+  if (!acInstalled) return setStatus("saveStatus","Select AC Installed: YES or NO.","error");
+  if (!locked && !refused && !/^\d{10}$/.test(mobile)) {
+    return setStatus("saveStatus","Enter a valid 10 digit mobile number.","error");
+  }
+
+  const record={
+    survey_type:"EXISTING CONSUMER",
+    survey_status:status,
+    user_id:state.userId,
+    user_name:state.userName,
+    account_id:state.current.ACCT_ID,
+    consumer_name:state.current.NAME,
+    father_name:state.current.FATHER_NAME,
+    address:state.current.ADDRESS,
+    supply_type:state.current.SUPPLY_TYPE,
+    load:state.current.LOAD,
+    sdo_code:state.current.SDO_CODE,
+
+    connection_status:state.current.CONNECTION_STATUS || "",
+    last_pay_date:state.current.LAST_PAY_DATE || "",
+    last_pay_amount:state.current.LAST_PAY_AMOUNT || "",
+
+    feeded_village_name:state.current.feeded_village_name || "",
+
+    correct_village_name:village || "",
+    village,
+    feeder_substation:feederInfo.substation,
+    feeder:feederInfo.feeder,
+    dt,
+    theft_possibility:theft,
+    site_reading:siteReading,
+    site_max_demand:siteMaxDemand,
+    nature_of_supply:natureOfSupply,
+    house_condition:houseCondition,
+    consumer_payment_response:consumerPaymentResponse,
+
+    consumer_payment_date:consumerPaymentDate,
+    meter_condition:meterCondition,
+    ac_installed:acInstalled,
+    latitude:state.doorSurveyGps ? state.doorSurveyGps.latitude : "",
+    longitude:state.doorSurveyGps ? state.doorSurveyGps.longitude : "",
+    gps_accuracy:state.doorSurveyGps ? state.doorSurveyGps.accuracy : "",
+    mobile_number:mobile,
+    meter_number:getConsumerMeterNo(state.current),
+    current_reading:getConsumerReading(state.current),
+    outstanding:getConsumerOutstanding(state.current),
+    connection_type:"",
+    meter_installed:"",
+    connected_load:"",
+    remarks,
+    mobile_refused:refused ? "YES" : "NO",
+    house_locked:locked ? "YES" : "NO",
+    created_at:new Date().toISOString(),
+    upload_status:"PENDING"
+  };
+
+  openConfirmation(
+    "Confirm Existing Consumer Survey",
+    [
+      ["Account ID",record.account_id],
+      ["Consumer",record.consumer_name],
+
+      ["Village",record.village],
+      ["Feeder",feederDisplay(record)],
+      ["DT",record.dt],
+      ["Nature of Supply",record.nature_of_supply],
+
+      ["House Condition",record.house_condition],
+      ["Payment Response",record.consumer_payment_response],
+      ["Expected Payment Date",record.consumer_payment_date || "—"],
+      ["Meter Number",record.meter_number || "Not available"],
+
+      ["Master Reading",record.current_reading || "Not available"],
+      ["Site Reading",record.site_reading || "—"],
+      ["Site Max Demand",record.site_max_demand || "—"],
+      ["Theft Possibility",record.theft_possibility],
+
+      ["Outstanding",record.outstanding || "Not available"],
+      ["Meter Condition",record.meter_condition],
+      ["AC Installed",record.ac_installed],
+      ["Mobile",locked ? "Not collected - House Locked" :
+                         refused ? "Not provided - Consumer Refused" : record.mobile_number],
+      ["Survey Status",record.survey_status],
+      ["Remarks",record.remarks || "—"]
+    ],
+    ()=>saveLocalRecord(record,"saveStatus")
+  );
+}
+
+function saveLocalRecord(record,statusId) {
+  return new Promise((resolve)=>{
+    const tx=state.db.transaction("records","readwrite");
+    tx.objectStore("records").add(record);
+    tx.oncomplete=()=>{
+      closeConfirmation();
+
+      // Clear the completed form immediately so the next survey starts fresh.
+      if (record.survey_type === "EXISTING CONSUMER") {
+        $("consumerCard").classList.add("hidden");
+        $("entryCard").classList.add("hidden");
+        $("existingSearchCard").classList.remove("hidden");
+        $("accountId").value = "";
+        $("searchStatus").textContent = "";
+        resetExistingForm();
+      } else {
+        resetNewSurveyForm();
+      }
+
+      setStatus(statusId,"Survey saved locally. Ready for the next entry.","ok");
+      updateCounts();
+      resolve(true);
+    };
+    tx.onerror=()=>{
+      setStatus(statusId,"Could not save survey.","error");
+      closeConfirmation();
+      resolve(false);
+    };
+  });
+}
+
+function resetNewSurveyForm() {
+  [
+    "newConnectionType","newName","newFather","newVillage","newAddress","newNatureOfSupply","newHouseCondition",
+    "newMobile","newMeterInstalled","newMeterNo","newCurrentReading",
+    "newMeterCondition","newConnectedLoad","newAcInstalled","newRemarks"
+  ].forEach(id=>{
+    const el=$(id);
+    if (el.tagName==="SELECT") el.value="";
+    else el.value="";
+  });
+
+  $("newMeterNo").disabled=false;
+  $("newCurrentReading").disabled=false;
+
+  ["newFeeder","newDt","newTheftPossibility","newSiteMaxDemand"].forEach(id=>{
+    if ($(id)) { $(id).value=""; $(id).disabled=false; }
+  });
+  fillDtDropdown("newDt","newFeeder");
+
+  state.doorSurveyGps=null;
+
+
+}
+
+function updateNewMeterFields() {
+  const installed=$("newMeterInstalled").value;
+  const no=installed==="NO";
+  $("newMeterNo").disabled=no;
+
+  $("newCurrentReading").disabled=no;
+  if ($("newSiteMaxDemand")) {
+    $("newSiteMaxDemand").disabled=no;
+    if (no) $("newSiteMaxDemand").value="";
+  }
+  if (no) {
+    $("newMeterNo").value="";
+    $("newCurrentReading").value="";
+
+
+    if (!$("newMeterCondition").value) $("newMeterCondition").value="NOT INSTALLED";
+  }
+}
+
+function makeSurveyId() {
+  const d=new Date();
+  const date=d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0");
+  return "SURV-"+date+"-"+Date.now()+"-"+Math.floor(Math.random()*1000);
+}
+
+async function prepareNewSave() {
+  const connectionType=$("newConnectionType").value;
+  const name=$("newName").value.trim();
+  const father=$("newFather").value.trim();
+  const village=$("newVillage").value;
+  const address=$("newAddress").value.trim();
+  const mobile=$("newMobile").value.replace(/\D/g,"");
+  const installed=$("newMeterInstalled").value;
+  const meterNo=$("newMeterNo").value.trim();
+  const reading=$("newCurrentReading").value.trim();
+  const natureOfSupply=$("newNatureOfSupply").value;
+  const houseCondition=$("newHouseCondition").value;
+  const meterCondition=$("newMeterCondition").value;
+  const connectedLoad=$("newConnectedLoad").value.trim();
+  const ac=$("newAcInstalled").value;
+  const remarks=$("newRemarks").value.trim();
+
+  if (!connectionType) return setStatus("newSaveStatus","Select connection status.","error");
+  if (!name) return setStatus("newSaveStatus","Enter consumer/occupant name.","error");
+
+  if (!village) return setStatus("newSaveStatus","Select village.","error");
+
+  const feederValue=$("newFeeder").value;
+  const dt=$("newDt").value;
+  const theft=$("newTheftPossibility").value;
+  const siteMaxDemand=$("newSiteMaxDemand").value.trim();
+  if (!feederValue) return setStatus("newSaveStatus","Select feeder.","error");
+  if (!dt) return setStatus("newSaveStatus","Select DT.","error");
+  if (!theft) return setStatus("newSaveStatus","Select theft possibility.","error");
+  if (!isValidOptionalNumber(siteMaxDemand)) return setStatus("newSaveStatus","Site max demand must be a number.","error");
+  const feederInfo=parseFeederValue(feederValue);
+
+
+  if (!natureOfSupply) return setStatus("newSaveStatus","Select Nature of Supply.","error");
+  if (!houseCondition) return setStatus("newSaveStatus","Select House Condition.","error");
+  if (!address) return setStatus("newSaveStatus","Enter complete address.","error");
+  if (mobile && !/^\d{10}$/.test(mobile)) {
+    return setStatus("newSaveStatus","Enter a valid 10 digit mobile number.","error");
+  }
+  if (!installed) return setStatus("newSaveStatus","Select Meter Installed.","error");
+  if (installed==="YES" && !meterNo) return setStatus("newSaveStatus","Enter meter number.","error");
+
+  if (installed==="YES" && !reading) return setStatus("newSaveStatus","Enter site reading.","error");
+  if (!isValidOptionalNumber(reading)) return setStatus("newSaveStatus","Site reading must be a number.","error");
+
+  if (!meterCondition) return setStatus("newSaveStatus","Select meter condition.","error");
+  if (!ac) return setStatus("newSaveStatus","Select AC Installed.","error");
+
+  const surveyId=makeSurveyId();
+  const record={
+    survey_type:"CONNECTION NOT IN DATABASE",
+    survey_status:"NEW SITE FINDING",
+    connection_type:connectionType,
+    survey_id:surveyId,
+    user_id:state.userId,
+    user_name:state.userName,
+    account_id:"",
+    consumer_name:name,
+    father_name:father,
+    address,
+    supply_type:"",
+    load:"",
+
+    sdo_code:"",
+    feeded_village_name:"",
+    connection_status:"",
+    last_pay_date:"",
+    last_pay_amount:"",
+
+
+    correct_village_name:village || "",
+    village,
+    feeder_substation:feederInfo.substation,
+    feeder:feederInfo.feeder,
+    dt,
+    theft_possibility:theft,
+    site_max_demand:siteMaxDemand,
+    nature_of_supply:natureOfSupply,
+    house_condition:houseCondition,
+    meter_condition:meterCondition,
+
+    ac_installed:ac,
+    latitude:state.doorSurveyGps ? state.doorSurveyGps.latitude : "",
+    longitude:state.doorSurveyGps ? state.doorSurveyGps.longitude : "",
+    gps_accuracy:state.doorSurveyGps ? state.doorSurveyGps.accuracy : "",
+    mobile_number:mobile,
+    meter_installed:installed,
+    meter_number:meterNo,
+
+    /* Typed on site: Site Reading. Master Reading does not apply. */
+    current_reading:"",
+    site_reading:reading,
+    connected_load:connectedLoad,
+
+    outstanding:"",
+    remarks,
+    mobile_refused:"NO",
+    house_locked:"NO",
+    created_at:new Date().toISOString(),
+    upload_status:"PENDING"
+  };
+
+  openConfirmation(
+    "Confirm New Site Survey",
+    [
+      ["Survey ID",record.survey_id],
+      ["Connection Status",record.connection_type],
+      ["Name",record.consumer_name],
+
+      ["Village",record.village],
+      ["Feeder",feederDisplay(record)],
+      ["DT",record.dt],
+      ["Address",record.address],
+
+      ["Nature of Supply",record.nature_of_supply],
+      ["House Condition",record.house_condition],
+      ["Mobile",record.mobile_number || "Not provided"],
+      ["Meter Installed",record.meter_installed],
+      ["Meter Number",record.meter_number || "Not applicable"],
+
+      ["Site Reading",record.site_reading || "Not applicable"],
+      ["Site Max Demand",record.site_max_demand || "—"],
+      ["Theft Possibility",record.theft_possibility],
+
+      ["Meter Condition",record.meter_condition],
+      ["Connected Load",record.connected_load || "—"],
+      ["AC Installed",record.ac_installed],
+      ["Remarks",record.remarks || "—"]
+    ],
+    ()=>saveLocalRecord(record,"newSaveStatus")
+  );
+}
+
+function getAllRecords() {
+  return new Promise((resolve, reject) => {
+    const tx = state.db.transaction("records", "readonly");
+    const req = tx.objectStore("records").getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function updateRecordStatus(ids, status) {
+  return new Promise((resolve, reject) => {
+    if (!ids.length) return resolve();
+    const tx = state.db.transaction("records", "readwrite");
+    const store = tx.objectStore("records");
+    for (const id of ids) {
+      const req = store.get(id);
+      req.onsuccess = () => {
+        const r = req.result;
+        if (r) { r.upload_status = status; store.put(r); }
+      };
+    }
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getAllUploadableRecords() {
+  const [surveys,activities]=await Promise.all([getAllRecords(),getAllActivityRecords()]);
+  return [...surveys,...activities];
+}
+
+
+/*
+ * One records upload at a time: a second tap (or UPLOAD VIDEOS
+ * starting a records upload) while one is running is ignored,
+ * so the same record is never sent twice at the same moment.
+ */
+let uploadRecordsRunning = false;
+
+async function uploadPending() {
+  if (uploadRecordsRunning) return;
+  uploadRecordsRunning = true;
+  const button = $("uploadBtn");
+  if (button) button.disabled = true;
+  try {
+    return await uploadPendingOnce();
+  } finally {
+    uploadRecordsRunning = false;
+    if (button) button.disabled = false;
+  }
+}
+
+async function uploadPendingOnce() {
+  if (!state.sessionToken) return showLogin();
+
+  const records = await getAllUploadableRecords();
+
+  const pending = records.filter(r => String(r.upload_status||"PENDING").toUpperCase() === "PENDING");
+
+  if (!pending.length) {
+    return setStatus("uploadStatus", "No pending records to upload.", "ok");
+  }
+
+  setStatus("uploadStatus", `Uploading ${pending.length.toLocaleString()} records...`);
+  const batchSize = 50;
+  let uploaded = 0;
+
+  for (let i = 0; i < pending.length; i += batchSize) {
+    const batch = pending.slice(i, i + batchSize);
+    try {
+      // Survey activity cards use activity_type="SURVEY" only for the local/activity-search UI.
+      // The upload API classifies surveys by the absence of activity_type, so strip that UI-only
+      // marker from survey payloads. Activity records keep their existing activity_type unchanged.
+      const uploadBatch = batch.map(r => {
+        if (String(r.activity_type || "").trim().toUpperCase() === "SURVEY") {
+          const copy = Object.assign({}, r);
+          delete copy.activity_type;
+          return copy;
+        }
+        return r;
+      });
+      const response = await fetch(SERVER_URL, {
+        method: "POST",
+        headers: {"Content-Type": "text/plain;charset=utf-8"},
+        body: JSON.stringify({action:"upload",token:state.sessionToken,records:uploadBatch})
+      });
+      const result = await response.json();
+      if (!result.success) {
+        if (result.code === "AUTH") { logout(); alert("Your login session has expired. Please login again."); return; }
+        throw new Error(result.message || "Server rejected upload.");
+      }
+      saveVideoSettings(result.video_settings);
+      for (const r of batch) await setOneRecordStatus(r.id,"UPLOADED",r);
+      uploaded += batch.length;
+      setStatus("uploadStatus", `Uploaded ${uploaded.toLocaleString()} / ${pending.length.toLocaleString()}...`, "ok");
+    } catch (e) {
+      setStatus("uploadStatus", `Upload stopped after ${uploaded.toLocaleString()} records. ${e && e.message ? e.message : "Upload failed."} Remaining records are still pending.`, "error");
+      await updateCounts();
+      return;
+    }
+  }
+  await updateCounts();
+  setStatus("uploadStatus", `Upload complete. ${uploaded.toLocaleString()} records uploaded.`, "ok");
+}
+
+
+async function syncUploadStatus() {
+  if (!state.sessionToken) return showLogin();
+
+  const records = await getAllUploadableRecords();
+  if (!records.length) {
+    return setStatus("syncStatus","No local records to check.","ok");
+  }
+
+  const batchSize = 250;
+  let checked = 0;
+  let restored = 0;
+  let confirmed = 0;
+
+  setStatus("syncStatus",`Checking ${records.length.toLocaleString()} local records on server...`);
+
+  for (let i=0; i<records.length; i+=batchSize) {
+    const batch = records.slice(i,i+batchSize);
+
+    try {
+      const response = await fetch(SERVER_URL,{
+        method:"POST",
+        headers:{"Content-Type":"text/plain;charset=utf-8"},
+        body:JSON.stringify({
+          action:"sync_upload_status",
+          token:state.sessionToken,
+          records:batch.map(r=>{
+            const type=String(r.activity_type||"").trim().toUpperCase();
+            const item={
+              user_id:r.user_id || state.userId || "",
+              account_id:r.account_id || "",
+              survey_id:r.survey_id || "",
+              survey_type:r.survey_type || "EXISTING CONSUMER"
+            };
+            if(type==="DISCONNECTION" || type==="RECHECK" || type==="PHONE_CALLING") {
+              item.activity_type=type;
+              if(type==="DISCONNECTION") item.disconnection_id=r.disconnection_id || "";
+              if(type==="RECHECK") item.recheck_id=r.recheck_id || "";
+              if(type==="PHONE_CALLING") item.calling_id=r.calling_id || "";
+            }
+            return item;
+          })
+        })
+      });
+
+      const raw=await response.text();
+      let result;
+      try {
+        result=JSON.parse(raw);
+      } catch(e) {
+        throw new Error("Server returned an invalid response. Check the Apps Script deployment/version.");
+      }
+
+      if (!result.success) {
+        if (result.code==="AUTH") {
+          alert("Your login session is invalid. Please login again.");
+          logout();
+          return;
+        }
+        throw new Error(result.message || "Status check failed.");
+      }
+
+      const present=new Set((result.present_keys||[]).map(String));
+
+      for (const r of batch) {
+        const key=uploadStatusKey(r);
+        const exists=present.has(key);
+
+        if (exists) {
+          if (r.upload_status !== "UPLOADED") {
+            await setOneRecordStatus(r.id,"UPLOADED",r);
+            confirmed++;
+          }
+        } else if (r.upload_status === "UPLOADED") {
+          await setOneRecordStatus(r.id,"PENDING",r);
+          restored++;
+        }
+      }
+
+      checked += batch.length;
+      setStatus(
+        "syncStatus",
+        `Checked ${checked.toLocaleString()} / ${records.length.toLocaleString()}...`
+      );
+
+    } catch(e) {
+      setStatus(
+        "syncStatus",
+        `Status check failed after ${checked.toLocaleString()} records: ${e.message}`,
+        "error"
+      );
+      return;
+    }
+  }
+
+  await updateCounts();
+
+  if (restored) {
+    setStatus(
+      "syncStatus",
+      `Status sync complete. ${restored} record(s) were not found on the server and are now Pending Upload.`,
+      "error"
+    );
+  } else if (confirmed) {
+    setStatus(
+      "syncStatus",
+      `Status sync complete. ${confirmed} record(s) confirmed on the server.`,
+      "ok"
+    );
+  } else {
+    setStatus(
+      "syncStatus",
+      `Status sync complete. All ${records.length.toLocaleString()} local record(s) match the server.`,
+      "ok"
+    );
+  }
+}
+
+function uploadStatusKey(r) {
+  const type=String(r.activity_type || "").trim().toUpperCase();
+  if(type==="DISCONNECTION") return "DISCONNECTION|"+String(r.disconnection_id || "").trim();
+  if(type==="RECHECK") return "RECHECK|"+String(r.recheck_id || "").trim();
+  if(type==="PHONE_CALLING") return "PHONE_CALLING|"+String(r.calling_id || "").trim();
+
+  const user=String(r.user_id || state.userId || "").trim().toLowerCase();
+  if (String(r.survey_type || "").trim().toUpperCase()==="CONNECTION NOT IN DATABASE") {
+    return user+"|SURVEY|"+String(r.survey_id || "").trim();
+  }
+  return user+"|ACCOUNT|"+String(r.account_id || "").trim();
+}
+
+
+function storeNameForActivity(record) {
+  const type=String(record && record.activity_type || "").trim().toUpperCase();
+  if(type==="DISCONNECTION") return "disconnections";
+  if(type==="RECHECK") return "rechecks";
+  if(type==="PHONE_CALLING") return "phoneCalls";
+  return "records";
+}
+
+function setOneRecordStatus(id,status,recordHint) {
+  return new Promise(resolve=>{
+    const storeName=storeNameForActivity(recordHint);
+    const tx=state.db.transaction(storeName,"readwrite");
+    const store=tx.objectStore(storeName);
+    const req=store.get(id);
+    req.onsuccess=()=>{
+      const record=req.result;
+      if (!record) return;
+      record.upload_status=status;
+      if(status==="UPLOADED" && String(record.activity_type||"").trim()){
+        record.last_updated_by_user_id=state.userId||"";
+        record.last_updated_by_name=state.userName||state.userId||"";
+        record.last_updated_at=new Date().toISOString();
+      }
+      store.put(record);
+    };
+    tx.oncomplete=()=>resolve(true);
+    tx.onerror=()=>resolve(false);
+  });
+}
+
+
+/* V15.1.1 NEW FEATURE ONLY: India time display.
+   Device clock remains the source. We format the captured instant explicitly in IST. */
+function v1511ISTDateTime(value) {
+  const d=value ? new Date(value) : new Date();
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone:"Asia/Kolkata",
+    day:"2-digit", month:"2-digit", year:"numeric",
+    hour:"2-digit", minute:"2-digit", second:"2-digit",
+    hour12:false
+  }).format(d).replace(",", "");
+}
+
+/* V15.1 NEW FEATURE ONLY: My Collection. Existing functions are untouched. */
+function v151LocalDateKey(value) {
+  const d=value ? new Date(value) : new Date();
+  if (Number.isNaN(d.getTime())) return "";
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+}
+
+
+
+async function v151RefreshMyCollection() {
+  /* Database not open yet (early startup): init() refreshes later. */
+  if (!state.db) return;
+
+  const surveys=await getAllRecords();
+
+
+  const disconnections=await getAllFromStore("disconnections");
+  const rechecks=await getAllFromStore("rechecks");
+  const phoneCalls=await getAllFromStore("phoneCalls");
+
+  const today=v151LocalDateKey(new Date());
+  const countToday=list=>list.filter(r=>v151LocalDateKey(r.created_at)===today).length;
+  const pending=list=>list.filter(r=>String(r.upload_status||"PENDING").toUpperCase()!=="UPLOADED").length;
+
+  $("collectionSurveyToday").textContent=countToday(surveys).toLocaleString("en-IN");
+  $("collectionDisconnectionToday").textContent=countToday(disconnections).toLocaleString("en-IN");
+  $("collectionRecheckToday").textContent=countToday(rechecks).toLocaleString("en-IN");
+  $("collectionPhoneToday").textContent=countToday(phoneCalls).toLocaleString("en-IN");
+
+  $("collectionTotalToday").textContent=(countToday(surveys)+countToday(disconnections)+countToday(rechecks)+countToday(phoneCalls)).toLocaleString("en-IN");
+  $("collectionPendingToday").textContent=(pending(surveys)+pending(disconnections)+pending(rechecks)+pending(phoneCalls)).toLocaleString("en-IN");
+
+  $("collectionSurveyTotal").textContent=surveys.length.toLocaleString("en-IN");
+  $("collectionDisconnectionTotal").textContent=disconnections.length.toLocaleString("en-IN");
+  $("collectionRecheckTotal").textContent=rechecks.length.toLocaleString("en-IN");
+  $("collectionPhoneTotal").textContent=phoneCalls.length.toLocaleString("en-IN");
+
+  $("collectionDateLabel").textContent=new Intl.DateTimeFormat("en-IN",{timeZone:"Asia/Kolkata",day:"2-digit",month:"short",year:"numeric"}).format(new Date());
+}
+function v151InitMyCollection() {
+  const btn=$("refreshCollectionBtn");
+  if(btn) btn.addEventListener("click",v151RefreshMyCollection);
+  v151RefreshMyCollection();
+}
+
+async function updateCounts() {
+  if (!state.db) return;
+  const [surveys,disconnections,rechecks,phoneCalls]=await Promise.all([
+    getAllRecords(),
+    getAllFromStore("disconnections"),
+    getAllFromStore("rechecks"),
+    getAllFromStore("phoneCalls")
+  ]);
+  const groups=[
+    ["survey",surveys],
+    ["disconnection",disconnections],
+    ["recheck",rechecks],
+    ["phone",phoneCalls]
+  ];
+  let savedTotal=0,pendingTotal=0;
+  for(const [key,list] of groups){
+    const pending=list.filter(r=>String(r.upload_status||"PENDING").toUpperCase()==="PENDING").length;
+    savedTotal+=list.length;
+    pendingTotal+=pending;
+    const savedEl=$("upload"+key+"Saved");
+    const pendingEl=$("upload"+key+"Pending");
+    if(savedEl) savedEl.textContent=list.length.toLocaleString("en-IN");
+    if(pendingEl) pendingEl.textContent=pending.toLocaleString("en-IN");
+  }
+  $("savedCount").textContent=savedTotal.toLocaleString("en-IN");
+  $("pendingCount").textContent=pendingTotal.toLocaleString("en-IN");
+  /* Keep My Collection in step after every save / upload / sync. */
+  v151RefreshMyCollection().catch(err =>
+    console.error("My Collection refresh failed", err)
+  );
+
+  /* Videos section: pending count and size. */
+  refreshVideoUploadInfo().catch(err =>
+    console.error("Video info refresh failed", err)
+  );
+
+
+}
+
+
+async function exportData() {
+  const records = await getAllRecords();
+  if (!records.length) return alert("No locally saved records.");
+
+  const headers = ["Survey Type","Survey Status","Connection Type","Survey ID","User ID","User Name","Account ID","Consumer Name","Father/Husband","Address","Supply Type","Load","SDO Code","Village","Meter Condition","AC Installed","Mobile Number","House Locked","Mobile Refused","Meter Installed","Meter Number","Current Reading","Outstanding","Connected Load","Nature of Supply","House Condition","Consumer Payment Response","Consumer Payment Date","Remarks","Created At","Feeded Village Name","Connection Status","Last Pay Date","Last Pay Amount","Upload Status"];
+  const rows = records.map(r => [r.survey_type,r.survey_status,r.connection_type,r.survey_id,r.user_id,r.user_name,r.account_id,r.consumer_name,r.father_name,r.address,r.supply_type,r.load,r.sdo_code,r.village,r.meter_condition,r.ac_installed,r.mobile_number,r.house_locked,r.mobile_refused,r.meter_installed,r.meter_number,r.current_reading,r.outstanding,r.connected_load,r.nature_of_supply,r.house_condition,r.consumer_payment_response||"",r.consumer_payment_date||"",r.remarks,r.created_at,r.feeded_village_name,r.connection_status,r.last_pay_date,r.last_pay_amount,r.upload_status]);
+  const csv = [headers,...rows].map(row => row.map(v => `"${String(v ?? "").replaceAll('"','""')}"`).join(",")).join("\n");
+
+  const blob = new Blob(["\ufeff"+csv], {type:"text/csv;charset=utf-8"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "mobile_collection_data.csv"; a.click();
+  URL.revokeObjectURL(url);
+}
+
+
+
+
+let dashboardHasLoaded = false;
+
+function resetDashboardDisplay() {
+  dashboardHasLoaded = false;
+  const ids = [
+    "sumSurveyTotal","sumMeterOk","sumMeterDamaged","sumMeterNI","sumAcYes","sumAcNo",
+    "discTotal","discPaid","discDisconnected","discTimeGiven","discOutstanding",
+    "recheckTotal","recheckConnected","recheckDisconnected","recheckLocked","recheckPayment","recheckOutstanding",
+    "phoneTotal","phoneOutstanding"
+  ];
+  ids.forEach(id => { if($(id)) $(id).textContent = "0"; });
+  if($("discOutstanding")) $("discOutstanding").textContent = "₹0";
+  if($("recheckOutstanding")) $("recheckOutstanding").textContent = "₹0";
+  if($("dashboardPhoneOutstanding")) $("dashboardPhoneOutstanding").textContent = "₹0";
+  if($("substationReport")) $("substationReport").innerHTML = '<div class="dashboard-empty-state">Click Load Dashboard to load dashboard data.</div>';
+  if($("userReport")) $("userReport").innerHTML = '<div class="dashboard-empty-state">Click Load Dashboard to load dashboard data.</div>';
+  if($("multiUserReport")) $("multiUserReport").innerHTML = "";
+  if($("phoneResponses")) $("phoneResponses").innerHTML = '<div class="status">No response data available.</div>';
+  ["dashSurveyTable","dashDiscTable","dashRecheckTable","dashPhoneTable"].forEach(id => {
+    if($(id)) $(id).innerHTML = '<div class="dashboard-empty-state">Click Load Dashboard to load dashboard data.</div>';
+  });
+}
+
+/* v20.18: the substation list is kept on the phone (like the village list),
+   so the tick boxes are ready at once; the server copy refreshes it quietly. */
+function dashSubsKey() { return "fieldworkDashSubs_" + (state.userId || ""); }
+function dashSubsFromPhone() {
+  try { const v = JSON.parse(localStorage.getItem(dashSubsKey()) || "null"); return Array.isArray(v) ? v : null; }
+  catch (e) { return null; }
+}
+let dashSubsLoading = null;
+function dashSubsFailed() {
+  const box = $("dashSubPickerList");
+  if (box && !box.querySelector("input")) box.innerHTML = '<div class="sub-pick-row">Could not load substations. Check internet and open the dashboard again.</div>';
+}
+
+async function loadDashboardFilters() {
+  const saved = dashSubsFromPhone();
+  if (saved && $("dashSubPickerList") && !$("dashSubPickerList").querySelector("input")) fillDashSubPicker(saved);
+  if (dashSubsLoading) return dashSubsLoading;
+  dashSubsLoading = (async () => {
+    try {
+      const result = await adminRequest("dashboard_filters");
+      if (!result.success) return dashSubsFailed();
+      /* v20.17: tick boxes; the server sends only this subdivision's substations */
+      const subs = result.substations || [];
+      try { localStorage.setItem(dashSubsKey(), JSON.stringify(subs)); } catch (e) {}
+      fillDashSubPicker(subs);
+    } catch(e) {
+      dashSubsFailed();
+    } finally {
+      dashSubsLoading = null;
+    }
+  })();
+  return dashSubsLoading;
+}
+
+
+
+let correctionRecord = null;
+
+async function loadCorrectionVillages() {
+  const select = $("corrVillage");
+  if (select.options.length > 1) return;
+
+  try {
+    const response = await fetch("village.json");
+    const villages = await response.json();
+
+    for (const village of villages) {
+      const option = document.createElement("option");
+      option.value = village.value;
+      option.textContent = village.label;
+      select.appendChild(option);
+    }
+  } catch(e) {}
+}
+
+function clearCorrectionForm() {
+  correctionRecord = null;
+  $("correctionResult").classList.add("hidden");
+  $("correctionSearchStatus").textContent = "";
+  $("correctionStatus").textContent = "";
+  $("correctionAccountId").value = "";
+  $("corrConsumerName").textContent = "";
+  $("corrAccount").textContent = "";
+  $("corrOriginalUser").textContent = "";
+  $("corrOriginalDate").textContent = "";
+  $("corrVillage").value = "";
+  $("corrMeterCondition").value = "";
+  $("corrAcInstalled").value = "";
+  $("corrMobile").value = "";
+}
+
+async function openCorrection() {
+  if (!state.isAdmin && state.userId.toLowerCase() !== "admin") return;
+  showMainView("correctionCard");
+  await loadCorrectionVillages();
+  $("correctionAccountId").focus();
+}
+
+async function findCorrectionRecord() {
+  const accountId = $("correctionAccountId").value.trim();
+  if (!accountId) {
+    return setStatus("correctionSearchStatus","Enter Account ID.","error");
+  }
+
+  setStatus("correctionSearchStatus","Searching...");
+  $("correctionResult").classList.add("hidden");
+  correctionRecord = null;
+
+  try {
+    const result = await adminRequest("get_record", {account_id:accountId});
+
+    if (!result.success) {
+      return setStatus("correctionSearchStatus",result.message || "Could not search record.","error");
+    }
+
+    if (!result.found) {
+      return setStatus("correctionSearchStatus","No uploaded record found for this Account ID.","error");
+    }
+
+    correctionRecord = result.record;
+
+    $("corrConsumerName").textContent = correctionRecord.consumer_name || "";
+    $("corrAccount").textContent = correctionRecord.account_id || "";
+    $("corrOriginalUser").textContent =
+      `${correctionRecord.user_name || correctionRecord.user_id || "Unknown"}`;
+    $("corrOriginalDate").textContent = formatDate(correctionRecord.created_at);
+
+    $("corrVillage").value = correctionRecord.village || "";
+    $("corrMeterCondition").value = correctionRecord.meter_condition || "";
+    $("corrAcInstalled").value = correctionRecord.ac_installed || "";
+    $("corrMobile").value = correctionRecord.mobile_number || "";
+
+    $("correctionResult").classList.remove("hidden");
+    setStatus("correctionSearchStatus","Record found. You may correct the fields below.","ok");
+  } catch(e) {
+    setStatus("correctionSearchStatus","Could not connect to server.","error");
+  }
+}
+
+async function saveCorrection() {
+  if (!correctionRecord) return;
+
+  const village=$("corrVillage").value;
+  const meter=$("corrMeterCondition").value;
+  const ac=$("corrAcInstalled").value;
+  const mobile=$("corrMobile").value.replace(/\D/g,"");
+
+  if (!village) return setStatus("correctionStatus","Select village.","error");
+  if (!meter) return setStatus("correctionStatus","Select meter condition.","error");
+  if (!ac) return setStatus("correctionStatus","Select AC Installed: YES or NO.","error");
+  if (!/^\d{10}$/.test(mobile)) {
+    return setStatus("correctionStatus","Enter a valid 10 digit mobile number.","error");
+  }
+
+  setStatus("correctionStatus","Saving correction...");
+
+  try {
+    const result=await adminRequest("update_record",{
+      account_id:correctionRecord.account_id,
+      village:village,
+      meter_condition:meter,
+      ac_installed:ac,
+      mobile_number:mobile
+    });
+
+    if (!result.success) {
+      return setStatus("correctionStatus",result.message || "Could not update record.","error");
+    }
+
+    correctionRecord=result.record;
+    setStatus(
+      "correctionStatus",
+      `Correction saved. Updated by ${result.updated_by} at ${formatDate(result.updated_at)}.`,
+      "ok"
+    );
+  } catch(e) {
+    setStatus("correctionStatus","Could not connect to server.","error");
+  }
+}
+
+async function exportFilteredReport() {
+  if (!state.isAdmin && state.userId.toLowerCase() !== "admin") return;
+
+  setStatus("exportStatus", "Preparing report...");
+  try {
+    const result = await adminRequest("export_report", {
+      from_date: $("dashFromDate").value,
+      to_date: $("dashToDate").value,
+      village: $("dashVillageFilter").value,
+      substation: $("dashSubstationFilter").value
+    });
+
+    if (!result.success) {
+      return setStatus("exportStatus", result.message || "Could not create report.", "error");
+    }
+
+    if (!result.rows.length) {
+      return setStatus("exportStatus", "No records match the selected filters.", "error");
+    }
+
+    const headers = [
+      "User ID","User Name","Account ID","Consumer Name","Father/Husband",
+      "Address","Supply Type","Load","SDO Code","Village","Meter Condition",
+      "AC Installed","Mobile Number","Created At","Nature of Supply","House Condition"
+    ];
+
+    const csvRows = [headers].concat(result.rows.map(r => [
+      r.user_id,r.user_name,r.account_id,r.consumer_name,r.father_name,
+      r.address,r.supply_type,r.load,r.sdo_code,r.village,r.meter_condition,
+      r.ac_installed,r.mobile_number,r.created_at,r.nature_of_supply,r.house_condition
+    ]));
+
+    const csv = csvRows.map(row =>
+      row.map(v => `"${String(v ?? "").replaceAll('"','""')}"`).join(",")
+    ).join("\n");
+
+    const blob = new Blob(["\ufeff" + csv], {type:"text/csv;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+
+    const from = $("dashFromDate").value || "all";
+    const to = $("dashToDate").value || "all";
+    a.download = `consumer_report_${from}_to_${to}.csv`;
+
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    setStatus("exportStatus", `${result.rows.length.toLocaleString()} records exported successfully.`, "ok");
+  } catch(e) {
+    setStatus("exportStatus", "Could not connect to server.", "error");
+  }
+}
+
+
+function setDashboardToday() {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth()+1).padStart(2,"0");
+  const dd = String(now.getDate()).padStart(2,"0");
+  const today = `${yyyy}-${mm}-${dd}`;
+
+  $("dashFromDate").value = today;
+  $("dashToDate").value = today;
+
+  $("dashSubstationFilter").value = "";
+  syncDashSubPicker();
+}
+
+/*
+ * v20.17: substation filter with tick boxes. The chosen names are kept in the
+ * hidden #dashSubstationFilter as "A||B" (empty = all substations).
+ */
+function fillDashSubPicker(list) {
+  const box = $("dashSubPickerList");
+  if (!box) return;
+  const keep = String($("dashSubstationFilter").value || "").split("||").filter(s => list.indexOf(s) !== -1);
+  $("dashSubstationFilter").value = keep.join("||");
+  box.innerHTML =
+    '<label class="sub-pick-row sub-pick-all"><input type="checkbox" value=""> All Substations</label>' +
+    list.map(s => '<label class="sub-pick-row"><input type="checkbox" value="' + escapeHtml(s) + '"> ' + escapeHtml(s) + "</label>").join("") +
+    '<button type="button" id="dashSubPickerDone" class="small-btn">DONE</button>';
+  box.querySelectorAll("input").forEach(cb => cb.addEventListener("change", () => {
+    const boxes = Array.from(box.querySelectorAll("input"));
+    if (cb.value === "") boxes.forEach(x => { if (x.value !== "") x.checked = false; });
+    const chosen = boxes.filter(x => x.value !== "" && x.checked).map(x => x.value);
+    $("dashSubstationFilter").value = chosen.join("||");
+    syncDashSubPicker();
+  }));
+  $("dashSubPickerDone").addEventListener("click", () => box.classList.add("hidden"));
+  syncDashSubPicker();
+}
+
+function syncDashSubPicker() {
+  const chosen = String(($("dashSubstationFilter") && $("dashSubstationFilter").value) || "").split("||").filter(Boolean);
+  const box = $("dashSubPickerList");
+  if (box) box.querySelectorAll("input").forEach(x => { x.checked = x.value === "" ? !chosen.length : chosen.indexOf(x.value) !== -1; });
+  const btn = $("dashSubPickerBtn");
+  if (btn) btn.textContent = !chosen.length ? "All Substations"
+    : chosen.length <= 2 ? chosen.join(", ") : chosen.slice(0, 2).join(", ") + " +" + (chosen.length - 2) + " more";
+}
+
+if ($("dashSubPickerBtn")) {
+  $("dashSubPickerBtn").addEventListener("click", () => $("dashSubPickerList").classList.toggle("hidden"));
+  document.addEventListener("click", e => {
+    const p = $("dashSubPicker");
+    if (p && !p.contains(e.target)) $("dashSubPickerList").classList.add("hidden");
+  });
+}
+
+
+async function openDashboard() {
+  if (!state.sessionToken) return showLogin();
+  showMainView("dashboardCard");
+  resetDashboardDisplay();
+  // Opening the dashboard must not request dashboard/activity data.
+  // Only the lightweight filter lists are prepared here.
+  loadDashboardFilters();      /* v20.18: list from the phone at once, refreshed quietly */
+}
+
+function formatDashboardMoney(value){
+  const n=Number(value||0);
+  return "₹"+n.toLocaleString("en-IN",{maximumFractionDigits:2});
+}
+
+function renderSubstationReport(items) {
+  const box=$("substationReport");
+  if(!box) return;
+  if(!items || !items.length){
+    box.innerHTML='<div class="dashboard-empty-state">No substation data available for the selected filter.</div>';
+    return;
+  }
+  let html='<div class="substation-table"><div class="substation-row substation-head"><div>Substation</div><div>Survey</div><div>Disconnection</div><div>Recheck</div><div>Phone</div><div>Total</div></div>';
+
+
+  let grandSurvey=0;
+  let grandDisconnection=0;
+  let grandRecheck=0;
+  let grandPhone=0;
+  let grandTotal=0;
+
+  for(const x of items){
+
+    const survey=Number(x.survey||0);
+    const disconnection=Number(x.disconnection||0);
+    const recheck=Number(x.recheck||0);
+    const phone=Number(x.phone_calling||0);
+    const total=Number(x.total||0);
+
+    grandSurvey+=survey;
+    grandDisconnection+=disconnection;
+    grandRecheck+=recheck;
+    grandPhone+=phone;
+    grandTotal+=total;
+
+    html+=`<div class="substation-row"><div data-label="Substation">${escapeHtml(x.name||"Unassigned")}</div><div data-label="Survey">${survey.toLocaleString()}</div><div data-label="Disconnection">${disconnection.toLocaleString()}</div><div data-label="Recheck">${recheck.toLocaleString()}</div><div data-label="Phone">${phone.toLocaleString()}</div><div data-label="Total"><b>${total.toLocaleString()}</b></div></div>`;
+  }
+
+  html+=`<div class="substation-row substation-total-row">
+    <div data-label="Substation"><b>TOTAL</b></div>
+    <div data-label="Survey"><b>${grandSurvey.toLocaleString()}</b></div>
+    <div data-label="Disconnection"><b>${grandDisconnection.toLocaleString()}</b></div>
+    <div data-label="Recheck"><b>${grandRecheck.toLocaleString()}</b></div>
+    <div data-label="Phone"><b>${grandPhone.toLocaleString()}</b></div>
+    <div data-label="Total"><b>${grandTotal.toLocaleString()}</b></div>
+  </div>`;
+
+  html+='</div>';
+
+  box.innerHTML=html;
+}
+
+function renderUserTable(items, targetId, multi=false) {
+  const box=$(targetId);
+  if(!box) return;
+  if(!items || !items.length){
+    box.innerHTML=multi ? '<div class="dashboard-empty-state">No multi-substation users in the selected filter.</div>' : '<div class="dashboard-empty-state">No single-substation users in the selected filter.</div>';
+    return;
+  }
+  let html='<div class="dashboard-table-wrap"><div class="user-row user-head"><div>User</div><div>Assigned Substation(s)</div><div>Survey</div><div>Disconnection</div><div>Recheck</div><div>Phone</div><div>Total</div></div>';
+  for(const x of items){
+    html+=`<div class="user-row"><div data-label="User">${escapeHtml(x.name||x.user_id||"Unknown")}</div><div data-label="Assigned Substation(s)">${escapeHtml(x.substation||"Unassigned")}</div><div data-label="Survey">${Number(x.survey||0).toLocaleString()}</div><div data-label="Disconnection">${Number(x.disconnection||0).toLocaleString()}</div><div data-label="Recheck">${Number(x.recheck||0).toLocaleString()}</div><div data-label="Phone">${Number(x.phone_calling||0).toLocaleString()}</div><div data-label="Total"><b>${Number(x.total||0).toLocaleString()}</b></div></div>`;
+  }
+  html+='</div>';
+  box.innerHTML=html;
+}
+
+function renderUserReport(items){
+  const single=(items||[]).filter(x=>!x.multi_substation);
+  const multi=(items||[]).filter(x=>x.multi_substation);
+  renderUserTable(single,"userReport",false);
+  const multiBox=$("multiUserReport");
+  if(!multiBox) return;
+  if(!multi.length){
+    multiBox.innerHTML='';
+    return;
+  }
+  multiBox.innerHTML='<h4 class="dashboard-table-title">Multi-Substation Users</h4>';
+  const table=document.createElement("div");
+  table.id="multiUserReportTable";
+  multiBox.appendChild(table);
+  renderUserTable(multi,"multiUserReportTable",true);
+}
+
+function renderPhoneResponses(items){
+  const box=$("phoneResponses");
+  if(!box) return;
+  if(!items || !items.length){
+    box.innerHTML='<div class="status">No response data available.</div>';
+    return;
+  }
+  box.innerHTML=items.map(x=>`<div><b>${Number(x.count||0).toLocaleString()}</b><span>${escapeHtml(x.name||"Unknown")}</span></div>`).join("");
+}
+
+/* ---------- v20.11/12: dashboard summaries as tables (status in rows, substations in columns) ---------- */
+let dashLastFilters = null;            /* filters of the loaded dashboard (for the tapped counts) */
+const dashRowsCache = {};              /* rows_type -> rows of the loaded dashboard */
+
+function renderDashboardSummaries(result) {
+  if (typeof showReportSignatureState === "function") showReportSignatureState();      /* v20.15 */
+  dashLastFilters = {
+    from_date: $("dashFromDate") ? $("dashFromDate").value : "",
+    to_date: $("dashToDate") ? $("dashToDate").value : "",
+    village: "",
+    substation: $("dashSubstationFilter") ? $("dashSubstationFilter").value : ""
+  };
+  Object.keys(dashRowsCache).forEach(k => delete dashRowsCache[k]);
+  const by = result.summary_by_substation || {};
+  const n = v => Math.round(Number(v) || 0).toLocaleString("en-IN");
+  const rs = v => "₹" + Math.round(Number(v) || 0).toLocaleString("en-IN");
+  const mtx = (box, kind, data, rows, note) => {
+    const el = $(box);
+    if (!el) return;
+    /* v20.15: only the substations that have entries; none -> message, no table */
+    const subs = Object.keys(data || {}).sort((a, b) => a.localeCompare(b));
+    if (!subs.length) {
+      el.innerHTML = '<div class="dashboard-empty-state">No entries for the selected filter.</div>';
+      return;
+    }
+    const link = (v, txt, sub, ri) => (Number(v) || 0) > 0
+      ? '<a href="#" class="dash-link" data-kind="' + kind + '" data-sub="' + escapeHtml(sub) + '" data-row="' + ri + '">' + txt + "</a>"
+      : txt;
+    let h = '<table class="dash-mtx"><thead><tr><th>Status</th>' + subs.map(s => "<th>" + escapeHtml(s) + "</th>").join("") + "<th>Total</th></tr></thead><tbody>";
+    rows.forEach((r, ri) => {
+      const vals = subs.map(s => r.get(data[s]));
+      const total = vals.reduce((a, b) => a + (Number(b) || 0), 0);
+      const f = r.money ? rs : n;
+      const cnt = r.money ? subs.map(s => r.count ? r.count(data[s]) : 0) : vals;
+      const cntTotal = cnt.reduce((a, b) => a + (Number(b) || 0), 0);
+      h += "<tr" + (r.sep ? ' class="sep"' : "") + "><td>" + escapeHtml(r.label) + "</td>" +
+        vals.map((v, i) => "<td>" + link(cnt[i], f(v), subs[i], ri) + "</td>").join("") +
+        "<td>" + link(cntTotal, f(total), "", ri) + "</td></tr>";
+    });
+    el.innerHTML = h + "</tbody></table>" + (note ? '<div class="dash-mtx-note">' + note + "</div>" : "");
+    dashMtxRows[kind] = rows;
+  };
+  const row = (label, key, extra) => Object.assign({ label: label, key: key, get: c => (c && c[key]) || 0 }, extra || {});
+  const videoRows = missingLabel => [
+    row("Videos uploaded", "video_uploaded", { sep: true, match: x => x.video === "video_uploaded" }),
+    row("Videos recorded, not uploaded yet", "video_pending", { match: x => x.video === "video_pending" }),
+    row(missingLabel, "video_none", { match: x => x.video === "video_none" })
+  ];
+  const videoNote = "Tap a number to see those consumers. Entries still waiting on a phone are counted after they are uploaded.";
+  const st = s => x => x.status === s;
+  const all = () => true;
+  mtx("dashSurveyTable", "SURVEY", by.survey, [
+    row("Total surveys", "total", { match: all }), row("Meter OK", "meter_ok", { match: x => x.meter === "OK" }),
+    row("Meter damaged", "meter_damaged", { match: x => x.meter === "DAMAGED" }),
+    row("Meter not installed", "meter_not_installed", { match: x => x.meter === "NOT INSTALLED" }),
+    row("AC installed – YES", "ac_yes", { match: x => x.ac === "YES" }), row("AC installed – NO", "ac_no", { match: x => x.ac === "NO" })]);
+  mtx("dashDiscTable", "DISCONNECTION", by.disconnection, [
+    row("Total visits", "total", { match: all }), row("Disconnected", "disconnected", { match: st("DISCONNECTED") }),
+    row("House lock and disconnected", "house_lock_disc", { match: st("HOUSE LOCK AND DISCONNECTED") }),
+    row("Time given", "time_given", { match: st("TIME GIVEN FOR PAYMENT") }), row("Paid", "paid", { match: st("PAID") }),
+    row("Total outstanding", "outstanding", { money: true, count: c => (c && c.total) || 0, match: all })]
+    .concat(videoRows("Disconnected, but no video recorded")), videoNote);
+  mtx("dashRecheckTable", "RECHECK", by.recheck, [
+    row("Total rechecks", "total", { match: all }), row("Found connected", "found_connected", { match: st("FOUND CONNECTED") }),
+    row("Still disconnected", "still_disconnected", { match: st("STILL DISCONNECTED") }),
+    row("House locked", "house_locked", { match: st("HOUSE LOCKED") }), row("Payment made", "payment_made", { match: st("PAYMENT MADE") }),
+    row("Total outstanding", "outstanding", { money: true, count: c => (c && c.total) || 0, match: all })]
+    .concat(videoRows("No video recorded (found connected / still disconnected / house locked)")), videoNote);
+  const responses = {};
+  Object.keys(by.phone_calling || {}).forEach(s => Object.keys(by.phone_calling[s].responses || {}).forEach(r => { responses[r] = true; }));
+  mtx("dashPhoneTable", "PHONE_CALLING", by.phone_calling, [row("Total calls", "total", { match: all }),
+    row("Total outstanding", "outstanding", { money: true, count: c => (c && c.total) || 0, match: all })]
+    .concat(Object.keys(responses).sort().map((r, i) => ({ label: r, sep: i === 0, match: x => x.status === r,
+      get: c => (c && c.responses && c.responses[r]) || 0 }))));
+  dashReportDates();
+  if (!result.summary_by_substation) {
+    ["dashSurveyTable", "dashDiscTable", "dashRecheckTable", "dashPhoneTable"].forEach(id => {
+      if ($(id)) $(id).innerHTML = '<div class="dashboard-empty-state">Update Apps Script (Code.gs) to see these tables.</div>';
+    });
+  }
+}
+const dashMtxRows = {};
+
+/* ---------- v20.12: tap a dashboard number -> the list of those consumers ---------- */
+const DASH_KIND_NAME = { SURVEY: "Survey", DISCONNECTION: "Disconnection", RECHECK: "Recheck", PHONE_CALLING: "Phone calling" };
+let dashListShown = null;
+
+function dashListOverlay() {
+  let box = $("dashListOverlay");
+  if (box) return box;
+  box = document.createElement("div");
+  box.id = "dashListOverlay";
+  box.className = "dash-list-overlay hidden";
+  box.innerHTML =
+    '<div class="dash-list-card"><div class="dash-list-head"><b id="dashListTitle"></b>' +
+    '<button id="dashListCloseBtn" type="button" class="secondary">CLOSE</button></div>' +
+    '<div id="dashListInfo" class="dash-mtx-note"></div>' +
+    '<div class="dash-list-btns"><button id="dashListPdfBtn" type="button" class="secondary">DOWNLOAD PDF</button>' +
+    '<button id="dashListXlsBtn" type="button" class="secondary">DOWNLOAD EXCEL</button></div>' +
+    '<div id="dashListStatus" class="status"></div><div id="dashListBody"></div></div>';
+  document.body.appendChild(box);
+  $("dashListCloseBtn").addEventListener("click", () => { box.classList.add("hidden"); document.body.style.overflow = ""; });
+  box.addEventListener("click", e => { if (e.target === box) $("dashListCloseBtn").click(); });
+  $("dashListPdfBtn").addEventListener("click", dashListPdf);
+  $("dashListXlsBtn").addEventListener("click", dashListXlsx);
+  return box;
+}
+
+async function dashRows(kind) {
+  if (dashRowsCache[kind]) return dashRowsCache[kind];
+  const res = await adminRequest("dashboard", Object.assign({}, dashLastFilters || {}, { rows_type: kind }));
+  if (!res || !res.success) throw new Error((res && res.message) || "Could not load the list.");
+  if (!Array.isArray(res.rows)) throw new Error("Update Apps Script (Code.gs) to open these lists.");
+  dashRowsCache[kind] = res.rows;
+  return res.rows;
+}
+
+async function openDashList(kind, sub, rowIndex) {
+  const r = (dashMtxRows[kind] || [])[rowIndex];
+  if (!r) return;
+  const box = dashListOverlay();
+  box.classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  const title = DASH_KIND_NAME[kind] + " · " + (sub || "All substations") + " · " + r.label;
+  $("dashListTitle").textContent = title;
+  $("dashListInfo").textContent = "Loading…";
+  $("dashListBody").innerHTML = "";
+  setStatus("dashListStatus", "");
+  try {
+    const rows = (await dashRows(kind)).filter(x => (!sub || x.sub === sub) && r.match(x));
+    dashListShown = { kind: kind, title: title, rows: rows };
+    const f = dashLastFilters || {};
+    $("dashListInfo").textContent = rows.length.toLocaleString("en-IN") + " entries" +
+      (f.from_date || f.to_date ? " · " + (f.from_date ? formatListDate(f.from_date) : "start") + " to " + (f.to_date ? formatListDate(f.to_date) : "today") : "") +
+      (rows.length > 200 ? " (first 200 shown; the PDF / Excel has all)" : "");
+    $("dashListBody").innerHTML = rows.slice(0, 200).map(x =>
+      '<div class="dash-li"><b>' + escapeHtml(x.account_id) + "</b> " + escapeHtml(x.consumer_name) +
+      "<div>" + escapeHtml([x.date, x.sub, x.user_name].filter(Boolean).join(" · ")) + "</div>" +
+      "<div>" + escapeHtml([x.status || x.meter, x.committed_date ? "Committed " + x.committed_date : "", x.mobile].filter(Boolean).join(" · ")) +
+      (x.outstanding !== undefined && x.outstanding !== "" ? " · ₹" + Math.round(Number(String(x.outstanding).replace(/,/g, "")) || 0).toLocaleString("en-IN") : "") +
+      "</div></div>").join("");
+  } catch (e) {
+    $("dashListInfo").textContent = "";
+    setStatus("dashListStatus", e.message || "Could not load the list.", "error");
+  }
+}
+
+function dashListColumns(kind) {
+  const base = [["Date", "date"], ["Substation", "sub"], ["User", "user_name"], ["Account ID", "account_id"], ["Consumer Name", "consumer_name"],
+    ["Father/Husband", "father_name"], ["Address", "address"], ["Mobile", "mobile"]];
+  if (kind === "SURVEY") return base.concat([["Village", "village"], ["Meter", "meter"], ["AC", "ac"], ["Outstanding", "outstanding"]]);
+  if (kind === "PHONE_CALLING") return base.concat([["Response", "status"], ["Committed Date", "committed_date"], ["Outstanding", "outstanding"], ["Remarks", "remarks"]]);
+  return base.concat([["Status", "status"], ["Payment Mode", "payment_mode"], ["Committed / Payment Date", "committed_date"],
+    ["Paid Amount (by user)", "paid_amount"], ["Outstanding", "outstanding"], ["Video", "video"]]);
+}
+const dashVideoText = v => ({ video_uploaded: "Uploaded", video_pending: "Pending", video_none: "No video" }[v] || "");
+function dashListCell(x, key) {
+  if (key === "video") return dashVideoText(x.video);
+  if (key === "outstanding") return Math.round(Number(String(x.outstanding).replace(/,/g, "")) || 0);
+  return x[key] == null ? "" : String(x[key]);
+}
+
+function dashListPdf() {
+  const s = dashListShown;
+  if (!s || !s.rows.length) return;
+  if (!window.jspdf || !window.jspdf.jsPDF || !window.jspdf.jsPDF.API.autoTable) {
+    return setStatus("dashListStatus", "PDF library is not loaded. Please reload the app.", "error");
+  }
+  const cols = dashListColumns(s.kind);
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+  doc.setFontSize(13);
+  doc.text(s.title, 10, 12);
+  doc.setFontSize(8);
+  doc.text($("dashListInfo").textContent.replace(/ \(first 200.*\)$/, "") + "    On: " + shareDateText(new Date().toISOString()), 10, 18);
+  doc.autoTable({
+    startY: 22, margin: { left: 10, right: 10 },
+    head: [["S.No"].concat(cols.map(c => c[0]))],
+    body: s.rows.map((x, i) => [i + 1].concat(cols.map(c => c[1] === "outstanding" ? dashListCell(x, c[1]).toLocaleString("en-IN") : dashListCell(x, c[1])))),
+    theme: "grid",
+    styles: { fontSize: 6.8, cellPadding: 1, overflow: "linebreak", valign: "middle", lineColor: [120, 120, 120], lineWidth: 0.1, textColor: [0, 0, 0] },
+    headStyles: { fillColor: [21, 101, 192], textColor: 255, fontSize: 6.8 },
+    columnStyles: { 0: { cellWidth: 8, halign: "right" } },
+    didDrawPage: () => {
+      doc.setFontSize(7);
+      doc.text("Page " + doc.internal.getNumberOfPages(), doc.internal.pageSize.getWidth() - 25, doc.internal.pageSize.getHeight() - 5);
+    }
+  });
+  const name = s.title.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") + "_" + dlFileStamp() + ".pdf";
+  doc.save(name);
+  setStatus("dashListStatus", "Downloaded: " + name, "ok");
+}
+
+function dashListXlsx() {
+  const s = dashListShown;
+  if (!s || !s.rows.length) return;
+  if (!window.XLSX) return setStatus("dashListStatus", "Excel library is not loaded. Please reload the app.", "error");
+  const cols = dashListColumns(s.kind);
+  const aoa = [[s.title], [$("dashListInfo").textContent.replace(/ \(first 200.*\)$/, "")], [],
+    ["S.No"].concat(cols.map(c => c[0]))].concat(s.rows.map((x, i) => [i + 1].concat(cols.map(c => dashListCell(x, c[1])))));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), "List");
+  const name = s.title.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") + "_" + dlFileStamp() + ".xlsx";
+  XLSX.writeFile(wb, name);
+  setStatus("dashListStatus", "Downloaded: " + name, "ok");
+}
+
+document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest("a.dash-link");
+  if (!a) return;
+  e.preventDefault();
+  openDashList(a.dataset.kind, a.dataset.sub, Number(a.dataset.row));
+});
+
+/* ---------- v20.11/12: Disconnection report PDF, and the two follow-up lists ---------- */
+function dashReportDates() {
+  const today = new Date();
+  const p = x => String(x).padStart(2, "0");
+  const iso = today.getFullYear() + "-" + p(today.getMonth() + 1) + "-" + p(today.getDate());
+  if ($("dashRepFrom") && !$("dashRepFrom").value) $("dashRepFrom").value = ($("dashFromDate") && $("dashFromDate").value) || iso;
+  if ($("dashRepTo") && !$("dashRepTo").value) $("dashRepTo").value = ($("dashToDate") && $("dashToDate").value) || iso;
+}
+
+let dashReportFile = null;
+async function shareDisconnectionReport() {
+  if (!dashReportFile) return;
+  if (!navigator.share || !navigator.canShare || !navigator.canShare({ files: [dashReportFile] })) {
+    return setStatus("dashRepStatus", "This device cannot share from here. Share " + dashReportFile.name + " from the Download folder.", "error");
+  }
+  try { await navigator.share({ files: [dashReportFile], title: dashReportFile.name.replace(/_/g, " ").replace(/\.pdf$/, "") }); }
+  catch (e) { if (!e || e.name !== "AbortError") setStatus("dashRepStatus", "Could not open sharing. Share it from the Download folder.", "error"); }
+}
+
+/* mode: REPORT (every visit) / TG_NOT_PAID (time given, no payment since the visit) /
+   PAID_NOT_PAID (paid at visit, no payment since the visit) */
+async function downloadDisconnectionReportPdf(mode, fromDate, toDate) {
+  mode = typeof mode === "string" ? mode : "REPORT";
+  dashReportDates();
+  const from = fromDate || $("dashRepFrom").value, to = toDate || $("dashRepTo").value;
+  if (!from || !to || from > to) return setStatus("dashRepStatus", "Choose the report dates (from – to).", "error");
+  if (!window.jspdf || !window.jspdf.jsPDF || !window.jspdf.jsPDF.API.autoTable) {
+    return setStatus("dashRepStatus", "PDF library is not loaded. Please reload the app.", "error");
+  }
+  if (!navigator.onLine) return setStatus("dashRepStatus", "No internet. The report needs internet.", "error");
+  if (mode !== "REPORT" && !state.masterReady) return setStatus("dashRepStatus", "Master Data is still loading. Please wait.", "error");
+  setStatus("dashRepStatus", "");
+  showGlobalLoading("Preparing the report…", "Reading the disconnection entries.");
+  try {
+    const res = await adminRequest("disconnection_report", {
+      from_date: from, to_date: to, substation: $("dashSubstationFilter") ? $("dashSubstationFilter").value : ""
+    });
+    if (!res || !res.success) throw new Error((res && res.message) || "Update Apps Script (Code.gs) for the report.");
+    const rows = res.rows || [];
+
+    const amount = v => { const x = Number(String(v == null ? "" : v).replace(/,/g, "").trim()); return String(v == null ? "" : v).trim() !== "" && isFinite(x) ? x : null; };
+    const iso = v => parseMasterDate(v) || "";
+    const dmy = v => formatListDate(v);
+    let marked = 0;
+    const list = [];
+    for (const r of rows) {
+      let c = null;
+      try { c = state.masterReady ? await getMasterByAccountInput(r.account_id) : null; } catch (e) { c = null; }
+      const pay = c ? iso(c.LAST_PAY_DATE) : "";
+      const paidSince = !!pay && pay >= r.date;
+      if (mode === "TG_NOT_PAID" && !(r.status === "TIME GIVEN FOR PAYMENT" && !paidSince)) continue;
+      if (mode === "PAID_NOT_PAID" && !(r.status === "PAID" && !paidSince)) continue;
+      if (mode === "DISC_NOT_PAID" && !(isDisconnectedStatus(r.status) && !paidSince)) continue;      /* v20.13, v20.17 */
+      const sub = String((c && c.SUBSTATION) || r.user_substation || "").replace(/_\d+$/, "");
+      /* final outstanding: on the visit day (daily data, Apps Script) - else as saved at the visit */
+      let out = amount(r.visit_day_outstanding), mark = "";
+      if (out === null) {
+        out = amount(r.outstanding);
+        const upTo = iso(r.phone_data_up_to);
+        if (upTo && r.date) {
+          const d = new Date(r.date + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() - 2);
+          if (upTo < d.toISOString().slice(0, 10)) { mark = "*"; marked++; }
+        }
+      }
+      const npl = c ? nplTypeOf(c) : "";
+      const ll = v => { const x = Number(v); return v !== "" && isFinite(x) && x ? x.toFixed(4) : ""; };
+      const committed = iso(r.committed_date);
+      const statusText = r.status === "TIME GIVEN FOR PAYMENT" ? "TIME GIVEN" + (committed ? " (" + dmy(committed) + ")" : "") : r.status;
+      list.push({
+        date: r.date, sub: sub || "—", acct: r.account_id, name: (c && c.NAME) || r.consumer_name,
+        user: r.user_name || r.user_id || "",
+        father: (c && c.FATHER_NAME) || r.father_name, address: (c && c.ADDRESS) || r.address,
+        supply: r.supply_type || (c && c.SUPPLY_TYPE) || "", load: r.load || (c && c.LOAD) || "",
+        mobile: String(r.mobile_refused).toUpperCase() === "YES" ? "Refused" : r.mobile,
+        lat: ll(r.latitude), lng: ll(r.longitude), out: out, mark: mark,
+        list: npl === "NEVER PAID" ? "Never paid" : npl === "LONG UNPAID" ? "Long unpaid" : "",
+        status: r.status, statusText: statusText, committed: committed, mode: r.payment_mode,
+        paid: r.status === "PAID" ? amount(r.paid_amount) : null,
+        lastPay: pay, lastPayAmt: c ? c.LAST_PAY_AMOUNT : "", now: c ? amount(c.TOTAL_OUTSTANDING) : null
+      });
+    }
+    if (!list.length) {
+      return setStatus("dashRepStatus", mode === "REPORT" ? "No disconnection entries in these dates." : "No consumers for this list in these dates.", "error");
+    }
+    list.sort((a, b) => a.date.localeCompare(b.date) || a.sub.localeCompare(b.sub) || String(a.acct).localeCompare(String(b.acct)));
+
+    const TITLE = { REPORT: "DISCONNECTION REPORT", TG_NOT_PAID: "TIME GIVEN BUT NOT YET PAID", PAID_NOT_PAID: "PAID AT VISIT BUT NOT ACTUALLY PAID",
+      DISC_NOT_PAID: "DISCONNECTED BUT NOT YET PAID" }[mode];
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+    const money2 = v => v === null || v === undefined ? "" : Number(v).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const money0 = v => "Rs. " + Math.round(Number(v) || 0).toLocaleString("en-IN");
+
+    doc.setFontSize(14);
+    doc.text(TITLE, 10, 12);
+    doc.setFontSize(8.5);
+    const subFilter = $("dashSubstationFilter") && $("dashSubstationFilter").value.split("||").join(", ");
+    doc.text("Period: " + dmy(from) + " to " + dmy(to) + (subFilter ? "    Substation: " + subFilter : "") +
+      (mode === "REPORT" ? "" : "    Payments up to: " + ((getLocalMasterMeta() || {}).report_date || "data on this phone")) +
+      "    On: " + shareDateText(new Date().toISOString()), 10, 18);
+
+    /* summary: status in rows (total visits first), substations in columns */
+    const subs = Array.from(new Set(list.map(x => x.sub))).sort((a, b) => a.localeCompare(b));
+    const count = (s, pred) => list.filter(x => (s === null || x.sub === s) && pred(x)).length;
+    const sum = (s, pred, f) => list.filter(x => (s === null || x.sub === s) && pred(x)).reduce((a, x) => a + (Number(f(x)) || 0), 0);
+    const all = () => true;
+    const sRows = [];
+    const addCount = (label, pred) => sRows.push([label].concat(subs.map(s => count(s, pred)), [count(null, pred)]));
+    const addSum = (label, f) => sRows.push([label].concat(subs.map(s => money0(sum(s, all, f))), [money0(sum(null, all, f))]));
+    if (mode === "REPORT") {
+      addCount("Total visits", all);
+      addCount("Disconnected", x => x.status === "DISCONNECTED");
+      addCount("House lock and disconnected", x => x.status === "HOUSE LOCK AND DISCONNECTED");
+      addCount("Time given", x => x.status === "TIME GIVEN FOR PAYMENT");
+      addCount("Paid", x => x.status === "PAID");
+      addSum("Final outstanding", x => x.out);
+      addSum("Paid amount (reported by user)", x => x.paid);
+      addCount("Never paid", x => x.list === "Never paid");
+      addCount("Long unpaid", x => x.list === "Long unpaid");
+    } else {
+      addCount("Consumers", all);
+      addSum("Final outstanding (visit day)", x => x.out);
+      addSum("Outstanding now", x => x.now);
+      if (mode === "PAID_NOT_PAID") addSum("Paid amount (reported by user)", x => x.paid);
+      addCount("Never paid", x => x.list === "Never paid");
+      addCount("Long unpaid", x => x.list === "Long unpaid");
+    }
+
+    doc.autoTable({
+      startY: 22, margin: { left: 10, right: 10, bottom: getReportSignature() ? 28 : 10 },
+      head: [["Status"].concat(subs, ["Total"])], body: sRows, theme: "grid",
+      tableWidth: Math.min(277, 50 + 25 * (subs.length + 1)),
+      styles: { fontSize: 8, cellPadding: 1.5, lineColor: [120, 120, 120], lineWidth: 0.1, textColor: [0, 0, 0], halign: "right" },
+      headStyles: { fillColor: [21, 101, 192], textColor: 255, halign: "center" },
+      columnStyles: { 0: { halign: "left", fontStyle: "bold", cellWidth: 50 } },
+      didParseCell: d => { if (d.section === "body" && d.column.index === subs.length + 1) d.cell.styles.fontStyle = "bold"; }
+    });
+
+    let head, body, colStyles;
+    if (mode === "REPORT") {
+      head = ["S.No", "Date", "Substation", "User Name", "Account ID", "Consumer Name", "Father/Husband", "Address", "Supply Type", "Load",
+        "Mobile No", "Latitude", "Longitude", "Final Out (Rs.)", "List Category", "Disconnection Status", "Paid Amount (Reported by User)"];
+      body = list.map((x, i) => [i + 1, dmy(x.date), x.sub, x.user, x.acct, x.name, x.father, x.address, x.supply, x.load, x.mobile,
+        x.lat, x.lng, money2(x.out) + x.mark, x.list, x.statusText, x.paid === null ? "" : money2(x.paid)]);
+      colStyles = {      /* v20.18: User Name added */
+        0: { cellWidth: 8, halign: "right" }, 1: { cellWidth: 15 }, 2: { cellWidth: 17 }, 3: { cellWidth: 18 }, 4: { cellWidth: 17 },
+        5: { cellWidth: 22 }, 6: { cellWidth: 18 }, 7: { cellWidth: 24 }, 8: { cellWidth: 11, halign: "center" },
+        9: { cellWidth: 8, halign: "center" }, 10: { cellWidth: 17 }, 11: { cellWidth: 13 }, 12: { cellWidth: 13 },
+        13: { cellWidth: 18, halign: "right" }, 14: { cellWidth: 16, halign: "center" }, 15: { cellWidth: 21, halign: "center" },
+        16: { cellWidth: 18, halign: "right" }
+      };
+    } else {
+      head = ["S.No", "Visit Date", "Substation", "User Name", "Account ID", "Consumer Name", "Father/Husband", "Address", "Mobile No",
+        mode === "TG_NOT_PAID" ? "Committed Date" : mode === "DISC_NOT_PAID" ? "Latitude, Longitude" : "Payment Mode",
+        mode === "PAID_NOT_PAID" ? "Paid Amount (Reported by User)" : "Final Out (Rs.)",
+        "Last Pay Date", "Last Pay Amt", "Outstanding Now", "List Category"];
+      body = list.map((x, i) => [i + 1, dmy(x.date), x.sub, x.user, x.acct, x.name, x.father, x.address, x.mobile,
+        mode === "TG_NOT_PAID" ? (x.committed ? dmy(x.committed) : "") : mode === "DISC_NOT_PAID" ? (x.lat ? x.lat + ", " + x.lng : "") : x.mode,
+        mode === "PAID_NOT_PAID" ? (x.paid === null ? "" : money2(x.paid)) : money2(x.out) + x.mark,
+        x.lastPay ? dmy(x.lastPay) : "", x.lastPayAmt || "", x.now === null ? "" : money2(x.now), x.list]);
+      colStyles = {      /* v20.18: User Name added */
+        0: { cellWidth: 8, halign: "right" }, 1: { cellWidth: 16 }, 2: { cellWidth: 18 }, 3: { cellWidth: 18 }, 4: { cellWidth: 18 },
+        5: { cellWidth: 22 }, 6: { cellWidth: 20 }, 7: { cellWidth: 30 }, 8: { cellWidth: 18 }, 9: { cellWidth: 20 },
+        10: { cellWidth: 19, halign: "right" }, 11: { cellWidth: 17 }, 12: { cellWidth: 15, halign: "right" },
+        13: { cellWidth: 20, halign: "right" }, 14: { cellWidth: 17, halign: "center" }
+      };
+    }
+    doc.autoTable({
+      startY: doc.lastAutoTable.finalY + 6, margin: { left: 10, right: 10, bottom: getReportSignature() ? 28 : 10 },
+      head: [head], body: body, theme: "grid",
+      styles: { fontSize: 6.8, cellPadding: 1, overflow: "linebreak", valign: "middle", lineColor: [120, 120, 120], lineWidth: 0.1, textColor: [0, 0, 0] },
+      headStyles: { fillColor: [21, 101, 192], textColor: 255, fontSize: 6.8, halign: "center" },
+      columnStyles: colStyles,
+      didDrawPage: () => {
+        doc.setFontSize(7);
+        doc.text("Page " + doc.internal.getNumberOfPages(), doc.internal.pageSize.getWidth() - 25, doc.internal.pageSize.getHeight() - 5);
+      }
+    });
+    let y = doc.lastAutoTable.finalY + 5;
+    if (y > doc.internal.pageSize.getHeight() - (getReportSignature() ? 30 : 14)) { doc.addPage(); y = 14; }
+    doc.setFontSize(7);
+    doc.text("Final Out = outstanding on the visit day (daily billing and payment data)" +
+      (marked ? "; * = outstanding as saved at the visit, when the phone's data was more than 2 days old." : ".") +
+      (mode === "REPORT" ? "" : "  Not paid = no payment dated on or after the visit day."), 10, y);
+
+    const fileTitle = { REPORT: "Disconnection_Report_", TG_NOT_PAID: "Time_Given_Not_Yet_Paid_", PAID_NOT_PAID: "Paid_At_Visit_Not_Actually_Paid_",
+      DISC_NOT_PAID: "Disconnected_Not_Yet_Paid_" }[mode];
+    const name = fileTitle + from + "_to_" + to + ".pdf";
+    addReportSignature(doc);                                                   /* v20.15 */
+    doc.save(name);
+    dashReportFile = new File([doc.output("blob")], name, { type: "application/pdf" });
+    if ($("dashRepShareBtn")) $("dashRepShareBtn").classList.remove("hidden");
+    setStatus("dashRepStatus", "Downloaded: " + name.replace(/_/g, " ") + " (" + list.length.toLocaleString("en-IN") + ").", "ok");
+  } catch (e) {
+    console.error(e);
+    setStatus("dashRepStatus", "Could not make the PDF: " + (e.message || e), "error");
+  } finally {
+    hideGlobalLoading();
+  }
+}
+if ($("dashRepPdfBtn")) {
+  $("dashRepPdfBtn").addEventListener("click", () => downloadDisconnectionReportPdf("REPORT"));
+  if ($("dashRepShareBtn")) $("dashRepShareBtn").addEventListener("click", shareDisconnectionReport);
+  if ($("dashTgNotPaidBtn")) $("dashTgNotPaidBtn").addEventListener("click", () => downloadDisconnectionReportPdf("TG_NOT_PAID"));
+  if ($("dashPaidNotPaidBtn")) $("dashPaidNotPaidBtn").addEventListener("click", () => downloadDisconnectionReportPdf("PAID_NOT_PAID"));
+  if ($("dashDiscNotPaidBtn")) $("dashDiscNotPaidBtn").addEventListener("click", () => downloadDisconnectionReportPdf("DISC_NOT_PAID"));
+  if ($("dashRepTodayBtn")) $("dashRepTodayBtn").addEventListener("click", () => {          /* v20.14 */
+    const d = new Date(), p = x => String(x).padStart(2, "0");
+    const today = d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+    downloadDisconnectionReportPdf("REPORT", today, today);
+  });
+  ["dashRepFrom", "dashRepTo"].forEach(id => $(id).addEventListener("focus", dashReportDates, { once: true }));
+}
+
+
+
+
+/* ---------- v20.15: signature on every page of the disconnection report ---------- */
+/* Kept on this phone only (per user): { img: PNG data URL, text: name / designation } */
+function reportSignatureKey() {
+  return "fieldworkReportSignature:" + String(state.userId || "").trim().toLowerCase();
+}
+function getReportSignature() {
+  try { const s = JSON.parse(localStorage.getItem(reportSignatureKey()) || "null"); return s && s.img ? s : null; }
+  catch (e) { return null; }
+}
+function showReportSignatureState() {
+  const s = getReportSignature();
+  if ($("dashSigState")) $("dashSigState").textContent = s ? "Added" + (s.text ? " (" + s.text + ")" : "") : "Not added";
+  if ($("dashSigRemoveBtn")) $("dashSigRemoveBtn").classList.toggle("hidden", !s);
+}
+
+function openSignaturePad() {
+  let box = $("sigOverlay");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "sigOverlay";
+    box.className = "dash-list-overlay";
+    box.innerHTML =
+      '<div class="dash-list-card"><div class="dash-list-head"><b>Signature for reports</b>' +
+      '<button id="sigCloseBtn" type="button" class="secondary">CLOSE</button></div>' +
+      '<div class="dash-mtx-note">Sign inside the box with your finger / touchpad, or upload a photo of your signature. ' +
+      "It is kept on this phone and printed at the bottom of every page of the report.</div>" +
+      '<canvas id="sigCanvas" width="600" height="220" class="sig-canvas"></canvas>' +
+      '<div class="dash-list-btns"><button id="sigClearBtn" type="button" class="secondary">CLEAR</button>' +
+      '<label class="sig-upload secondary">UPLOAD SIGNATURE<input id="sigFile" type="file" accept="image/*" hidden></label></div>' +
+      '<label for="sigText">Name / designation under the signature (optional)</label>' +
+      '<input id="sigText" maxlength="60" placeholder="e.g. SDO, Orai">' +
+      '<div id="sigStatus" class="status"></div>' +
+      '<button id="sigSaveBtn" type="button" class="primary">SAVE SIGNATURE</button></div>';
+    document.body.appendChild(box);
+    const cv = $("sigCanvas"), ctx = cv.getContext("2d");
+    let drawing = false, drawn = false;
+    const pos = e => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height]; };
+    cv.addEventListener("pointerdown", e => { drawing = true; drawn = true; cv.setPointerCapture(e.pointerId); const [x, y] = pos(e); ctx.beginPath(); ctx.moveTo(x, y); e.preventDefault(); });
+    cv.addEventListener("pointermove", e => { if (!drawing) return; const [x, y] = pos(e); ctx.lineTo(x, y); ctx.stroke(); e.preventDefault(); });
+    ["pointerup", "pointercancel", "pointerleave"].forEach(ev => cv.addEventListener(ev, () => { drawing = false; }));
+    const reset = () => { ctx.clearRect(0, 0, cv.width, cv.height); ctx.lineWidth = 4; ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = "#0b2a6f"; drawn = false; };
+    box._reset = reset;
+    box._isDrawn = () => drawn;
+    box._setDrawn = v => { drawn = v; };
+    $("sigClearBtn").addEventListener("click", reset);
+    $("sigCloseBtn").addEventListener("click", () => { box.classList.add("hidden"); document.body.style.overflow = ""; });
+    $("sigFile").addEventListener("change", () => {
+      const file = $("sigFile").files && $("sigFile").files[0];
+      if (!file) return;
+      const img = new Image();
+      img.onload = () => {
+        reset();
+        const k = Math.min(cv.width / img.width, cv.height / img.height);
+        const w = img.width * k, h = img.height * k;
+        ctx.drawImage(img, (cv.width - w) / 2, (cv.height - h) / 2, w, h);
+        /* make a white / light background transparent, so only the ink prints */
+        const d = ctx.getImageData(0, 0, cv.width, cv.height);
+        for (let i = 0; i < d.data.length; i += 4) {
+          if (d.data[i] > 200 && d.data[i + 1] > 200 && d.data[i + 2] > 200) d.data[i + 3] = 0;
+        }
+        ctx.putImageData(d, 0, 0);
+        box._setDrawn(true);
+        URL.revokeObjectURL(img.src);
+      };
+      img.onerror = () => setStatus("sigStatus", "This file could not be read as a picture.", "error");
+      img.src = URL.createObjectURL(file);
+      $("sigFile").value = "";
+    });
+    $("sigSaveBtn").addEventListener("click", () => {
+      if (!box._isDrawn()) return setStatus("sigStatus", "Sign in the box or upload a signature first.", "error");
+      /* crop to the ink */
+      const d = ctx.getImageData(0, 0, cv.width, cv.height);
+      let x0 = cv.width, y0 = cv.height, x1 = 0, y1 = 0;
+      for (let y = 0; y < cv.height; y++) for (let x = 0; x < cv.width; x++) {
+        if (d.data[(y * cv.width + x) * 4 + 3] > 20) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      }
+      if (x1 <= x0 || y1 <= y0) return setStatus("sigStatus", "Sign in the box or upload a signature first.", "error");
+      const out = document.createElement("canvas");
+      out.width = x1 - x0 + 8; out.height = y1 - y0 + 8;
+      out.getContext("2d").drawImage(cv, x0 - 4, y0 - 4, out.width, out.height, 0, 0, out.width, out.height);
+      try {
+        localStorage.setItem(reportSignatureKey(), JSON.stringify({ img: out.toDataURL("image/png"), text: $("sigText").value.trim(),
+          w: out.width, h: out.height }));
+      } catch (e) {
+        return setStatus("sigStatus", "Could not keep the signature on this phone (storage full or blocked).", "error");
+      }
+      showReportSignatureState();
+      setStatus("dashRepStatus", "Signature saved. It will be printed on every page of the reports.", "ok");
+      $("sigCloseBtn").click();
+    });
+  }
+  box._reset();
+  const s = getReportSignature();
+  $("sigText").value = s ? s.text || "" : "";
+  if (s) {
+    const img = new Image();
+    img.onload = () => {
+      const cv = $("sigCanvas"), k = Math.min(cv.width / img.width, cv.height / img.height, 1);
+      cv.getContext("2d").drawImage(img, (cv.width - img.width * k) / 2, (cv.height - img.height * k) / 2, img.width * k, img.height * k);
+      box._setDrawn(true);
+    };
+    img.src = s.img;
+  }
+  setStatus("sigStatus", "");
+  box.classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+}
+
+/* bottom-right of every page, left of the page number */
+function addReportSignature(doc) {
+  const s = getReportSignature();
+  if (!s) return;
+  const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
+  const maxW = 45, maxH = 15;
+  const ratio = (s.w && s.h) ? s.w / s.h : 3;
+  let w = maxW, h = w / ratio;
+  if (h > maxH) { h = maxH; w = h * ratio; }
+  const right = W - 32, x = right - w, base = H - 9;
+  for (let p = 1; p <= doc.internal.getNumberOfPages(); p++) {
+    doc.setPage(p);
+    try { doc.addImage(s.img, "PNG", x, base - h, w, h); } catch (e) { return; }
+    doc.setDrawColor(120, 120, 120);
+    doc.setLineWidth(0.2);
+    doc.line(right - maxW, base + 0.5, right, base + 0.5);
+    doc.setFontSize(7);
+    doc.setTextColor(0, 0, 0);
+    doc.text(s.text || "Signature", right, base + 3.5, { align: "right" });
+  }
+}
+
+if ($("dashSigBtn")) {
+  $("dashSigBtn").addEventListener("click", openSignaturePad);
+  $("dashSigRemoveBtn").addEventListener("click", () => {
+    if (!confirm("Remove the signature from this phone?")) return;
+    try { localStorage.removeItem(reportSignatureKey()); } catch (e) {}
+    showReportSignatureState();
+  });
+}
+
+async function loadDashboard() {
+  dashboardHasLoaded = true;
+  $("sumSurveyTotal").textContent="...";
+  $("sumMeterOk").textContent="...";
+  $("sumMeterDamaged").textContent="...";
+  $("sumMeterNI").textContent="...";
+  $("sumAcYes").textContent="...";
+  $("sumAcNo").textContent="...";
+  $("discTotal").textContent="...";
+  $("discPaid").textContent="...";
+  $("discDisconnected").textContent="...";
+  $("discTimeGiven").textContent="...";
+  $("discOutstanding").textContent="...";
+  $("recheckTotal").textContent="...";
+  $("recheckConnected").textContent="...";
+  $("recheckDisconnected").textContent="...";
+  $("recheckLocked").textContent="...";
+  $("recheckPayment").textContent="...";
+  $("recheckOutstanding").textContent="...";
+  $("phoneTotal").textContent="...";
+  $("dashboardPhoneOutstanding").textContent="...";
+
+  showGlobalLoading(
+    "Loading Dashboard...",
+    "Fetching dashboard data from server. Please wait."
+  );
+
+
+  try {
+    const result = await adminRequest("dashboard", {
+      from_date: $("dashFromDate").value,
+      to_date: $("dashToDate").value,
+      village:  "",
+      substation: $("dashSubstationFilter").value
+    });
+
+    if (!result.success) {
+      $("substationReport").innerHTML='<div class="dashboard-empty-state">'+escapeHtml(result.message || "Could not load dashboard.")+'</div>';
+      $("userReport").innerHTML='<div class="dashboard-empty-state">Could not load dashboard.</div>';
+      $("multiUserReport").innerHTML='';
+      return;
+    }
+
+    const s=result.survey_summary||{};
+    $("sumSurveyTotal").textContent=Number(s.total||0).toLocaleString();
+    $("sumMeterOk").textContent=Number(s.meter_ok||0).toLocaleString();
+    $("sumMeterDamaged").textContent=Number(s.meter_damaged||0).toLocaleString();
+    $("sumMeterNI").textContent=Number(s.meter_not_installed||0).toLocaleString();
+    $("sumAcYes").textContent=Number(s.ac_yes||0).toLocaleString();
+    $("sumAcNo").textContent=Number(s.ac_no||0).toLocaleString();
+
+    const d=result.disconnection_summary||{};
+    $("discTotal").textContent=Number(d.total||0).toLocaleString();
+    $("discPaid").textContent=Number(d.paid||0).toLocaleString();
+    $("discDisconnected").textContent=Number(d.disconnected||0).toLocaleString();
+    $("discTimeGiven").textContent=Number(d.time_given||0).toLocaleString();
+    $("discOutstanding").textContent=formatDashboardMoney(d.outstanding);
+
+    const r=result.recheck_summary||{};
+    $("recheckTotal").textContent=Number(r.total||0).toLocaleString();
+    $("recheckConnected").textContent=Number(r.found_connected||0).toLocaleString();
+    $("recheckDisconnected").textContent=Number(r.still_disconnected||0).toLocaleString();
+    $("recheckLocked").textContent=Number(r.house_locked||0).toLocaleString();
+    $("recheckPayment").textContent=Number(r.payment_made||0).toLocaleString();
+    $("recheckOutstanding").textContent=formatDashboardMoney(r.outstanding);
+
+    const ph=result.phone_calling_summary||{};
+    $("phoneTotal").textContent=Number(ph.total||0).toLocaleString();
+    $("dashboardPhoneOutstanding").textContent=formatDashboardMoney(ph.outstanding);
+    renderPhoneResponses(ph.responses||[]);
+    renderDashboardSummaries(result);                             /* v20.11 */
+
+    renderSubstationReport(result.substation_wise||[]);
+    renderUserReport(result.user_wise||[]);
+  } catch(e) {
+    dashboardHasLoaded = false;
+    $("substationReport").innerHTML='<div class="dashboard-empty-state">Could not connect to server.</div>';
+    $("userReport").innerHTML='<div class="dashboard-empty-state">Could not connect to server.</div>';
+    $("multiUserReport").innerHTML='';
+  } finally {
+     hideGlobalLoading();
+  }
+}
+
+async function adminRequest(action, extra={}) {
+  const response = await fetch(SERVER_URL, {
+    method: "POST",
+    headers: {"Content-Type":"text/plain;charset=utf-8"},
+    body: JSON.stringify(Object.assign({
+      action,
+      token: state.sessionToken
+    }, extra))
+  });
+  return await response.json();
+}
+
+
+
+
+
+async function openAdmin() {
+  if (!state.isAdmin) return;
+
+  showMainView("adminCard");
+
+  showGlobalLoading(
+    "Loading Admin...",
+    "Fetching admin data and user list. Please wait."
+  );
+
+  try {
+    await loadAdminMasterLists();
+
+  } finally {
+    hideGlobalLoading();
+  }
+}
+
+async function loadAdminMasterLists() {
+  const subBox =
+    $("newUserSubstations");
+
+  const roleSelect =
+    $("newUserRole");
+
+  const divisionSelect =
+    $("newUserDivision");
+
+  const subdivisionSelect =
+    $("newUserSubdivision");
+
+  if (
+    !subBox ||
+    !roleSelect ||
+    !divisionSelect ||
+    !subdivisionSelect
+  ) {
+    return false;
+  }
+
+  subBox.textContent =
+    "Loading organization hierarchy...";
+
+  roleSelect.innerHTML =
+    '<option value="">Select role</option>';
+
+  divisionSelect.innerHTML =
+    '<option value="">Select Division</option>';
+
+  subdivisionSelect.innerHTML =
+    '<option value="">Select Subdivision</option>';
+
+  try {
+
+    const result =
+      await adminRequest("master_lists");
+
+    if (!result.success) {
+      subBox.textContent =
+        result.message ||
+        "Could not load organization hierarchy.";
+
+      return false;
+    }
+
+    window.adminOrganizationMaster = {
+      divisions:
+        Array.isArray(result.divisions)
+          ? result.divisions
+          : [],
+
+      divisionMap:
+        result.division_map || {},
+
+      subdivisionMap:
+        result.subdivision_map || {},
+
+      roles:
+        Array.isArray(result.roles)
+          ? result.roles
+          : [],
+
+      roleScope:
+        result.role_scope || {}
+    };
+
+    for (
+      const division of
+      window.adminOrganizationMaster.divisions
+    ) {
+
+      const option =
+        document.createElement("option");
+
+      option.value = division;
+      option.textContent = division;
+
+      divisionSelect.appendChild(option);
+    }
+
+    for (
+      const role of
+      window.adminOrganizationMaster.roles
+    ) {
+
+      const option =
+        document.createElement("option");
+
+      option.value = role;
+      option.textContent = role;
+
+      roleSelect.appendChild(option);
+    }
+
+    updateAdminAssignmentUI();
+
+    return true;
+
+  } catch(e) {
+
+    subBox.textContent =
+      "Could not connect to server.";
+
+    return false;
+  }
+}
+
+function getAdminRoleScope() {
+  const role =
+    $("newUserRole")?.value || "";
+
+  return (
+    window.adminOrganizationMaster
+      ?.roleScope?.[role] || ""
+  );
+}
+
+
+function clearAdminSubstations(message) {
+  const box =
+    $("newUserSubstations");
+
+  if (!box) return;
+
+  box.innerHTML = "";
+
+  const info =
+    document.createElement("div");
+
+  info.className =
+    "admin-scope-info";
+
+  info.textContent =
+    message || "";
+
+  box.appendChild(info);
+}
+
+
+function renderAdminSubstations(
+  substations,
+  options={}
+) {
+  const box =
+    $("newUserSubstations");
+
+  if (!box) return;
+
+  box.innerHTML = "";
+
+  const auto =
+    options.auto === true;
+
+  const single =
+    options.single === true;
+
+  if (!substations.length) {
+
+    clearAdminSubstations(
+      "No substations available."
+    );
+
+    return;
+  }
+
+  substations.forEach(name => {
+
+    const label =
+      document.createElement("label");
+
+    label.className =
+      "admin-checkbox-item" +
+      (auto
+        ? " admin-auto-scope"
+        : "");
+
+    const input =
+      document.createElement("input");
+
+    input.type =
+      single
+        ? "radio"
+        : "checkbox";
+
+    input.name =
+      single
+        ? "new-user-substation-single"
+        : "new-user-substation";
+
+    input.className =
+      "new-user-substation";
+
+    input.value =
+      name;
+
+    input.checked =
+      auto;
+
+    input.disabled =
+      auto;
+
+    const span =
+      document.createElement("span");
+
+    span.textContent =
+      name;
+
+    label.appendChild(input);
+    label.appendChild(span);
+
+    box.appendChild(label);
+  });
+}
+
+
+function updateAdminScopeInfo() {
+
+  const division =
+    $("newUserDivision")?.value || "";
+
+  const subdivision =
+    $("newUserSubdivision")?.value || "";
+
+  const role =
+    $("newUserRole")?.value || "";
+
+  const divisionInfo =
+    $("newUserDivisionScope");
+
+  const subdivisionInfo =
+    $("newUserSubdivisionScope");
+
+  const scopeInfo =
+    $("newUserScopeInfo");
+
+  [
+    divisionInfo,
+    subdivisionInfo,
+    scopeInfo
+  ].forEach(el => {
+
+    if (!el) return;
+
+    el.classList.add("hidden");
+    el.textContent = "";
+  });
+
+  if (!role || !division) {
+    return;
+  }
+
+  const scope =
+    getAdminRoleScope();
+
+  const divisionData =
+    window.adminOrganizationMaster
+      ?.divisionMap?.[division] ||
+    {
+      subdivisions:[],
+      substations:[]
+    };
+
+  if (scope === "DIVISION") {
+
+    if (divisionInfo) {
+
+      divisionInfo.textContent =
+        `${divisionData.subdivisions.length} subdivision(s) and ` +
+        `${divisionData.substations.length} substation(s) ` +
+        `will be selected automatically.`;
+
+      divisionInfo.classList.remove("hidden");
+    }
+
+    renderAdminSubstations(
+      divisionData.substations,
+      {auto:true}
+    );
+
+    return;
+  }
+
+  if (!subdivision) {
+    return;
+  }
+
+  const key =
+    division +
+    "||" +
+    subdivision;
+
+  const substations =
+    window.adminOrganizationMaster
+      ?.subdivisionMap?.[key] || [];
+
+  if (scope === "SUBDIVISION") {
+
+    if (subdivisionInfo) {
+
+      subdivisionInfo.textContent =
+        `${substations.length} substation(s) ` +
+        `will be selected automatically.`;
+
+      subdivisionInfo.classList.remove("hidden");
+    }
+
+    renderAdminSubstations(
+      substations,
+      {auto:true}
+    );
+
+    return;
+  }
+
+  if (scope === "SUBSTATION_SINGLE") {
+
+    if (scopeInfo) {
+
+      scopeInfo.textContent =
+        `Select one substation for ${role}.`;
+
+      scopeInfo.classList.remove("hidden");
+    }
+
+    renderAdminSubstations(
+      substations,
+      {single:true}
+    );
+
+    return;
+  }
+
+  if (scope === "SUBSTATION_MULTI") {
+
+    if (scopeInfo) {
+
+      scopeInfo.textContent =
+        `Select one or more substations for ${role}.`;
+
+      scopeInfo.classList.remove("hidden");
+    }
+
+    renderAdminSubstations(
+      substations,
+      {single:false}
+    );
+  }
+}
+
+
+function updateAdminAssignmentUI() {
+
+  const division =
+    $("newUserDivision")?.value || "";
+
+  const role =
+    $("newUserRole")?.value || "";
+
+  const subdivisionSelect =
+    $("newUserSubdivision");
+
+  if (!subdivisionSelect) {
+    return;
+  }
+
+  subdivisionSelect.innerHTML =
+    '<option value="">Select Subdivision</option>';
+
+  const divisionData =
+    window.adminOrganizationMaster
+      ?.divisionMap?.[division] ||
+    {
+      subdivisions:[],
+      substations:[]
+    };
+
+  for (
+    const subdivision of
+    divisionData.subdivisions
+  ) {
+
+    const option =
+      document.createElement("option");
+
+    option.value =
+      subdivision;
+
+    option.textContent =
+      subdivision;
+
+    subdivisionSelect.appendChild(option);
+  }
+
+  const scope =
+    getAdminRoleScope();
+
+  if (scope === "DIVISION") {
+
+    subdivisionSelect.value = "";
+    subdivisionSelect.disabled = true;
+
+    clearAdminSubstations(
+      "Substations will be selected automatically from the entire Division."
+    );
+
+  } else {
+
+    subdivisionSelect.disabled =
+      false;
+
+    if (!division) {
+
+      clearAdminSubstations(
+        "Select Division first."
+      );
+
+    } else {
+
+      clearAdminSubstations(
+        "Select Subdivision."
+      );
+    }
+  }
+
+  updateAdminScopeInfo();
+}
+
+
+async function loadUsers() {
+  $("usersTable").textContent = "Loading...";
+  try {
+    const result = await adminRequest("list_users");
+    if (!result.success) {
+      $("usersTable").textContent = result.message || "Could not load users.";
+      return;
+    }
+
+    const rows = [
+  `    <div class="user-row user-head"><div>User ID</div><div>Name</div><div>Division</div><div>Subdivision</div><div>Substation(s)</div><div>Role</div><div>Status</div><div>Action</div></div>`
+    ];
+
+    for (const u of result.users) {
+
+      const action = (u.active === "YES"
+        ? `<button class="small-btn danger-btn" onclick="toggleUser('${escapeHtml(u.user_id)}','NO')">DISABLE</button>`
+        : `<button class="small-btn" onclick="toggleUser('${escapeHtml(u.user_id)}','YES')">ENABLE</button>`) +
+        ` <button class="small-btn" onclick="resetUserPassword('${escapeHtml(u.user_id)}')">RESET PASSWORD</button>`;
+
+      rows.push(
+
+        `<div class="user-row"><div data-label="User ID">${escapeHtml(u.user_id)}</div><div data-label="Name">${escapeHtml(u.user_name)}</div><div data-label="Division">${escapeHtml(u.division || "Unassigned")}</div><div data-label="Subdivision">${escapeHtml(u.subdivision || "Unassigned")}</div><div data-label="Substation(s)" class="admin-user-substation">${escapeHtml(u.substation || "Unassigned")}</div><div data-label="Role">${escapeHtml(u.role || "")}</div><div data-label="Status">${escapeHtml(u.active)}</div><div data-label="Action">${action}</div></div>`
+      );
+    }
+    $("usersTable").innerHTML = rows.join("");
+  } catch (e) {
+    $("usersTable").textContent = "Could not connect to server.";
+  }
+}
+
+
+
+async function createUser() {
+  if (!state.isAdmin) return;
+
+  const userId =
+    $("newUserId").value.trim();
+
+  const userName =
+    $("newUserName").value.trim();
+
+  const password =
+    $("newUserPassword").value;
+
+  const division =
+    $("newUserDivision").value.trim();
+
+  const subdivision =
+    $("newUserSubdivision").value.trim();
+
+  const role =
+    $("newUserRole").value.trim();
+
+  const scope =
+    getAdminRoleScope();
+
+  const substations = [
+    ...document.querySelectorAll(
+      ".new-user-substation:checked"
+    )
+  ].map(el => el.value);
+
+  if (
+    !userId ||
+    !userName ||
+    !password
+  ) {
+    return setStatus(
+      "adminStatus",
+      "Enter User ID, User Name and Password.",
+      "error"
+    );
+  }
+
+  if (!division) {
+    return setStatus(
+      "adminStatus",
+      "Select Division.",
+      "error"
+    );
+  }
+
+  if (!role) {
+    return setStatus(
+      "adminStatus",
+      "Select a role.",
+      "error"
+    );
+  }
+
+  if (
+    scope !== "DIVISION" &&
+    !subdivision
+  ) {
+    return setStatus(
+      "adminStatus",
+      "Select Subdivision.",
+      "error"
+    );
+  }
+
+  if (
+    scope === "SUBSTATION_SINGLE" &&
+    substations.length !== 1
+  ) {
+    return setStatus(
+      "adminStatus",
+      `${role} requires exactly one substation.`,
+      "error"
+    );
+  }
+
+  if (
+    scope === "SUBSTATION_MULTI" &&
+    !substations.length
+  ) {
+    return setStatus(
+      "adminStatus",
+      `Select at least one substation for ${role}.`,
+      "error"
+    );
+  }
+
+  if (
+    (
+      scope === "DIVISION" ||
+      scope === "SUBDIVISION"
+    ) &&
+    !substations.length
+  ) {
+    return setStatus(
+      "adminStatus",
+      "No substations were derived for this assignment.",
+      "error"
+    );
+  }
+
+  setStatus(
+    "adminStatus",
+    "Creating user..."
+  );
+
+  const result =
+    await adminRequest(
+      "create_user",
+      {
+        user_id:userId,
+        user_name:userName,
+        password:password,
+        substations:substations,
+        division:division,
+        subdivision:subdivision,
+        role:role
+      }
+    );
+
+  if (!result.success) {
+
+    return setStatus(
+      "adminStatus",
+      result.message ||
+        "Could not create user.",
+      "error"
+    );
+  }
+
+  $("newUserId").value = "";
+  $("newUserName").value = "";
+  $("newUserPassword").value = "";
+  $("newUserDivision").value = "";
+  $("newUserSubdivision").value = "";
+  $("newUserRole").value = "";
+
+  updateAdminAssignmentUI();
+
+  setStatus(
+    "adminStatus",
+    "User created successfully.",
+    "ok"
+  );
+
+
+}
+
+
+/*
+ * Admin: RESET PASSWORD for a user of the admin's area.
+ * Opens the in-app Reset Password window. After a reset the user
+ * is logged out on all phones and logs in again with the new
+ * password. Records saved on their phone are kept.
+ */
+let resetPasswordUserId = "";
+
+function resetUserPassword(userId) {
+  if (!state.isAdmin) return;
+
+  resetPasswordUserId = userId;
+  $("resetPasswordFor").textContent = "User ID: " + userId;
+  $("resetPasswordNew").value = "";
+  $("resetPasswordConfirm").value = "";
+  $("resetPasswordShow").checked = false;
+  $("resetPasswordNew").type = "password";
+  $("resetPasswordConfirm").type = "password";
+
+  $("resetPasswordFields").classList.remove("hidden");
+  $("resetPasswordSaveBtn").classList.remove("hidden");
+  $("resetPasswordSaveBtn").disabled = false;
+
+  setStatus("resetPasswordStatus", "");
+  $("resetPasswordModal").classList.remove("hidden");
+  $("resetPasswordNew").focus();
+}
+
+function closeResetPassword() {
+  $("resetPasswordModal").classList.add("hidden");
+  $("resetPasswordNew").value = "";
+  $("resetPasswordConfirm").value = "";
+  resetPasswordUserId = "";
+}
+
+function toggleResetPasswordVisibility() {
+  const type = $("resetPasswordShow").checked ? "text" : "password";
+  $("resetPasswordNew").type = type;
+  $("resetPasswordConfirm").type = type;
+}
+
+async function saveResetPassword() {
+
+  const userId = resetPasswordUserId;
+  if (!userId) return;
+
+  const password = $("resetPasswordNew").value;
+  const confirmPassword = $("resetPasswordConfirm").value;
+
+  if (password.length < 6) {
+    return setStatus("resetPasswordStatus", "Password must be at least 6 characters.", "error");
+  }
+  if (password !== confirmPassword) {
+    return setStatus("resetPasswordStatus", "The two passwords do not match.", "error");
+  }
+
+  const button = $("resetPasswordSaveBtn");
+  button.disabled = true;
+  setStatus("resetPasswordStatus", "");
+  showGlobalLoading("Resetting password…", "Saving the new password for " + userId + " on the server.");
+
+  let result;
+
+  try {
+    result = await adminRequest("reset_password", { user_id: userId, new_password: password });
+  } catch (e) {
+    result = { success: false, message: "Could not connect to the server. Please try again." };
+  } finally {
+    hideGlobalLoading();
+    button.disabled = false;
+  }
+
+  if (!result.success) {
+    return setStatus("resetPasswordStatus", result.message || "Could not reset the password.", "error");
+  }
+
+  $("resetPasswordNew").value = "";
+  $("resetPasswordConfirm").value = "";
+
+  button.classList.add("hidden");
+  $("resetPasswordFields").classList.add("hidden");
+  setStatus("resetPasswordStatus", result.message || "Password reset.", "ok");
+
+
+  /* Own password reset: this phone's login is no longer valid. */
+  if (String(userId).toLowerCase() === String(state.userId || "").toLowerCase()) {
+    setTimeout(() => {
+      closeResetPassword();
+      logout();
+    }, 2500);
+  }
+}
+
+
+
+async function toggleUser(userId, active) {
+  if (!state.isAdmin) return;
+
+  const result = await adminRequest("set_user_active", {
+    user_id:userId,
+    active
+  });
+
+  if (!result.success) {
+    alert(result.message || "Could not update user.");
+    return;
+  }
+
+  
+  if (!$("usersTable").classList.contains("hidden")) {
+      await loadUsers();
+  }
+
+}
+
+
+$("homeBtn").addEventListener("click", goHome);
+$("checkMasterUpdateBtn")
+  .addEventListener(
+    "click",
+    checkAndUpdateMasterData
+  );
+
+$("downloadMasterUpdateBtn")
+  .addEventListener(
+    "click",
+    performMasterUpdate
+  );
+
+/* Feeder change -> refresh its DT list */
+for (const [feederId, dtId] of FEEDER_DT_PAIRS) {
+  if ($(feederId)) {
+    $(feederId).addEventListener("change", () => {
+      if ($(dtId)) $(dtId).value = "";
+      fillDtDropdown(dtId, feederId);
+    });
+  }
+}
+
+
+
+/* Defaulter List (guarded: page may not have it) */
+if ($("openDefaulterListBtn")) {
+  $("openDefaulterListBtn").addEventListener("click", openDefaulterList);
+  $("dlCloseBtn").addEventListener("click", closeDefaulterList);
+  $("dlPreviewBtn").addEventListener("click", previewDefaulterList);
+  $("dlPdfBtn").addEventListener("click", downloadDefaulterPdf);
+  $("dlPayMode").addEventListener("change", dlUpdatePayBoxes);
+  /* v20.11: office lists */
+  if ($("dlNpl")) $("dlNpl").addEventListener("change", () => dlSwitchNplMode($("dlNpl").value));   /* v20.12 */
+  const openOfficeList = async type => {
+    await openDefaulterList(type);
+    setStatus("dlStatusMsg", "");
+  };
+  if ($("openNeverPaidListBtn")) $("openNeverPaidListBtn").addEventListener("click", () => openOfficeList("NEVER PAID"));
+  if ($("openLongUnpaidListBtn")) $("openLongUnpaidListBtn").addEventListener("click", () => openOfficeList("LONG UNPAID"));
+
+
+  $("dlDocMode").addEventListener("change", dlUpdateDocBox);
+  $("dlLoadMode").addEventListener("change", dlUpdateLoadBox);
+  ["dlLoadMin", "dlLoadMax", "dlOutMin"].forEach(id => dlNumbersOnly($(id)));
+  document.querySelectorAll("#defaulterListCard .dl-filter-head").forEach(btn =>
+
+    btn.addEventListener("click", () => dlToggleList(btn.dataset.target))
+  );
+}
+
+
+/* Disconnected But Unpaid List (guarded: page may not have it) */
+if ($("openDisconnectedUnpaidBtn")) {
+  $("openDisconnectedUnpaidBtn").addEventListener("click", () => openDisconnectedUnpaidList("DISC"));
+  if ($("openPhonePromiseBtn")) $("openPhonePromiseBtn").addEventListener("click", () => openDisconnectedUnpaidList("PHONE"));
+  $("duBackBtn").addEventListener("click", closeDisconnectedUnpaidList);
+  $("duLoadBtn").addEventListener("click", loadDisconnectedUnpaid);
+  $("duPreviewBtn").addEventListener("click", previewDisconnectedUnpaid);
+  $("duPdfBtn").addEventListener("click", downloadDisconnectedUnpaidPdf);
+  ["duDateMode", "duLoadMode", "duDocMode", "duPayMode"].forEach(id =>
+    $(id).addEventListener("change", duUpdateBoxes)
+  );
+  ["duLoadMin", "duLoadMax", "duOutMin"].forEach(id => dlNumbersOnly($(id)));
+
+
+  document.querySelectorAll("#disconnectedUnpaidCard .dl-filter-head").forEach(btn =>
+    btn.addEventListener("click", () => dlToggleList(btn.dataset.target))
+  );
+}
+
+
+
+/* Share window buttons (guarded: page may not have them) */
+if ($("shareWhatsAppBtn")) $("shareWhatsAppBtn").addEventListener("click", shareLastActivity);
+if ($("shareCloseBtn")) $("shareCloseBtn").addEventListener("click", closeShareModal);
+if ($("shareVideoBtn")) $("shareVideoBtn").addEventListener("click", shareLastActivityVideo);
+
+
+
+/* Status change: show / hide the video part of the form */
+if ($("disconnectStatus")) $("disconnectStatus").addEventListener("change", () => updateVideoSection("DISCONNECTION"));
+if ($("recheckStatus")) $("recheckStatus").addEventListener("change", () => updateVideoSection("RECHECK"));
+
+
+/* UPLOAD VIDEOS button (guarded: page may not have it) */
+if ($("uploadVideosBtn")) $("uploadVideosBtn").addEventListener("click", uploadPendingVideos);
+
+
+
+/* Video recorder buttons (guarded: page may not have them) */
+if ($("disconnectRecordBtn")) $("disconnectRecordBtn").addEventListener("click", () => openVideoRecorder("DISCONNECTION"));
+if ($("recheckRecordBtn")) $("recheckRecordBtn").addEventListener("click", () => openVideoRecorder("RECHECK"));
+if ($("videoStartBtn")) $("videoStartBtn").addEventListener("click", startVideoRecording);
+if ($("videoStopBtn")) $("videoStopBtn").addEventListener("click", stopVideoRecording);
+if ($("videoPauseBtn")) $("videoPauseBtn").addEventListener("click", pauseVideoRecording);
+if ($("videoResumeBtn")) $("videoResumeBtn").addEventListener("click", resumeVideoRecording);
+if ($("videoPlayBtn")) $("videoPlayBtn").addEventListener("click", playVideoPreview);
+
+if ($("videoSaveBtn")) $("videoSaveBtn").addEventListener("click", saveRecordedVideo);
+if ($("videoRetakeBtn")) $("videoRetakeBtn").addEventListener("click", retakeVideo);
+if ($("videoCancelBtn")) $("videoCancelBtn").addEventListener("click", () => closeVideoRecorder(true));
+
+
+
+/* Permission gate buttons (guarded: page may not have them) */
+if ($("permissionAllowBtn")) {
+  $("permissionAllowBtn").addEventListener("click", requestDevicePermissions);
+}
+if ($("permissionLogoutBtn")) {
+  $("permissionLogoutBtn").addEventListener("click", () => {
+    permissionWaiters = [];
+    showPermissionGate(false);
+    logout();
+  });
+}
+
+
+
+/* Village list button (guarded: page may not have it) */
+if ($("checkVillageListBtn")) {
+  $("checkVillageListBtn")
+    .addEventListener(
+      "click",
+      () => checkVillageListUpdate(false)
+    );
+}
+$("existingSurveyBtn").addEventListener("click", showExistingSurvey);
+$("newSurveyBtn").addEventListener("click", showNewSurvey);
+$("searchType").addEventListener("change", ()=>{
+  $("accountId").value="";
+  updateExistingSearchPlaceholder();
+});
+
+$("recheckSearchType").addEventListener("change",()=>{
+  $("recheckAccountId").value="";
+  $("recheckSearchResults").innerHTML="";
+  $("recheckSearchResults").classList.add("hidden");
+  updateModuleSearchPlaceholder(
+    "recheckSearchType",
+    "recheckAccountId"
+  );
+});
+
+$("disconnectSearchType").addEventListener("change",()=>{
+  $("disconnectAccountId").value="";
+  $("disconnectSearchResults").innerHTML="";
+  $("disconnectSearchResults").classList.add("hidden");
+  updateModuleSearchPlaceholder(
+    "disconnectSearchType",
+    "disconnectAccountId"
+  );
+});
+
+
+$("saveBtn").addEventListener("click", prepareExistingSave);
+$("saveNewBtn").addEventListener("click", prepareNewSave);
+$("houseLocked").addEventListener("change", updateExistingSpecialOptions);
+$("mobileRefused").addEventListener("change", updateExistingSpecialOptions);
+$("newMeterInstalled").addEventListener("change", updateNewMeterFields);
+$("backToSurveyTypeBtn").addEventListener("click", closeAllSurveyForms);
+$("backFromNewBtn").addEventListener("click", closeAllSurveyForms);
+$("cancelConfirmBtn").addEventListener("click", closeConfirmation);
+$("confirmSaveBtn").addEventListener("click", async ()=>{
+  const fn=state.pendingConfirmation;
+  if (fn) await fn();
+});
+
+$("loginBtn").addEventListener("click", login);
+
+$("logoutBtn").addEventListener("click", logout);
+
+/* Reset Password window (guarded: page may not have it) */
+if ($("resetPasswordModal")) {
+  $("resetPasswordSaveBtn").addEventListener("click", saveResetPassword);
+  $("resetPasswordCloseBtn").addEventListener("click", closeResetPassword);
+  $("resetPasswordShow").addEventListener("change", toggleResetPasswordVisibility);
+}
+
+$("adminBtn").addEventListener("click", openAdmin);
+
+$("viewUsersBtn").addEventListener(
+  "click",
+  async () => {
+    const btn = $("viewUsersBtn");
+
+    btn.disabled = true;
+    btn.textContent = "LOADING USERS...";
+
+    try {
+      $("usersTable").classList.remove("hidden");
+      await loadUsers();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "REFRESH USERS";
+    }
+  }
+);
+
+$("dashboardBtn").addEventListener("click", openDashboard);
+$("disconnectionModuleBtn").addEventListener("click", openDisconnection);
+$("recheckModuleBtn").addEventListener("click", openRecheck);
+$("recheckSearchBtn").addEventListener("click", searchRecheckConsumer);
+
+
+$("recheckAccountId").addEventListener("keydown", e => { if(e.key === "Enter") searchRecheckConsumer(); });
+$("recheckStatus").addEventListener("change", updateRecheckConditionalFields);
+$("recheckSubmitBtn").addEventListener("click", prepareRecheckSave);
+$("recheckBackBtn").addEventListener("click", goHome);
+$("phoneCallingModuleBtn").addEventListener("click", openPhoneCalling);
+$("phoneSearchBtn").addEventListener("click", searchPhoneConsumer);
+$("phoneAccountId").addEventListener("keydown", e => { if(e.key === "Enter") searchPhoneConsumer(); });
+$("phoneResponse").addEventListener("change", updatePhoneConditionalFields);
+$("phoneMobile").addEventListener("input", ()=>{
+  $("phoneCallBtn").disabled=!/^\d{10}$/.test($("phoneMobile").value.trim());
+});
+$("phoneCallBtn").addEventListener("click", callPhoneNumber);
+$("phoneSubmitBtn").addEventListener("click", preparePhoneCallSave);
+$("phoneBackBtn").addEventListener("click", goHome);
+$("accountActivityModuleBtn").addEventListener("click", openActivitySearch);
+$("activityBackBtn").addEventListener("click", goHome);
+$("disconnectSearchBtn").addEventListener("click", searchDisconnectionConsumer);
+$("disconnectAccountId").addEventListener("keydown", e => { if(e.key === "Enter") searchDisconnectionConsumer(); });
+$("disconnectStatus").addEventListener("change", updateDisconnectionConditionalFields);
+if ($("disconnectMobileRefused")) $("disconnectMobileRefused").addEventListener("change", updateDisconnectMobileRefused);
+if ($("disconnectPaidAmount") && typeof dlNumbersOnly === "function") dlNumbersOnly($("disconnectPaidAmount"));
+$("disconnectSubmitBtn").addEventListener("click", prepareDisconnectionSave);
+$("disconnectBackBtn").addEventListener("click", goHome);
+$("activitySearchBtn").addEventListener("click", searchAccountActivity);
+$("activityAccountId").addEventListener("keydown", e => { if(e.key === "Enter") searchAccountActivity(); });
+$("findCorrectionBtn").addEventListener("click", findCorrectionRecord);
+$("saveCorrectionBtn").addEventListener("click", saveCorrection);
+$("correctionAccountId").addEventListener("keydown", e => {
+  if (e.key === "Enter") findCorrectionRecord();
+});
+$("refreshDashboardBtn").addEventListener("click", () => {
+  if (dashboardHasLoaded) loadDashboard();
+});
+$("todayDashboardBtn").addEventListener("click", setDashboardToday);
+$("applyDashboardFilterBtn").addEventListener("click", loadDashboard);
+$("clearDashboardFilterBtn").addEventListener("click", () => {
+  $("dashFromDate").value="";
+  $("dashToDate").value="";
+
+  $("dashSubstationFilter").value="";
+  syncDashSubPicker();
+  resetDashboardDisplay();
+});
+
+$("createUserBtn").addEventListener("click", createUser);
+
+$("newUserRole").addEventListener(  "change",  updateAdminAssignmentUI);
+$("newUserDivision").addEventListener(  "change",  () => {    $("newUserSubdivision").value = "";    updateAdminAssignmentUI();  });
+$("newUserSubdivision").addEventListener(  "change",  updateAdminScopeInfo);
+
+$("searchBtn").addEventListener("click", searchConsumer);
+
+$("masterSetupContinueBtn").addEventListener("click", closeMasterSetup);
+
+/* Master setup TRY AGAIN (guarded: page may not have it) */
+if ($("masterSetupRetryBtn")) {
+  $("masterSetupRetryBtn").addEventListener("click", () => {
+    $("masterSetupRetryBtn").classList.add("hidden");
+    startMasterSetup();
+  });
+}
+$("uploadBtn").addEventListener("click", uploadPending);
+$("syncStatusBtn").addEventListener("click", syncUploadStatus);
+$("exportBtn").addEventListener("click", v151ExportLocalData);
+$("loginPassword").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+$("loginUserId").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+$("accountId").addEventListener("keydown", e => { if (e.key === "Enter") searchConsumer(); });
+$("mobile").addEventListener("keydown", e => { if (e.key === "Enter") prepareExistingSave(); });
+$("consumerPaymentResponse").addEventListener("change", () => {
+  const response = $("consumerPaymentResponse").value;
+  const wrap = $("consumerPaymentDateWrap");
+
+  if (response === "कुछ दिन बाद जमा करेंगे") {
+    wrap.classList.remove("hidden");
+  } else {
+    wrap.classList.add("hidden");
+    $("consumerPaymentDate").value = "";
+  }
+});
+
+/*
+ * =========================================================
+ * v17.2 ADDITIONS
+ * =========================================================
+ * 1. Keep the screen on while the app is open
+ * 2. SHARE PDF ON WHATSAPP after a list PDF is created
+ * 3. Defaulter List remembers the last filters
+ * 4. Auto upload of records and videos when online
+ * 5. Disconnection / Recheck: details + video in one share
+ * 6. Consumption of the last three months
+ * 7. Account ID boxes: number keyboard, max 10 digits
+ */
+
+/* ---------- 1. keep the screen on ---------- */
+let screenWakeLock = null;
+
+async function keepScreenOn() {
+  if (!("wakeLock" in navigator) || document.visibilityState !== "visible") return;
+  if (screenWakeLock && !screenWakeLock.released) return;
+  try {
+    screenWakeLock = await navigator.wakeLock.request("screen");
+  } catch (e) {
+    console.warn("Screen wake lock not available", e);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") keepScreenOn();
+});
+document.addEventListener("click", keepScreenOn);
+keepScreenOn();
+
+/* ---------- small message at the bottom of the screen ---------- */
+function showAppToast(text, ms) {
+  let box = $("appToast");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "appToast";
+    box.style.cssText =
+      "position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:100000;" +
+      "max-width:92%;background:#16803c;color:#fff;padding:12px 16px;border-radius:10px;" +
+      "font-size:14px;font-weight:700;box-shadow:0 6px 20px rgba(0,0,0,.25);text-align:center";
+    document.body.appendChild(box);
+  }
+  box.textContent = text;
+  box.classList.remove("hidden");
+  clearTimeout(showAppToast.timer);
+  showAppToast.timer = setTimeout(() => box.classList.add("hidden"), ms || 5000);
+}
+
+/* ---------- 2. SHARE PDF ON WHATSAPP (lists) ---------- */
+const listPdfs = {};
+
+/* v20.17: Chrome shares at most 10 files (about 50 MB) at a time, so many PDFs go in parts:
+   each tap of the button shares the next part. */
+const SHARE_MAX_FILES = 10;
+const SHARE_MAX_BYTES = 45 * 1024 * 1024;
+
+function splitShareParts(files) {
+  const parts = [];
+  let cur = [], bytes = 0;
+  files.forEach(f => {
+    const size = (f.blob && f.blob.size) || 0;
+    if (cur.length && (cur.length >= SHARE_MAX_FILES || bytes + size > SHARE_MAX_BYTES)) { parts.push(cur); cur = []; bytes = 0; }
+    cur.push(f);
+    bytes += size;
+  });
+  if (cur.length) parts.push(cur);
+  return parts;
+}
+
+function listShareLabel(item) {
+  const total = item.files.length;
+  if (item.parts.length <= 1) {
+    return total > 1
+      ? "SHARE " + total + " PDFs ON WHATSAPP(" + total + " पीडीएफ व्हाट्सऐप पर भेजें)"
+      : "SHARE PDF ON WHATSAPP(व्हाट्सऐप पर पीडीएफ भेजें)";
+  }
+  let start = 1;
+  for (let i = 0; i < item.part; i++) start += item.parts[i].length;
+  const end = start + item.parts[item.part].length - 1;
+  return "SHARE PDFs " + start + "–" + end + " OF " + total + " ON WHATSAPP(पीडीएफ " + start + "–" + end + " / " + total + " व्हाट्सऐप पर भेजें)";
+}
+
+function rememberListPdf(prefix, blob, name, title) {
+  const files = Array.isArray(blob) ? blob : [{ blob: blob, name: name }];
+  listPdfs[prefix] = { files: files, name: files.map(x => x.name).join(", "), title: title, parts: splitShareParts(files), part: 0 };
+  const btn = $(prefix + "SharePdfBtn");
+  if (btn) {
+    btn.classList.remove("hidden");
+    btn.textContent = listShareLabel(listPdfs[prefix]);
+    if (typeof applyLanguage === "function") applyLanguage();      /* English / Hindi as chosen */
+  }
+}
+
+/* v20.18: before the first part, a small popup says the PDFs go 10 at a time.
+   Its SHARE button is a fresh tap, so sharing can open from it. */
+function openSharePartsPopup(prefix) {
+  const item = listPdfs[prefix];
+  const ranges = [];
+  let start = 1;
+  item.parts.forEach(p => { ranges.push(start + "–" + (start + p.length - 1)); start += p.length; });
+  $("sharePartsText").textContent =
+    "WhatsApp can share only 10 PDFs at a time. Your " + item.files.length + " PDFs will go in " + item.parts.length +
+    " parts: PDFs " + ranges.join(", ") + ". Tap the green button below for the first part. After sending it in WhatsApp, come back and tap the share button again for the next part." +
+    "(व्हाट्सऐप पर एक बार में केवल 10 पीडीएफ भेजे जा सकते हैं। आपके " + item.files.length + " पीडीएफ " + item.parts.length +
+    " भागों में जाएँगे: " + ranges.join(", ") + "। पहले भाग के लिए नीचे का हरा बटन दबाएँ। व्हाट्सऐप में भेजने के बाद वापस आकर अगले भाग के लिए शेयर बटन फिर दबाएँ।)";
+  $("sharePartsGoBtn").textContent = "SHARE PDFs " + ranges[0] + "(पीडीएफ " + ranges[0] + " भेजें)";
+  $("sharePartsModal").dataset.prefix = prefix;
+  $("sharePartsModal").classList.remove("hidden");
+  if (typeof applyLanguage === "function") applyLanguage();
+}
+if ($("sharePartsGoBtn")) {
+  $("sharePartsGoBtn").addEventListener("click", () => {
+    $("sharePartsModal").classList.add("hidden");
+    shareListPdf($("sharePartsModal").dataset.prefix, true);
+  });
+  $("sharePartsCancelBtn").addEventListener("click", () => $("sharePartsModal").classList.add("hidden"));
+}
+
+async function shareListPdf(prefix, fromPopup) {
+  const item = listPdfs[prefix];
+  if (!item) return;
+  if (item.parts.length > 1 && item.part === 0 && fromPopup !== true && $("sharePartsModal")) {
+    openSharePartsPopup(prefix);
+    return;
+  }
+
+
+  const statusId = prefix + "StatusMsg";
+  const part = item.parts[item.part] || item.parts[0];
+  const files = part.map(x => new File([x.blob], x.name, { type: "application/pdf" }));
+  const where = item.files.length > 1 ? "the " + item.files.length + " PDFs" : item.name;
+
+  if (!navigator.share || !navigator.canShare || !navigator.canShare({ files: files })) {
+    setStatus(statusId, "This device cannot share " + (item.files.length > 1 ? "these PDFs" : "the PDF") +
+      " from here. Share " + where + " from the Download folder.", "error");
+    return;
+  }
+
+  try {
+    await navigator.share({ files: files, title: item.title });
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    console.error(e);
+    setStatus(statusId, "Could not open sharing. Share " + where + " from the Download folder.", "error");
+    return;
+  }
+
+  if (item.parts.length > 1) {
+    const done = item.part + 1;
+    item.part = done % item.parts.length;
+    setStatus(statusId, done < item.parts.length
+      ? "Part " + done + " of " + item.parts.length + " shared. Tap the button again for the next PDFs."
+      : "All " + item.files.length + " PDFs shared (" + item.parts.length + " parts).", "ok");
+    const btn = $(prefix + "SharePdfBtn");
+    if (btn) {
+      btn.textContent = listShareLabel(item);
+      if (typeof applyLanguage === "function") applyLanguage();
+    }
+  }
+}
+
+
+/* The buttons are added here, so index.html does not change. */
+[["dl", "dlPdfBtn"], ["du", "duPdfBtn"]].forEach(([prefix, pdfBtnId]) => {
+  const pdfBtn = $(pdfBtnId);
+  if (!pdfBtn || $(prefix + "SharePdfBtn")) return;
+  const btn = document.createElement("button");
+  btn.id = prefix + "SharePdfBtn";
+  btn.type = "button";
+  btn.className = "secondary hidden";
+  btn.textContent = "SHARE PDF ON WHATSAPP(व्हाट्सऐप पर पीडीएफ भेजें)";
+  btn.addEventListener("click", () => shareListPdf(prefix));
+  pdfBtn.insertAdjacentElement("afterend", btn);
+});
+
+/* ---------- 3. Defaulter List remembers the last filters ---------- */
+const DL_SAVED_INPUTS = [
+  "dlLoadMode", "dlLoadMin", "dlLoadMax", "dlOutMin", "dlPayMode", "dlLongDate",
+  "dlSinceDate", "dlDocMode", "dlDocFrom", "dlDocTo",
+  "dlSort1", "dlDir1", "dlSort2", "dlDir2", "dlSort3", "dlDir3", "dlSplit", "dlNpl", "dlNplPaid"
+];
+
+/* v20.12: one memory per list: Defaulter (ALL), NEVER PAID, LONG UNPAID, BOTH */
+let dlNplMode = "ALL";
+function dlFiltersKey() {
+  return "fieldworkDefaulterFilters:" + String(state.userId || "").trim().toLowerCase() +
+    (dlNplMode && dlNplMode !== "ALL" ? ":" + dlNplMode : "");
+}
+
+/* the filters as they are when the page opens (used for a list opened the first time) */
+function dlResetInputsToDefault() {
+  DL_SAVED_INPUTS.forEach(id => {
+    const el = $(id);
+    if (!el || id === "dlNpl") return;
+    if (el.tagName === "SELECT") {
+      const o = Array.from(el.options).find(x => x.defaultSelected) || el.options[0];
+      if (o) el.value = o.value;
+    } else {
+      el.value = el.defaultValue;
+    }
+  });
+  for (let i = 1; i <= 3; i++) {
+    if ($("dlSort" + i) && $("dlSort" + i).options.length) {
+      $("dlSort" + i).value = DL_DEFAULT_SORT[i - 1][0];
+      $("dlDir" + i).value = DL_DEFAULT_SORT[i - 1][1];
+    }
+  }
+}
+
+/* switch to another list: keep this list's filters, bring back (or start) the other list's */
+function dlSwitchNplMode(mode) {
+  if (!$("dlNpl")) return;
+  if (mode !== dlNplMode) {
+    $("dlNpl").value = dlNplMode;
+    dlSaveFilters();
+    dlNplMode = mode;
+  }
+  $("dlNpl").value = mode;
+  dlRestoreFilters();
+  dlRefreshCascade(null);
+  dlFixEmptyRestoredLists();
+  dlUpdateNplTitle();
+  dlNplEmptyNotice();
+}
+
+/* v20.13: the office list tags reach the phone with the Fieldwork Master Tool's update */
+function dlNplEmptyNotice() {
+  if (!dlOptions || !$("dlNpl")) return;
+  const mode = $("dlNpl").value;
+  if (mode === "ALL") return setStatus("dlNplNote", "");
+  const n = dlOptions.nplCounts || {};
+  const count = mode === "BOTH" ? (n["NEVER PAID"] || 0) + (n["LONG UNPAID"] || 0) : (n[mode] || 0);
+  if (!count) setStatus("dlNplNote", "No consumer of this office list is on this phone yet, so the filters below are empty. " +
+    "The list comes with a daily update after the office files are put in the Fieldwork Master Tool (data\\lists folder) " +
+    "and the tool is run. Then tap CHECK FOR MASTER DATA UPDATE on the home page.", "error");
+  else setStatus("dlNplNote", count.toLocaleString("en-IN") + " consumers of this office list on this phone.", "ok");
+}
+
+function dlUpdateNplTitle() {
+  const h = document.querySelector("#defaulterListCard h2");
+  if (!h) return;
+  h.textContent = {
+    "NEVER PAID": "Never Paid List(कभी भुगतान नहीं सूची)",
+    "LONG UNPAID": "Long Unpaid List(लंबे समय से बकाया सूची)",
+    BOTH: "Never Paid + Long Unpaid List(कभी भुगतान नहीं + लंबे समय से बकाया सूची)"
+  }[dlNplMode] || "Defaulter List(बकायेदार सूची)";
+  try { if (typeof applyLanguage === "function") applyLanguage(); } catch (e) {}
+}
+
+function dlSaveFilters() {
+  if (!state.userId) return;
+  const lists = {};
+  DL_LISTS.forEach(id => {
+    const sel = dlSel[id];
+    lists[id] = sel ? Array.from(sel) : null;
+  });
+  const inputs = {};
+  DL_SAVED_INPUTS.forEach(id => { if ($(id)) inputs[id] = $(id).value; });
+  try {
+    localStorage.setItem(dlFiltersKey(), JSON.stringify({ lists: lists, inputs: inputs }));
+  } catch (e) {}
+}
+
+function dlReadSavedFilters() {
+  try {
+    return JSON.parse(localStorage.getItem(dlFiltersKey()) || "null");
+  } catch (e) {
+    return null;
+  }
+}
+
+/* Called while the filter lists are (re)built from the master. */
+function dlRestoreFilters() {
+  const saved = dlReadSavedFilters();
+  if (!saved) {                                                     /* v20.12: first time for this list */
+    dlResetInputsToDefault();
+    if (dlNplMode !== "ALL") {
+      $("dlPayMode").value = "ALL";            /* the office list decides who is never paid / long unpaid */
+      $("dlOutMin").value = "";
+    }
+  }
+  DL_LISTS.forEach(id => {
+    const values = saved && saved.lists ? saved.lists[id] : null;
+    if (Array.isArray(values)) dlSel[id] = new Set(values);
+    else delete dlSel[id];
+  });
+  if (saved && saved.inputs) {
+    DL_SAVED_INPUTS.forEach(id => {
+      const el = $(id);
+      const v = saved.inputs[id];
+      if (!el || v === undefined || v === null || id === "dlNpl") return;
+      if (el.tagName === "SELECT" && !Array.from(el.options).some(o => o.value === v)) return;
+      el.value = v;
+    });
+  }
+  dlUpdatePayBoxes();
+  dlUpdateLoadBox();
+  dlUpdateDocBox();
+}
+
+/* A remembered choice that no longer exists in the new master goes back to All. */
+function dlFixEmptyRestoredLists() {
+  for (let pass = 0; pass < DL_LISTS.length; pass++) {
+    const empty = DL_LISTS.find(id => dlSel[id] && !dlSel[id].size);
+    if (!empty) return;
+    dlSel[empty] = null;
+    dlRefreshCascade(null);
+  }
+}
+
+if ($("defaulterListCard")) {
+  let saveTimer = null;
+  const later = () => { clearTimeout(saveTimer); saveTimer = setTimeout(dlSaveFilters, 300); };
+  $("defaulterListCard").addEventListener("change", later);
+  $("defaulterListCard").addEventListener("input", later);
+}
+
+/* ---------- 4. auto upload when online ---------- */
+const AUTO_UPLOAD_EVERY_MS = 3 * 60 * 1000;
+const AUTO_UPLOAD_PAUSE_MS = 20 * 60 * 1000;
+let autoUploadRunning = false;
+let autoUploadPausedUntil = { records: 0, videos: 0 };
+
+async function autoUploadPendingCounts() {
+  const records = (await getAllUploadableRecords())
+    .filter(r => String(r.upload_status || "PENDING").toUpperCase() === "PENDING").length;
+  let videos = 0;
+  try { videos = (await getPendingVideos()).length; } catch (e) {}
+  return { records: records, videos: videos };
+}
+
+async function autoUploadIfOnline() {
+
+  if (autoUploadRunning || !state.sessionToken || !state.db || !state.masterReady) return;
+  if (!navigator.onLine || document.visibilityState !== "visible") return;
+  if (uploadRecordsRunning || videoUploadRunning) return;
+
+  autoUploadRunning = true;
+
+  try {
+    const now = Date.now();
+    const before = await autoUploadPendingCounts();
+    const doRecords = before.records > 0 && now >= autoUploadPausedUntil.records;
+    const doVideos = before.videos > 0 && now >= autoUploadPausedUntil.videos;
+    if (!doRecords && !doVideos) return;
+
+    if (doRecords) await uploadPending();
+    if (doVideos && state.sessionToken) await uploadPendingVideos();
+
+    const after = await autoUploadPendingCounts();
+    const records = Math.max(0, before.records - after.records);
+    const videos = Math.max(0, before.videos - after.videos);
+
+    /* No progress (no signal, daily video limit...): wait before trying again. */
+    if (doRecords && !records) autoUploadPausedUntil.records = Date.now() + AUTO_UPLOAD_PAUSE_MS;
+    if (doVideos && !videos) autoUploadPausedUntil.videos = Date.now() + AUTO_UPLOAD_PAUSE_MS;
+
+    if (records || videos) {
+      const parts = [];
+      if (records) parts.push(records.toLocaleString("en-IN") + (records === 1 ? " record" : " records"));
+      if (videos) parts.push(videos.toLocaleString("en-IN") + (videos === 1 ? " video" : " videos"));
+      showAppToast("Auto uploaded: " + parts.join(" and ") + ". (स्वतः अपलोड हो गया)");
+    }
+  } catch (e) {
+    console.warn("Auto upload failed", e);
+  } finally {
+    autoUploadRunning = false;
+  }
+}
+
+window.addEventListener("online", () => {
+  autoUploadPausedUntil = { records: 0, videos: 0 };
+  setTimeout(autoUploadIfOnline, 5000);
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") setTimeout(autoUploadIfOnline, 5000);
+});
+setInterval(autoUploadIfOnline, AUTO_UPLOAD_EVERY_MS);
+setTimeout(autoUploadIfOnline, 20000);
+
+/* ---------- 5. details + video in one share ---------- */
+if ($("shareVideoBtn")) {
+  $("shareVideoBtn").textContent = "SEND DETAILS ONLY(केवल विवरण भेजें)";
+}
+
+/* ---------- 6. consumption of three months ---------- */
+function consumptionText(c) {
+  const v = x => {
+    const s = String(x == null ? "" : x).trim();
+    return s || "—";
+  };
+  return v(c.CONSUMPTION_CURR_MNTH) + " / " + v(c.CONSUMPTION_PREV_MNTH) + " / " + v(c.CONSUMPTION_PREV_TO_PREV_MNTH);
+}
+
+["dConsumptionCurr", "phoneConsumptionCurr", "rcConsumptionCurr", "dcConsumptionCurr"].forEach(id => {
+  const label = $(id) && $(id).previousElementSibling;
+  if (label) {
+    label.textContent =
+      "Consumption: Current / Previous / Before Previous Month(खपत: चालू / पिछला / उससे पिछला माह)";
+  }
+});
+
+/* ---------- 7. Account ID boxes: number keyboard, max 10 digits ---------- */
+const ACCOUNT_ID_MAX_DIGITS = 10;
+
+function setAccountIdInputMode(input, isAccount) {
+  if (!input) return;
+  if (isAccount) {
+    input.setAttribute("inputmode", "numeric");
+    input.setAttribute("pattern", "[0-9]*");
+    input.setAttribute("maxlength", String(ACCOUNT_ID_MAX_DIGITS));
+    input.dataset.digitsOnly = "1";
+  } else {
+    input.setAttribute("inputmode", "text");
+    input.removeAttribute("pattern");
+    input.removeAttribute("maxlength");
+    delete input.dataset.digitsOnly;
+  }
+}
+
+function digitsOnlyGuard(input) {
+  if (!input || input.dataset.digitsGuard) return;
+  input.dataset.digitsGuard = "1";
+  input.addEventListener("input", () => {
+    if (input.dataset.digitsOnly !== "1") return;
+    const clean = input.value.replace(/\D/g, "").slice(0, ACCOUNT_ID_MAX_DIGITS);
+    if (clean !== input.value) input.value = clean;
+  });
+}
+
+[
+  ["searchType", "accountId"],
+  ["disconnectSearchType", "disconnectAccountId"],
+  ["recheckSearchType", "recheckAccountId"]
+].forEach(([selectId, inputId]) => {
+  const select = $(selectId), input = $(inputId);
+  if (!select || !input) return;
+  digitsOnlyGuard(input);
+  const apply = () => setAccountIdInputMode(input, select.value === "ACCOUNT");
+  select.addEventListener("change", apply);
+  input.addEventListener("focus", apply);   /* forms reset the choice without a change event */
+  apply();
+});
+
+["phoneAccountId", "activityAccountId"].forEach(id => {
+  const input = $(id);
+  if (!input) return;
+  digitsOnlyGuard(input);
+  setAccountIdInputMode(input, true);
+});
+
+
+/* =========================================================
+ * v18 ADDITIONS
+ * =========================================================
+ * Last bill date + bill basis in Consumer Details.
+ */
+function lastBillText(c) {
+  const date = formatListDate(c.LAST_BILL_DATE);
+  const basis = String(c.BILL_BASIS || "").trim();
+  if (!date && !basis) return "—";
+  return (date || "—") + (basis ? " (" + basis + ")" : "");
+}
+
+function showLastBill(c) {
+  ["dLastBill", "phoneLastBill", "rcLastBill", "dcLastBill"].forEach(id => {
+    if ($(id)) $(id).textContent = lastBillText(c);
+  });
+  /* v20.4: Geo Location in every section that shows a consumer */
+  ["dGeo", "phoneGeo", "rcGeo", "dcGeo"].forEach(id => {
+    if ($(id)) $(id).innerHTML = consumerLocationHtml(c);
+  });
+}
+
+/*
+ * =========================================================
+ * v20.4 GEO LOCATION
+ * =========================================================
+ *  SM   = smart meter installation file (verified)
+ *  PREV = master LAT/LON: where it was billed last month (not verified)
+ *  CUR  = billed report: where it was billed this month (not verified)
+ * Rules:
+ *  1. smart meter location                      -> green  "Verified smart meter location"
+ *  2. last + this month within 100 m            -> orange "Not verified - same place in this and last month's billing"
+ *  3. last + this month more than 100 m apart   -> red    both places, "differ by 1.2 km"
+ *  4. only one of them                          -> orange "Not verified - only this / last month's billing location"
+ *  5. none                                      -> "Geo location not available"
+ */
+const GEO_SAME_PLACE_M = 100;
+
+function geoPoint(lat, lng) {
+  const a = Number(lat), b = Number(lng);
+  return a && b && Math.abs(a) <= 90 && Math.abs(b) <= 180 ? [a, b] : null;
+}
+
+function geoDistanceM(p, q) {
+  const r = Math.PI / 180;
+  const x = (q[1] - p[1]) * r * Math.cos((p[0] + q[0]) / 2 * r);
+  const y = (q[0] - p[0]) * r;
+  return Math.round(Math.sqrt(x * x + y * y) * 6371000);
+}
+
+function geoDistanceText(m) {
+  return m < 1000 ? m + " m" : (m / 1000).toFixed(1) + " km";
+}
+
+function geoPlaceHtml(p, caption) {
+  const nav = "https://www.google.com/maps/dir/?api=1&destination=" + p[0] + "," + p[1];
+  return '<div class="geo-place">' + (caption ? '<span class="geo-cap">' + escapeHtml(caption) + "</span>" : "") +
+    '<span class="geo-ll">' + p[0] + ", " + p[1] + "</span>" +
+    '<a class="cl-nav" href="' + escapeHtml(nav) + '" target="_blank" rel="noopener">NAVIGATE</a></div>';
+}
+
+function geoLabelHtml(text, color) {
+  return '<span class="cl-geo" style="color:' + color + '">' + escapeHtml(text) + "</span>";
+}
+
+function consumerLocationHtml(c) {
+  if (!c) return "—";
+  const sm = geoPoint(c.SM_LAT, c.SM_LNG);
+  const prev = geoPoint(c.PREV_LAT, c.PREV_LNG);
+  const cur = geoPoint(c.CUR_LAT, c.CUR_LNG);
+  const GREEN = "#15803d", ORANGE = "#b45309", RED = "#b42318";
+
+  if (sm) {
+    return geoPlaceHtml(sm) + geoLabelHtml("Verified smart meter location (स्मार्ट मीटर स्थान, सत्यापित)", GREEN);
+  }
+  if (prev && cur) {
+    const d = geoDistanceM(prev, cur);
+    if (d <= GEO_SAME_PLACE_M) {
+      return geoPlaceHtml(cur) + geoLabelHtml("Could be correct, but not verified: almost the same place in this and last month's billing (" +
+        geoDistanceText(d) + " apart) (सही हो सकता है, पर सत्यापित नहीं - दोनों माह लगभग एक ही स्थान)", ORANGE);
+    }
+    return geoPlaceHtml(cur, "This month's billing") + geoPlaceHtml(prev, "Last month's billing") +
+      geoLabelHtml("Not verified: this and last month's billing places differ by " + geoDistanceText(d) +
+        " (असत्यापित, दोनों माह के स्थान अलग)", RED);
+  }
+  if (cur) {
+    return geoPlaceHtml(cur) + geoLabelHtml("Not verified: only this month's billing location (last month's not available) " +
+      "(असत्यापित, केवल इस माह का स्थान)", ORANGE);
+  }
+  if (prev) {
+    return geoPlaceHtml(prev) + geoLabelHtml("Not verified: only last month's billing location (this month's not available yet) " +
+      "(असत्यापित, केवल पिछले माह का स्थान)", ORANGE);
+  }
+  return "Geo location not available (स्थान उपलब्ध नहीं)";
+}
+
+/* =========================================================
+ * v18.3 ADDITIONS
+ * =========================================================
+ * 1. Share from the CONFIRM tap. Phones open the share window
+ *    only right after a tap, so it is opened before saving
+ *    (saving a video takes several seconds).
+ */
+async function shareAtConfirm(record, video) {
+  /* "shared" | "closed" (share window closed) | "failed" (phone did not allow it) */
+  if (!navigator.share) return "failed";
+
+  const data = { text: buildActivityShareText(record) };
+
+  if (video && video.blob) {
+    const file = new File([video.blob], video.fileName, { type: video.contentType || "video/mp4" });
+    if (!(navigator.canShare && navigator.canShare({ files: [file] }))) return "failed";
+    data.files = [file];
+  }
+
+  try {
+    await navigator.share(data);
+    return "shared";
+  } catch (e) {
+    return e && e.name === "AbortError" ? "closed" : "failed";
+  }
+}
+
+/* Only when the phone could not open the share window does the Saved screen appear. */
+async function afterSaveShare(record, video, sharing) {
+  const result = await sharing;
+  if (result === "failed") openShareModal(record, video);
+}
+
+/* 2. App version at the bottom (taken from app.js?v=... in index.html). */
+const APP_VERSION = (() => {
+  try {
+    return new URL(document.currentScript.src).searchParams.get("v") || "";
+  } catch (e) {
+    return "";
+  }
+})();
+
+(() => {
+  const footer = document.querySelector("footer");
+  if (!footer || !APP_VERSION) return;
+  const line = document.createElement("div");
+  line.id = "appVersionLabel";
+  line.style.cssText = "margin-top:3px;font-size:11px;opacity:.85";
+  line.textContent = "App version " + APP_VERSION;
+  footer.appendChild(line);
+})();
+
+/* =========================================================
+ * v18.6: read the master Excel file in a background worker
+ * =========================================================
+ * Returns { total, next(), close() }. next() gives
+ * { rows: [up to 5,000 rows], done }. The first chunk starts
+ * with the header row.
+ */
+const MASTER_READ_CHUNK = 5000;
+
+/*
+ * v20.16: the old way unpacked the whole Excel file in memory
+ * (about 1.5 GB for a 2-lakh-row master) and Chrome closed the
+ * page ("Aw, Snap!") on phones with less memory. Now the sheet is
+ * unpacked and read piece by piece (about 4 times less memory,
+ * 4 times faster). The old way is kept only for very old browsers.
+ */
+/*
+ * Self-contained: it is also copied into the background worker
+ * as text, so it must not use anything from outside itself.
+ */
+async function masterStreamReader(bytes, chunkSize) {
+  if (typeof DecompressionStream !== "function" || typeof ReadableStream !== "function") {
+    throw new Error("NO_STREAM_SUPPORT");
+  }
+  const u32 = (p) => (bytes[p] | (bytes[p + 1] << 8) | (bytes[p + 2] << 16)) + bytes[p + 3] * 16777216;
+  const u16 = (p) => bytes[p] | (bytes[p + 1] << 8);
+  const u64 = (p) => u32(p) + u32(p + 4) * 4294967296;
+
+  /* ---- zip directory ---- */
+  let eocd = -1;
+  for (let p = bytes.length - 22; p >= Math.max(0, bytes.length - 65558); p--) {
+    if (u32(p) === 0x06054b50) { eocd = p; break; }
+  }
+  if (eocd < 0) throw new Error("Master Data file is not a valid Excel (.xlsx) file.");
+  let count = u16(eocd + 10);
+  let dirOffset = u32(eocd + 16);
+  if (dirOffset === 0xFFFFFFFF || count === 0xFFFF) {
+    const loc = eocd - 20;
+    if (loc >= 0 && u32(loc) === 0x07064b50) {
+      const z = u64(loc + 8);
+      if (u32(z) === 0x06064b50) { count = u64(z + 32); dirOffset = u64(z + 48); }
+    }
+  }
+  const files = {};
+  let p = dirOffset;
+  for (let i = 0; i < count && u32(p) === 0x02014b50; i++) {
+    const method = u16(p + 10);
+    const crc = u32(p + 16);
+    let comp = u32(p + 20), size = u32(p + 24), local = u32(p + 42);
+    const nameLen = u16(p + 28), extraLen = u16(p + 30), commentLen = u16(p + 32);
+    const name = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nameLen));
+    let e = p + 46 + nameLen;
+    const eEnd = e + extraLen;
+    while (e + 4 <= eEnd) {
+      const id = u16(e), len = u16(e + 2);
+      if (id === 1) {
+        let q = e + 4;
+        if (size === 0xFFFFFFFF) { size = u64(q); q += 8; }
+        if (comp === 0xFFFFFFFF) { comp = u64(q); q += 8; }
+        if (local === 0xFFFFFFFF) { local = u64(q); q += 8; }
+      }
+      e += 4 + len;
+    }
+    files[name.replace(/^\/+/, "").toLowerCase()] = { method, crc, comp, size, local };
+    p = eEnd + commentLen;
+  }
+
+  /* ---- unpack one file as a stream of bytes ---- */
+  const byteStream = (f) => {
+    if (u32(f.local) !== 0x04034b50) throw new Error("Master Data file is damaged.");
+    const start = f.local + 30 + u16(f.local + 26) + u16(f.local + 28);
+    const end = start + f.comp;
+    if (end > bytes.length) throw new Error("Master Data file is incomplete.");
+    let pos = start;
+    let head = null, tail = null;
+    if (f.method === 8) {
+      /* a gzip wrapper around the raw zip data: works on every Chrome with streams */
+      head = new Uint8Array([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]);
+      tail = new Uint8Array(8);
+      const t = [f.crc, f.size % 4294967296];
+      for (let k = 0; k < 2; k++) for (let b = 0; b < 4; b++) tail[k * 4 + b] = Math.floor(t[k] / Math.pow(256, b)) & 255;
+    } else if (f.method !== 0) {
+      throw new Error("NO_STREAM_SUPPORT");
+    }
+    const raw = new ReadableStream({
+      pull(ctrl) {
+        if (head) { ctrl.enqueue(head); head = null; return; }
+        if (pos < end) {
+          const n = Math.min(65536, end - pos);
+          ctrl.enqueue(bytes.slice(pos, pos + n));
+          pos += n;
+          return;
+        }
+        if (tail) { ctrl.enqueue(tail); tail = null; return; }
+        ctrl.close();
+      }
+    });
+    return f.method === 8 ? raw.pipeThrough(new DecompressionStream("gzip")) : raw;
+  };
+
+  const readWhole = async (name) => {
+    const f = files[name.toLowerCase()];
+    if (!f) return "";
+    const rd = byteStream(f).getReader();
+    const dec = new TextDecoder("utf-8");
+    let out = "";
+    for (;;) {
+      const r = await rd.read();
+      if (r.done) break;
+      out += dec.decode(r.value, { stream: true });
+    }
+    return out + dec.decode();
+  };
+
+  const unxml = (s) => {
+    if (s.indexOf("&") >= 0) {
+      s = s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g, (m, g) =>
+        g === "amp" ? "&" : g === "lt" ? "<" : g === "gt" ? ">" : g === "quot" ? '"' : g === "apos" ? "'" :
+        String.fromCodePoint(g[1] === "x" ? parseInt(g.slice(2), 16) : parseInt(g.slice(1), 10)));
+    }
+    if (s.indexOf("_x") >= 0) {
+      s = s.replace(/_x([0-9a-fA-F]{4})_/g, (m, h) => String.fromCharCode(parseInt(h, 16)));
+    }
+    return s;
+  };
+  const richText = (inner) => {
+    inner = inner.replace(/<rPh\b[\s\S]*?<\/rPh>/g, "");
+    let out = "";
+    const re = /<t\b[^>]*?(?:\/>|>([\s\S]*?)<\/t>)/g;
+    let m;
+    while ((m = re.exec(inner))) out += m[1] || "";
+    return unxml(out);
+  };
+
+  /* ---- first sheet ---- */
+  const wbXml = await readWhole("xl/workbook.xml");
+  const relsXml = await readWhole("xl/_rels/workbook.xml.rels");
+  let sheetPath = "xl/worksheets/sheet1.xml";
+  const firstSheet = /<sheet\b[^>]*?\br:id="([^"]+)"/.exec(wbXml) || /<sheet\b[^>]*?\bid="([^"]+)"/.exec(wbXml);
+  if (firstSheet) {
+    const relRe = /<Relationship\b([^>]*)>/g;
+    let m;
+    while ((m = relRe.exec(relsXml))) {
+      const idm = /\bId="([^"]+)"/.exec(m[1]);
+      const tm = /\bTarget="([^"]+)"/.exec(m[1]);
+      if (idm && tm && idm[1] === firstSheet[1]) {
+        const t = tm[1];
+        sheetPath = t.charAt(0) === "/" ? t.slice(1) : "xl/" + t.replace(/^\.\//, "");
+        break;
+      }
+    }
+  }
+  const sheetFile = files[sheetPath.toLowerCase()];
+  if (!sheetFile) throw new Error("Consumer master XLSX contains no worksheet.");
+
+  /* ---- shared texts (the Master Tool does not use them, Excel does) ---- */
+  const sst = [];
+  const sstXml = await readWhole("xl/sharedStrings.xml");
+  if (sstXml) {
+    const re = /<si\b[^>]*?(?:\/>|>([\s\S]*?)<\/si>)/g;
+    let m;
+    while ((m = re.exec(sstXml))) sst.push(m[1] ? richText(m[1]) : "");
+  }
+
+  /* ---- which styles are dates ---- */
+  const dateStyle = [];
+  const stylesXml = await readWhole("xl/styles.xml");
+  if (stylesXml) {
+    const custom = {};
+    const nf = /<numFmt\b([^>]*)>/g;
+    let m;
+    while ((m = nf.exec(stylesXml))) {
+      const id = /\bnumFmtId="(\d+)"/.exec(m[1]);
+      const code = /\bformatCode="([^"]*)"/.exec(m[1]);
+      if (id && code) {
+        const c = unxml(code[1]).replace(/"[^"]*"|\[[^\]]*\]|\\./g, "");
+        custom[id[1]] = /[dmyhsDMYHS]/.test(c) && !/^General$/i.test(c);
+      }
+    }
+    const xfs = /<cellXfs\b[\s\S]*?<\/cellXfs>/.exec(stylesXml);
+    if (xfs) {
+      const xf = /<xf\b([^>]*)>/g;
+      while ((m = xf.exec(xfs[0]))) {
+        const idm = /\bnumFmtId="(\d+)"/.exec(m[1]);
+        const id = idm ? +idm[1] : 0;
+        dateStyle.push((id >= 14 && id <= 22) || (id >= 27 && id <= 36) || (id >= 45 && id <= 47) || (id >= 50 && id <= 58) || custom[id] === true);
+      }
+    }
+  }
+  /* same as the Excel library: local time, corrected for old time-zone rules */
+  const dBase = new Date(1899, 11, 30, 0, 0, 0);
+  const nowOffset = new Date().getTimezoneOffset();
+  const dStart = dBase.getTime() + (nowOffset - dBase.getTimezoneOffset()) * 60000;
+  const excelDate = (v) => {
+    const d = new Date(v * 86400000 + dStart);
+    if (d.getTimezoneOffset() !== nowOffset) d.setTime(d.getTime() + (d.getTimezoneOffset() - nowOffset) * 60000);
+    return d;
+  };
+
+  const colIndex = (ref) => {
+    let n = 0;
+    for (let i = 0; i < ref.length; i++) {
+      const c = ref.charCodeAt(i);
+      if (c >= 65 && c <= 90) n = n * 26 + (c - 64);
+      else if (c >= 97 && c <= 122) n = n * 26 + (c - 96);
+      else break;
+    }
+    return n - 1;
+  };
+
+  /* ---- read the sheet piece by piece ---- */
+  const sheetReader = byteStream(sheetFile).getReader();
+  const dec = new TextDecoder("utf-8");
+  let text = "";
+  let ended = false;
+  let total = 0, firstCol = 0, width = 0, gotDim = false;
+  let pending = [];
+  let rowsSeen = 0, bytesSeen = 0;
+
+  const rowRe = /<row\b[^>]*?(?:\/>|>([\s\S]*?)<\/row>)/g;
+  const cellRe = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
+  const attrRe = /\b(r|t|s)="([^"]*)"/g;
+
+  const parseRows = (part) => {
+    rowRe.lastIndex = 0;
+    let rm;
+    while ((rm = rowRe.exec(part))) {
+      const inner = rm[1];
+      if (!inner) continue;
+      const row = width ? new Array(width).fill("") : [];
+      let any = false, next = 0;
+      cellRe.lastIndex = 0;
+      let cm;
+      while ((cm = cellRe.exec(inner))) {
+        const body = cm[2];
+        let ref = "", type = "n", style = 0, am;
+        attrRe.lastIndex = 0;
+        while ((am = attrRe.exec(cm[1]))) {
+          if (am[1] === "r") ref = am[2];
+          else if (am[1] === "t") type = am[2];
+          else style = +am[2] || 0;
+        }
+        const col = (ref ? colIndex(ref) : next) - firstCol;
+        next = col + firstCol + 1;
+        if (!body || col < 0) continue;
+        let val;
+        if (type === "inlineStr") {
+          const is = /<is>([\s\S]*?)<\/is>/.exec(body);
+          if (!is) continue;
+          val = richText(is[1]);
+        } else {
+          const vm = /<v>([\s\S]*?)<\/v>/.exec(body);
+          if (!vm) {
+            const is = type === "str" ? null : /<is>([\s\S]*?)<\/is>/.exec(body);
+            if (!is) continue;
+            val = richText(is[1]);
+          } else {
+            const v = vm[1];
+            if (type === "s") val = sst[+v] !== undefined ? sst[+v] : "";
+            else if (type === "str") val = unxml(v);
+            else if (type === "b") val = v === "1" || v === "true";
+            else if (type === "e") val = "";
+            else if (type === "d") val = new Date(unxml(v));
+            else {
+              val = parseFloat(v);
+              if (dateStyle[style] && isFinite(val)) val = excelDate(val);
+            }
+          }
+        }
+        while (row.length < col) row.push("");
+        row[col] = val;
+        any = true;
+      }
+      if (!any) continue;
+      if (!width) width = row.length;            /* no size in the file: use the header width */
+      while (row.length < width) row.push("");
+      pending.push(row);
+      rowsSeen++;
+    }
+  };
+
+  const fill = async () => {
+    while (!ended && pending.length < chunkSize) {
+      const r = await sheetReader.read();
+      if (r.done) {
+        text += dec.decode();
+        ended = true;
+      } else {
+        text += dec.decode(r.value, { stream: true });
+        bytesSeen += r.value.length;
+      }
+      if (!gotDim) {
+        const sd = text.indexOf("<sheetData");
+        if (sd >= 0 || ended) {
+          gotDim = true;
+          const dm = /<dimension\b[^>]*?\bref="([A-Za-z]+)(\d+)(?::([A-Za-z]+)(\d+))?"/.exec(text);
+          if (dm) {
+            firstCol = colIndex(dm[1]);
+            width = colIndex(dm[3] || dm[1]) - firstCol + 1;
+            total = (+(dm[4] || dm[2])) - (+dm[2]) + 1;
+            if (width > 16384 || width < 1) width = 0;
+          }
+        } else {
+          continue;
+        }
+      }
+      const endData = text.indexOf("</sheetData>");
+      let cut;
+      if (endData >= 0) {
+        cut = endData;
+        ended = true;
+      } else if (ended) {
+        cut = text.length;
+      } else {
+        const last = text.lastIndexOf("</row>");
+        if (last < 0) continue;
+        cut = last + 6;
+      }
+      parseRows(text.slice(0, cut));
+      text = ended ? "" : text.slice(cut);
+    }
+    if (ended) {
+      try { sheetReader.cancel(); } catch (e) {}
+      bytes = null;
+    }
+  };
+
+  await fill();
+  if (!total) {
+    /* no size in the file: estimate the row count, only for the % shown */
+    total = ended || !bytesSeen ? pending.length : Math.round(rowsSeen * sheetFile.size / bytesSeen);
+  }
+
+  return {
+    total,
+    next: async () => {
+      await fill();
+      const rows = pending.length > chunkSize ? pending.splice(0, chunkSize) : pending;
+      if (rows === pending) pending = [];
+      return { rows, done: ended && pending.length === 0 };
+    },
+    close: () => {
+      pending = [];
+      text = "";
+      if (!ended) { ended = true; try { sheetReader.cancel(); } catch (e) {} }
+      bytes = null;
+    }
+  };
+}
+
+
+
+function masterRowsFromArray(rows) {
+  let pos = 0;
+  return {
+    total: rows.length,
+    next: async () => {
+      const part = rows.slice(pos, pos + MASTER_READ_CHUNK);
+      for (let i = pos; i < pos + part.length; i++) rows[i] = null;   /* free memory as we go */
+      pos += part.length;
+      return { rows: part, done: pos >= rows.length };
+    },
+    close: () => { rows = []; }
+  };
+}
+
+async function masterRowsOnThisThread(buffer) {
+  try {
+    return await masterStreamReader(buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer), MASTER_READ_CHUNK);
+  } catch (e) {
+    console.warn("Stream reading not possible, using the full Excel reader:", e);
+  }
+  if (typeof XLSX === "undefined") {
+    throw new Error("Excel library is not loaded. Please check xlsx.full.min.js.");
+  }
+  let workbook = XLSX.read(buffer, { type: "array", cellDates: true, dense: true, cellText: false, cellHTML: false, cellNF: false, cellStyles: false });
+  const ws = workbook.Sheets[workbook.SheetNames[0]];
+  if (!ws) throw new Error("Consumer master XLSX contains no worksheet.");
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true });
+  workbook = null;
+  return masterRowsFromArray(rows);
+}
+
+async function openMasterRowReader(buffer) {
+  const tag = document.querySelector('script[src*="xlsx.full.min.js"]');
+  const xlsxUrl = tag && tag.src ? tag.src : new URL("xlsx.full.min.js", document.baseURI).href;
+
+  const code =
+    "const masterStreamReader = " + masterStreamReader.toString() + ";\n" +
+    "let rows = null, pos = 0, stream = null;\n" +
+    "onmessage = async e => {\n" +
+    "  const m = e.data;\n" +
+    "  try {\n" +
+    "    if (m.type === 'parse') {\n" +
+    "      try {\n" +
+    "        stream = await masterStreamReader(new Uint8Array(m.buffer), " + MASTER_READ_CHUNK + ");\n" +
+    "        postMessage({ type: 'ready', total: stream.total });\n" +
+    "        return;\n" +
+    "      } catch (err) {\n" +
+    "        stream = null;\n" +
+    "        if (String(err && err.message) !== 'NO_STREAM_SUPPORT') throw err;\n" +
+    "      }\n" +
+    "      importScripts(" + JSON.stringify(xlsxUrl) + ");\n" +
+    "      let wb = XLSX.read(new Uint8Array(m.buffer), { type: 'array', cellDates: true, dense: true, cellText: false, cellHTML: false, cellNF: false, cellStyles: false });\n" +
+    "      const ws = wb.Sheets[wb.SheetNames[0]];\n" +
+    "      if (!ws) throw new Error('Consumer master XLSX contains no worksheet.');\n" +
+    "      rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });\n" +
+    "      wb = null;\n" +
+    "      postMessage({ type: 'ready', total: rows.length });\n" +
+    "    } else if (m.type === 'next') {\n" +
+    "      if (stream) {\n" +
+    "        const r = await stream.next();\n" +
+    "        postMessage({ type: 'rows', rows: r.rows, done: r.done });\n" +
+    "        return;\n" +
+    "      }\n" +
+    "      const part = rows.slice(pos, pos + " + MASTER_READ_CHUNK + ");\n" +
+    "      for (let i = pos; i < pos + part.length; i++) rows[i] = null;\n" +
+    "      pos += part.length;\n" +
+    "      postMessage({ type: 'rows', rows: part, done: pos >= rows.length });\n" +
+    "    }\n" +
+    "  } catch (err) {\n" +
+    "    postMessage({ type: 'error', message: String((err && err.message) || err) });\n" +
+    "  }\n" +
+    "};\n";
+
+  let worker = null;
+  try {
+    worker = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+  } catch (e) {
+    worker = null;
+  }
+  if (!worker) return masterRowsOnThisThread(buffer);
+
+  let waiting = null;
+  worker.onmessage = e => {
+    const w = waiting;
+    waiting = null;
+    if (!w) return;
+    if (e.data && e.data.type === "error") w.reject(new Error(e.data.message));
+    else w.resolve(e.data);
+  };
+  worker.onerror = e => {
+    if (e && e.preventDefault) e.preventDefault();
+    const w = waiting;
+    waiting = null;
+    if (w) w.reject(new Error((e && e.message) || "Master Data could not be read."));
+  };
+  const ask = msg => new Promise((resolve, reject) => {
+    waiting = { resolve, reject };
+    worker.postMessage(msg);
+  });
+
+  try {
+    const ready = await ask({ type: "parse", buffer: buffer });
+    return {
+      total: ready.total,
+      next: () => ask({ type: "next" }),
+      close: () => worker.terminate()
+    };
+  } catch (e) {
+    worker.terminate();
+    console.warn("Background reading failed, reading here instead:", e);
+    return masterRowsOnThisThread(buffer);
+  }
+}
+
+/* =========================================================
+ * v18.4 ADDITIONS: DAILY MASTER UPDATES (in the background)
+ * =========================================================
+ * The Master Tool publishes small change files every day.
+ * The phone asks the server (master_updates) which ones it needs,
+ * downloads them from R2 and applies them to the master on the
+ * phone. A new monthly master is downloaded in the background
+ * too; only the very first setup shows the setup screen.
+ * Checks: 25 s after opening, every 30 minutes, when the phone
+ * comes back online, and when the app is opened again.
+ */
+const MASTER_SYNC_EVERY_MS = 30 * 60 * 1000;
+const MASTER_SYNC_MIN_GAP_MS = 10 * 60 * 1000;
+const MASTER_CHANGE_BATCH = 500;
+let masterSyncRunning = false;
+let masterSyncLastAt = 0;
+
+function masterSyncLine(text) {
+  let el = $("masterSyncLine");
+  if (!el) {
+    const status = $("masterUpdateStatus");
+    if (!status) return;
+    el = document.createElement("div");
+    el.id = "masterSyncLine";
+    el.style.cssText = "margin-top:6px;font-size:12px;color:#5d7178";
+    status.insertAdjacentElement("afterend", el);
+  }
+  el.textContent = text || "";
+  if (!state.masterQuiet) refreshDataUpTo();
+}
+
+/* Small label at the top: "Data up to 08/11/2026" (or the update progress). */
+function setDataUpToText(text) {
+  let el = $("dataUpToLabel");
+  if (!el) {
+    const header = document.querySelector("header .subtitle") || document.querySelector("header h1");
+    if (!header) return;
+    el = document.createElement("div");
+    el.id = "dataUpToLabel";
+    el.style.cssText = "display:inline-block;margin-top:6px;padding:2px 9px;border-radius:999px;" +
+      "background:rgba(255,255,255,.2);color:#fff;font-size:11px;font-weight:700;letter-spacing:.2px";
+    header.insertAdjacentElement("afterend", el);
+  }
+  el.textContent = text || "";
+  el.classList.toggle("hidden", !text);
+}
+
+function refreshDataUpTo() {
+  if (state.masterQuiet) return;                 /* progress is shown instead */
+  const meta = getLocalMasterMeta();
+  if (!meta || !state.masterReady) {
+    setDataUpToText("");
+    return;
+  }
+  let date = String(meta.report_date || "").trim();
+  if (!date && meta.last_updated) {
+    const d = new Date(meta.last_updated);
+    if (!isNaN(d.getTime())) date = d.toLocaleDateString("en-GB");
+  }
+  setDataUpToText(date ? "Data up to " + date + reportsShortText(meta) : "");
+}
+
+/* " (billed report 08/11, unbilled 09/11)" - which day's reports the data comes from */
+function reportsShortText(meta) {
+  const r = (meta && meta.reports) || {};
+  const dm = v => String(v || "").split("/").slice(0, 2).join("/");
+  const parts = [];
+  if (r.billed) parts.push("billed report " + dm(r.billed));
+  if (r.unbilled) parts.push((r.billed ? "unbilled " : "unbilled report ") + dm(r.unbilled));
+  return parts.length ? " (" + parts.join(", ") + ")" : "";
+}
+
+setTimeout(refreshDataUpTo, 1500);
+setInterval(refreshDataUpTo, 60 * 1000);
+
+/* Progress of a background master import: one short line (the screen stays usable). */
+function masterQuietProgress(status, count, message) {
+  if (status !== "loading") return;
+  const text = String(message || "");
+  const toMb = (n, unit) => Number(n) * ({ KB: 1 / 1024, MB: 1, GB: 1024 }[unit] || 1);
+  let pct = null;
+  let step = "updating";
+
+  let m = text.match(/([\d.]+)\s*(KB|MB|GB)\s*\/\s*([\d.]+)\s*(KB|MB|GB)/i);
+  if (/download/i.test(text)) {
+    step = "downloading";
+    if (m) pct = Math.round(100 * toMb(m[1], m[2].toUpperCase()) / Math.max(toMb(m[3], m[4].toUpperCase()), 0.001));
+  } else if (/import/i.test(text)) {
+    step = "importing";
+    m = text.match(/(\d+)\s*%/);
+    if (m) pct = Number(m[1]);
+  }
+
+  const short = "Updating master data: " + step + (pct === null ? "…" : " " + Math.min(pct, 100) + "%");
+  masterSyncLine(short);
+  setDataUpToText(short);
+}
+
+function updatesSummaryText(meta) {
+  if (!meta || !meta.base_id) return "";
+  let text = "Daily updates: update " + (meta.updates_seq || 0);
+  if (meta.report_date) text += " (report " + meta.report_date + ")";
+  if (meta.updates_checked_at) {
+    text += ", checked " + new Date(meta.updates_checked_at)
+      .toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+  }
+  return text;
+}
+
+async function gunzipJson(buffer) {
+  const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return JSON.parse(await new Response(stream).text());
+}
+
+/* One batch of consumers in one transaction. Returns how many were found and changed. */
+function applyMasterChangeBatch(storeName, entries) {
+  return new Promise((resolve, reject) => {
+    const tx = state.masterDb.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    let changed = 0;
+
+    entries.forEach(([acct, fields]) => {
+      const req = store.get(acct);
+      req.onsuccess = () => {
+        const c = req.result;
+        if (!c) return;                          /* not in this master */
+        Object.assign(c, fields);
+        if ("METER_NO" in fields) {
+          c._meter_norm = String(c.METER_NO || "").toUpperCase().replace(/\s+/g, "");
+        }
+        store.put(c);
+        changed++;
+      };
+    });
+
+    tx.oncomplete = () => resolve(changed);
+    tx.onerror = () => reject(tx.error || new Error("Could not save master changes."));
+  });
+}
+
+async function applyMasterChangeFile(file, meta, onProgress) {
+  if (String(file.base_id || "") !== String(meta.base_id || "")) {
+    throw new Error("This update belongs to another master.");
+  }
+  const entries = Object.entries(file.changes || {});
+  const storeName = state.activeMasterStore;
+  let changed = 0;
+  for (let i = 0; i < entries.length; i += MASTER_CHANGE_BATCH) {
+    changed += await applyMasterChangeBatch(storeName, entries.slice(i, i + MASTER_CHANGE_BATCH));
+    if (onProgress) onProgress(Math.min(entries.length, i + MASTER_CHANGE_BATCH), entries.length);
+    await new Promise(resolve => setTimeout(resolve, 0));     /* keep the screen responsive */
+  }
+  return changed;
+}
+
+/* New monthly master without the setup screen: imported into the spare store, then switched. */
+async function backgroundMasterUpdate(remote) {
+  state.masterQuiet = true;
+  masterSyncLine("New Master Data is downloading in the background. You can keep working.");
+  try {
+    const buffer = await downloadAssignedMaster(remote);
+    const count = await importMasterIntoPending(buffer, remote);
+    masterNotice("");
+    showAppToast("New Master Data loaded: " + count.toLocaleString("en-IN") + " consumers. (नया मास्टर डेटा)");
+  } catch (e) {
+    /* free the half-imported copy; the current master stays in use */
+    try { await clearMasterConsumers(getInactiveMasterStore()); } catch (x) {}
+    masterNotice("New monthly master could not be downloaded; current data still works, it will try again. " +
+      "(पुराना डेटा चालू है)", "error");
+    throw e;
+  } finally {
+    state.masterQuiet = false;
+    refreshDataUpTo();
+  }
+}
+
+async function syncMasterUpdates(force, fromButton) {
+  if (masterSyncRunning) return;
+  if (!state.sessionToken || !state.masterDb || !state.masterReady || !navigator.onLine) return;
+  if (!fromButton && $("checkMasterUpdateBtn") && $("checkMasterUpdateBtn").disabled) return;   /* manual update running */
+  if (!force && Date.now() - masterSyncLastAt < MASTER_SYNC_MIN_GAP_MS) return;
+
+  masterSyncRunning = true;
+  masterSyncLastAt = Date.now();
+
+  try {
+    for (let round = 0; round < 2; round++) {
+      let meta = Object.assign({}, getLocalMasterMeta() || {});
+      masterNotice("Checking for daily master updates… (दैनिक अपडेट जाँच)", "info");
+      const res = await serverPost("master_updates", {
+        base_id: meta.base_id || "",
+        seq: Number(meta.updates_seq) || 0
+      });
+      if (!res || !res.success || !res.available) { masterNotice(""); return; }
+
+      if (res.master_changed) {
+        const remote = await checkAssignedMaster();
+        if (String(remote.master_file_id || "") === String(meta.master_file_id || "") &&
+            String(meta.parser_version || "") === MASTER_PARSER_VERSION) {
+          masterNotice("");
+          return;     /* this phone already has the newest master file */
+        }
+        await backgroundMasterUpdate(remote);
+        continue;     /* then fetch that master's updates */
+      }
+
+      if (res.up_to_date && (res.report_date || res.reports)) {
+        /* same figures, newer report days (or a phone that never had them) */
+        meta = Object.assign({}, getLocalMasterMeta(), {
+          report_date: res.report_date || meta.report_date || "",
+          reports: res.reports || meta.reports || {}
+        });
+        await saveMasterMeta(meta);
+        refreshDataUpTo();
+      }
+
+      let total = 0;
+      const files = res.downloads || [];
+      for (let n = 0; n < files.length; n++) {
+        const d = files[n];
+        if (Number(d.from_seq) > (Number(meta.updates_seq) || 0)) break;   /* gap: next time */
+        const which = "daily update " + d.seq + (files.length > 1 ? " (" + (n + 1) + " of " + files.length + ")" : "");
+        masterNotice("Downloading " + which + (d.size ? ", " + formatBytes(d.size) : "") + "… (दैनिक अपडेट डाउनलोड)", "info");
+        const r = await fetch(d.url);
+        if (!r.ok) throw new Error("Update download failed (HTTP " + r.status + ")");
+        const file = await gunzipJson(await r.arrayBuffer());
+        total += await applyMasterChangeFile(file, meta, (done, all) => {
+          masterNotice("Loading " + which + ": " + Math.round(100 * done / Math.max(all, 1)) + "% (" +
+            done.toLocaleString("en-IN") + " of " + all.toLocaleString("en-IN") +
+            " consumers) — keep the app open. (ऐप खुला रखें)", "warn");
+        });
+        meta = Object.assign({}, getLocalMasterMeta(), {
+          updates_seq: Number(file.seq) || 0,
+          report_date: file.report_date || meta.report_date || "",
+          billing_month: file.billing_month || meta.billing_month || "",
+          reports: file.reports || meta.reports || {}
+        });
+        await saveMasterMeta(meta);
+      }
+
+      meta = Object.assign({}, getLocalMasterMeta(), { updates_checked_at: new Date().toISOString() });
+      await saveMasterMeta(meta);
+      masterSyncLine(updatesSummaryText(meta));
+
+      if (total) {
+        dlOptions = null;          /* lists re-read their filter choices */
+        showAppToast("Master data updated: " + total.toLocaleString("en-IN") +
+          " consumers (report " + (meta.report_date || "") + "). (मास्टर डेटा अपडेट)");
+        masterNoticeBrief("Daily update loaded: " + total.toLocaleString("en-IN") + " consumers changed · data up to " +
+          (meta.report_date || "-") + ". (दैनिक अपडेट लोड हुआ)", "ok", 8000);
+      } else if (fromButton) {
+        masterNoticeBrief("Master data is up to date · data up to " + (meta.report_date || "-") + ". (डेटा अपडेटेड है)", "ok", 5000);
+      } else {
+        masterNotice("");
+      }
+      return;
+    }
+  } catch (e) {
+    console.warn("Daily master update failed", e);
+    const text = String((e && e.message) || e);
+    const noSpace = (e && e.name === "QuotaExceededError") || /quota|space/i.test(text);
+    const msg = noSpace
+      ? "Not enough storage space on this phone for the new Master Data. Free some space; it will try again."
+      : "Master Data update could not finish now; it will try again. (" + text + ")";
+    masterSyncLine(msg);
+    showAppToast(msg, 8000);
+    const monthlyMsg = $("masterNotice") && /monthly master/.test($("masterNotice").textContent);
+    if (!monthlyMsg) {                       /* the monthly master shows its own message */
+      masterNoticeBrief(noSpace ? msg : "Daily update could not finish; your data still works, it will try again. " +
+        "(अपडेट पूरा नहीं हुआ, फिर कोशिश होगी)", "error", 15000);
+    }
+    refreshDataUpTo();
+  } finally {
+    masterSyncRunning = false;
+  }
+}
+
+setInterval(() => syncMasterUpdates(false), MASTER_SYNC_EVERY_MS);
+setTimeout(() => syncMasterUpdates(true), 10000);
+window.addEventListener("online", () => setTimeout(() => syncMasterUpdates(true), 8000));
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") setTimeout(() => syncMasterUpdates(false), 6000);
+});
+if (getLocalMasterMeta()) masterSyncLine(updatesSummaryText(getLocalMasterMeta()));
+
+/* =========================================================
+ * v19.0 PROGRESS TAB
+ * =========================================================
+ * Everything is calculated on this phone from the master
+ * (+ daily updates), so it works offline. The master is read
+ * once per data version into village-level totals; filters and
+ * switches only add those totals up (instant).
+ * The disconnection drive comes from the server (REFRESH) and
+ * the last copy is kept for offline use.
+ */
+
+/* ---------- categories (Tariff PDF) ---------- */
+const PG_TARIFF = (() => {
+  const t = {
+    "LMV-1": "10 10A 11 17 17A 18 19",
+    "LMV-2": "20 22 24 24B 24C 24D 25 26 27 28",
+    "LMV-3": "30 31 32 33 34 35 36A 37A 38A",
+    "LMV-4": "40 40A 41 41A 42 42A 43 44 46 47",
+    "LMV-5": "50 51 52 53 54 55 56 57A 57 58U 58 58UA 59R 59RA",
+    "LMV-6": "60 60TA 61 63 65 66 67 68T",
+    "LMV-7": "72 73 74 75",
+    "LMV-8": "80U 80R 81U 81R 82U 82R",
+    "LMV-9": "90 91 92 93 94 95 99",
+    "LMV-10": "101 102 103 104 105 106 107",
+    "LMV-11": "11A 11B 11C 11D 11FA 11GA 11HA",
+    "HV-1": "H11 H12 H13 H14 H15 H15A H16 H16A H17 H17A H18 H18A",
+    "HV-2": "H21A H22A H23A H24A H26",
+    "HV-3": "H31 H32 H33 H34 H35 H36",
+    "HV-4": "H41 H42 H43"
+  };
+  const map = {};
+  Object.keys(t).forEach(cat => t[cat].split(" ").forEach(code => { map[code] = cat; }));
+  return map;
+})();
+const PG_CAT_ORDER = ["LMV-1", "LMV-2", "LMV-3", "LMV-4", "LMV-5", "LMV-6", "LMV-7", "LMV-8",
+  "LMV-9", "LMV-10", "LMV-11", "HV-1", "HV-2", "HV-3", "HV-4", "OTHER"];
+/* Govt: LMV-3, LMV-4 (40-44), LMV-7, LMV-8, LMV-10, HV-3, HV-4. PTW: LMV-5. Rest: Non-Govt. */
+const PG_GOVT_CODES = new Set("40 40A 41 41A 42 42A 43 44".split(" "));
+const PG_GOVT_CATS = new Set(["LMV-3", "LMV-7", "LMV-8", "LMV-10", "HV-3", "HV-4"]);
+const PG_BILLABLE = new Set(["INSERVICE", "TD", "TD>6MONTH", "TD>6MONTHS"]);
+const PG_GROUP_LABEL = { ALL: "All", G: "Govt", N: "Non-Govt", P: "PTW" };
+const PG_LEVELS = ["sdo", "sub", "feeder", "village"];
+const PG_LEVEL_LABEL = { sdo: "SDO", sub: "Substation", feeder: "Feeder", village: "Village" };
+const PG_UNPAID_BANDS = ["3 to 4", "5 to 9", "10 to 49", "50 and above"];
+const PG_UNBILLED_BANDS = ["1", "2", "3 to 4", "5 to 9", "10 to 49", "50 and above"];
+
+function pgSupplyCode(v) {
+  return String(v == null ? "" : v).trim().toUpperCase().replace(/\s+/g, "").replace(/\.0+$/, "");
+}
+function pgCategory(code) {
+  if (PG_TARIFF[code]) return PG_TARIFF[code];
+  const c = code ? supplyCategory(code) : "OTHER";
+  return PG_CAT_ORDER.indexOf(c) === -1 ? "OTHER" : c;
+}
+function pgGroup(code, cat) {
+  if (cat === "LMV-5") return "P";
+  return PG_GOVT_CATS.has(cat) || PG_GOVT_CODES.has(code) ? "G" : "N";
+}
+function pgBillable(status) {
+  return PG_BILLABLE.has(String(status || "").toUpperCase().replace(/\s+/g, ""));
+}
+function pgNum(v) {
+  const n = Number(String(v == null ? "" : v).replace(/,/g, "").trim());
+  return isFinite(n) ? n : 0;
+}
+function pgUnpaidBand(load) {               /* kW/kVA/BHP treated alike */
+  if (load >= 50) return 3;
+  if (load >= 10) return 2;
+  if (load >= 5) return 1;
+  if (load >= 3) return 0;
+  return -1;
+}
+function pgUnbilledBand(load) {
+  if (load >= 50) return 5;
+  if (load >= 10) return 4;
+  if (load >= 5) return 3;
+  if (load > 2) return 2;
+  if (load > 1) return 1;
+  return 0;
+}
+
+/* ---------- dates (yyyy-mm-dd strings compare correctly) ---------- */
+const PG_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+function pgMonthKey(label) {                 /* "NOV_2026" -> "2026-11" */
+  const m = String(label || "").toUpperCase().match(/([A-Z]{3})[_\- ]?(\d{4})/);
+  if (!m || PG_MONTHS.indexOf(m[1]) === -1) return "";
+  return m[2] + "-" + String(PG_MONTHS.indexOf(m[1]) + 1).padStart(2, "0");
+}
+function pgPrevMonth(ym) {
+  let [y, m] = ym.split("-").map(Number);
+  m -= 1; if (m < 1) { m = 12; y -= 1; }
+  return y + "-" + String(m).padStart(2, "0");
+}
+function pgDaysIn(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(Date.UTC(y, m, 0)).getUTCDate();
+}
+function pgAddDays(ymd, n) {
+  const d = new Date(ymd + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function pgDayDiff(a, b) {                   /* days from a to b */
+  return Math.round((Date.parse(b + "T00:00:00Z") - Date.parse(a + "T00:00:00Z")) / 86400000);
+}
+function pgShortDate(ymd) {                  /* "2026-11-08" -> "8 Nov" */
+  return Number(ymd.slice(8, 10)) + " " + PG_MONTHS[Number(ymd.slice(5, 7)) - 1].charAt(0) +
+    PG_MONTHS[Number(ymd.slice(5, 7)) - 1].slice(1).toLowerCase();
+}
+function pgTodayYmd() {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+function pgContext() {
+  const meta = getLocalMasterMeta() || {};
+  const report = parseMasterDate(meta.report_date) || pgTodayYmd();
+  const billingMonth = pgMonthKey(meta.billing_month) || report.slice(0, 7);
+  const masterMonth = pgMonthKey(meta.master_month) || pgPrevMonth(billingMonth);
+  const day = Math.min(Number(report.slice(8, 10)), pgDaysIn(masterMonth));
+  return {
+    key: [state.activeMasterStore, state.masterCount, meta.base_id || "", meta.updates_seq || 0,
+      meta.master_file_id || "", meta.report_date || ""].join("|"),
+    report: report,
+    billingMonth: billingMonth,
+    monthStart: billingMonth + "-01",
+    masterMonth: masterMonth,
+    compareOk: masterMonth === pgPrevMonth(billingMonth),
+    lmDayLimit: masterMonth + "-" + String(day).padStart(2, "0")
+  };
+}
+
+/* ---------- reading the master once ---------- */
+function pgNewCell() {
+  return {
+    n: 0, billable: 0, billed: 0,
+    rev: 0, lmDay: 0, lmTotal: 0, day: [0, 0, 0, 0, 0, 0, 0],
+    paid: 0, lmPaid: 0, lmPaidDay: 0,
+    unpaid: 0, unpaidAmt: 0, band: [0, 0, 0, 0], bandAmt: [0, 0, 0, 0],
+    never: 0, neverAmt: 0,
+    ub: [0, 0, 0, 0, 0, 0], cats: {}, remark: {}, basis: {}
+  };
+}
+function pgNewCat() {
+  return { billable: 0, paid: 0, lmPaid: 0, lmPaidDay: 0, unbilled: 0, unpaid: 0, unpaidAmt: 0 };
+}
+
+let pgData = null;          /* { key, ctx, cells: Map, units: [[sdo,sub,feeder,village]] } */
+let pgBusy = false;
+
+async function pgCompute(ctx) {
+  const cells = new Map();
+  const units = new Map();
+
+  await forEachMasterBatch(batch => {
+    for (const c of batch) {
+      const code = pgSupplyCode(c.SUPPLY_TYPE);
+      const cat = pgCategory(code);
+      const grp = pgGroup(code, cat);
+      const meter = String(c.MR_SOURCE_CD || "").trim().toUpperCase() === "SM" ? "S" : "N";
+      const u = [dlVal(c.SDO_CODE), dlVal(c.SUBSTATION), dlVal(c.FEEDER), dlVal(c.feeded_village_name)];
+      const uKey = u.join("\u0001");
+      if (!units.has(uKey)) units.set(uKey, u);
+      const key = uKey + "\u0001" + grp + "\u0001" + meter;
+      let m = cells.get(key);
+      if (!m) { m = pgNewCell(); cells.set(key, m); }
+      m.n++;
+
+      /* revenue: every consumer (also PD paying old dues) */
+      const pay = parseMasterDate(c.LAST_PAY_DATE);
+      const payAmt = pgNum(c.LAST_PAY_AMOUNT);
+      const tmRaw = String(c.THIS_MONTH_TOTAL_PAY_AMT == null ? "" : c.THIS_MONTH_TOTAL_PAY_AMT).trim();
+      let thisMonth = tmRaw !== "" ? pgNum(tmRaw) : 0;
+      const payInMonth = !!pay && pay >= ctx.monthStart && pay <= ctx.report;
+      if (!thisMonth && payInMonth) thisMonth = payAmt;
+      m.rev += thisMonth;
+      if (pay && pay <= ctx.report) {
+        const diff = pgDayDiff(pay, ctx.report);
+        if (diff >= 0 && diff < 7) m.day[diff] += payAmt;
+      }
+      const mpay = parseMasterDate(c.MASTER_LAST_PAY_DATE);
+      const lmIn = !!mpay && mpay.slice(0, 7) === ctx.masterMonth;
+      const lmInDay = lmIn && mpay <= ctx.lmDayLimit;
+      if (lmInDay) m.lmDay += pgNum(c.MASTER_LAST_PAY_AMOUNT);
+      const lmTotal = pgNum(c.MASTER_TOTAL_PAY_AMT);
+      m.lmTotal += lmTotal;
+
+      if (!pgBillable(c.CONNECTION_STATUS)) continue;
+
+      /* billable only from here */
+      const ce = m.cats[cat] || (m.cats[cat] = pgNewCat());
+      m.billable++; ce.billable++;
+      const paid = thisMonth > 0 || payInMonth;
+      if (paid) { m.paid++; ce.paid++; }
+      if (lmTotal > 0 || lmIn) { m.lmPaid++; ce.lmPaid++; }
+      if (lmInDay) { m.lmPaidDay++; ce.lmPaidDay++; }
+
+      const load = pgNum(c.LOAD);
+      const bill = parseMasterDate(c.LAST_BILL_DATE);
+      if (bill && bill.slice(0, 7) === ctx.billingMonth) {
+        m.billed++;
+        const r = String(c.METER_READ_REMARK || "").trim().toUpperCase() || "(blank)";
+        const b = String(c.BILL_BASIS || "").trim().toUpperCase() || "(blank)";
+        m.remark[r] = (m.remark[r] || 0) + 1;
+        m.basis[b] = (m.basis[b] || 0) + 1;
+      } else {
+        ce.unbilled++;
+        m.ub[pgUnbilledBand(load)]++;
+      }
+
+      const out = pgNum(c.TOTAL_OUTSTANDING);
+      if (out > 0 && !(pay && pay >= ctx.monthStart)) {
+        m.unpaid++; m.unpaidAmt += out;
+        ce.unpaid++; ce.unpaidAmt += out;
+        const band = pgUnpaidBand(load);
+        if (band >= 0) { m.band[band]++; m.bandAmt[band] += out; }
+      }
+      if (!pay || pay < "2010-01-01") {
+        m.never++; m.neverAmt += Math.max(out, 0);
+      }
+    }
+  });
+
+  return { key: ctx.key, ctx: ctx, cells: cells, units: Array.from(units.values()) };
+}
+
+function pgAdd(t, m) {
+  Object.keys(m).forEach(k => {
+    const v = m[k];
+    if (typeof v === "number") t[k] = (t[k] || 0) + v;
+    else if (Array.isArray(v)) { t[k] = t[k] || v.map(() => 0); v.forEach((x, i) => { t[k][i] += x; }); }
+    else if (k === "cats") Object.keys(v).forEach(cat => {
+      const a = t.cats[cat] || (t.cats[cat] = pgNewCat());
+      Object.keys(v[cat]).forEach(f => { a[f] += v[cat][f]; });
+    });
+    else Object.keys(v).forEach(x => { t[k][x] = (t[k][x] || 0) + v[x]; });
+  });
+}
+
+/* ---------- filters and switches (saved per user) ---------- */
+const PG_DEFAULTS = { sdo: "", sub: "", feeder: "", village: "", group: "ALL", meter: "ALL",
+  level: "sub", compare: "OFF", period: "M" };
+let pgSel = Object.assign({}, PG_DEFAULTS);
+
+function pgSaveKey() { return "fieldworkProgress:" + String(state.userId || "").trim().toLowerCase(); }
+function pgLoadSel() {
+  try { pgSel = Object.assign({}, PG_DEFAULTS, JSON.parse(localStorage.getItem(pgSaveKey()) || "{}")); }
+  catch (e) { pgSel = Object.assign({}, PG_DEFAULTS); }
+}
+function pgSaveSel() {
+  try { localStorage.setItem(pgSaveKey(), JSON.stringify(pgSel)); } catch (e) {}
+}
+
+function pgUnitMatches(u) {
+  return (!pgSel.sdo || u[0] === pgSel.sdo) && (!pgSel.sub || u[1] === pgSel.sub) &&
+    (!pgSel.feeder || u[2] === pgSel.feeder) && (!pgSel.village || u[3] === pgSel.village);
+}
+function pgLabel(v) { return v === DL_BLANK ? "(blank)" : v; }
+
+function pgFillSelect(id, values, current) {
+  const sel = $(id);
+  if (!sel) return "";
+  const list = dlSortValues(Array.from(new Set(values)));
+  const keep = current && list.indexOf(current) !== -1 ? current : "";
+  sel.innerHTML = '<option value="">All</option>' +
+    list.map(v => '<option value="' + escapeHtml(v) + '">' + escapeHtml(pgLabel(v)) + "</option>").join("");
+  sel.value = keep;
+  return keep;
+}
+
+function pgRefreshDropdowns() {
+  const u = pgData.units;
+  pgSel.sdo = pgFillSelect("pgSdo", u.map(x => x[0]), pgSel.sdo);
+  const a = u.filter(x => !pgSel.sdo || x[0] === pgSel.sdo);
+  pgSel.sub = pgFillSelect("pgSub", a.map(x => x[1]), pgSel.sub);
+  const b = a.filter(x => !pgSel.sub || x[1] === pgSel.sub);
+  pgSel.feeder = pgFillSelect("pgFeeder", b.map(x => x[2]), pgSel.feeder);
+  const c = b.filter(x => !pgSel.feeder || x[2] === pgSel.feeder);
+  pgSel.village = pgFillSelect("pgVillage", c.map(x => x[3]), pgSel.village);
+}
+
+function pgSetSwitches() {
+  [["pgGroup", "group"], ["pgMeter", "meter"], ["pgLevel", "level"], ["pgCompare", "compare"], ["pgPeriod", "period"]]
+    .forEach(([id, key]) => {
+      const box = $(id);
+      if (!box) return;
+      box.querySelectorAll("button[data-v]").forEach(b => b.classList.toggle("on", b.dataset.v === pgSel[key]));
+    });
+}
+
+function pgPeriodButtons(ctx) {
+  const box = $("pgPeriod");
+  if (!box) return;
+  const r = ctx.report;
+  const label = {
+    "1": "Latest day (" + pgShortDate(r) + ")",
+    "2": "2 days (" + pgShortDate(pgAddDays(r, -1)) + "–" + pgShortDate(r) + ")",
+    "7": "7 days (" + pgShortDate(pgAddDays(r, -6)) + "–" + pgShortDate(r) + ")",
+    "M": "This month (" + pgShortDate(ctx.monthStart) + "–" + pgShortDate(r) + ")"
+  };
+  box.querySelectorAll("button[data-v]").forEach(b => { b.textContent = label[b.dataset.v]; });
+}
+
+/* ---------- adding up for the screen ---------- */
+function pgCollect() {
+  const levelIdx = PG_LEVELS.indexOf(pgSel.level);
+  const total = pgNewCell();
+  const byUnit = new Map();
+  const byMeter = { S: pgNewCell(), N: pgNewCell() };
+
+  pgData.cells.forEach((m, key) => {
+    const parts = key.split("\u0001");
+    const u = parts.slice(0, 4);
+    const grp = parts[4], meter = parts[5];
+    if (!pgUnitMatches(u)) return;
+    if (pgSel.group !== "ALL" && grp !== pgSel.group) return;
+    pgAdd(byMeter[meter], m);                       /* smart / non-smart table ignores the meter switch */
+    if (pgSel.meter === "S" && meter !== "S") return;
+    if (pgSel.meter === "N" && meter !== "N") return;
+    pgAdd(total, m);
+    const name = u[levelIdx];
+    if (!byUnit.has(name)) byUnit.set(name, pgNewCell());
+    pgAdd(byUnit.get(name), m);
+  });
+
+  const units = dlSortValues(Array.from(byUnit.keys())).map(name => [pgLabel(name), byUnit.get(name)]);
+  return { total: total, units: units, byMeter: byMeter };
+}
+
+/* ---------- formatting ---------- */
+function pgN(n) { return Math.round(n || 0).toLocaleString("en-IN"); }
+function pgRs(n) { return "₹" + Math.round(n || 0).toLocaleString("en-IN"); }
+function pgPct(a, b) { return b ? (100 * a / b).toFixed(1) + "%" : "—"; }
+function pgChange(now, before) {
+  if (!before) return "—";
+  const p = 100 * (now - before) / before;
+  const cls = p >= 0 ? "pg-up" : "pg-down";
+  return '<span class="' + cls + '">' + (p >= 0 ? "+" : "") + p.toFixed(1) + "%</span>";
+}
+function pgTable(head, rows, totalRow) {
+  const th = "<tr>" + head.map(h => "<th>" + h + "</th>").join("") + "</tr>";
+  const tr = r => "<tr" + (r === totalRow ? ' class="total"' : "") + ">" + r.map(c => "<td>" + c + "</td>").join("") + "</tr>";
+  const body = (totalRow ? [totalRow] : []).concat(rows).map(tr).join("");
+  return '<div class="pg-scroll"><table class="pg-table"><thead>' + th + "</thead><tbody>" + body + "</tbody></table></div>";
+}
+function pgUnitRows(col, fn) {
+  /* [Total] + one row per unit, first column = unit name */
+  return { total: ["Total"].concat(fn(col.total)), rows: col.units.map(([name, m]) => [escapeHtml(name)].concat(fn(m))) };
+}
+
+/* ---------- sections ---------- */
+function pgRevenueHtml(col, ctx) {
+  const cmp = pgSel.compare === "ON" && ctx.compareOk;
+  const p = pgSel.period;
+  const periodSum = m => p === "M" ? m.rev : m.day.slice(0, Number(p)).reduce((a, b) => a + b, 0);
+  const periodName = $("pgPeriod") && $("pgPeriod").querySelector('button[data-v="' + p + '"]')
+    ? $("pgPeriod").querySelector('button[data-v="' + p + '"]').textContent : "Period";
+  const head = [PG_LEVEL_LABEL[pgSel.level]];
+  if (p !== "M") head.push(escapeHtml(periodName));
+  head.push("This month");
+  if (cmp) head.push("Last month same day", "Change", "Last month total");
+  const fn = m => {
+    const r = [];
+    if (p !== "M") r.push(pgRs(periodSum(m)));
+    r.push(pgRs(m.rev));
+    if (cmp) r.push(pgRs(m.lmDay), pgChange(m.rev, m.lmDay), pgRs(m.lmTotal));
+    return r;
+  };
+  const t = pgUnitRows(col, fn);
+  let note = "";
+  if (pgSel.compare === "ON" && !ctx.compareOk) {
+    note = '<div class="pg-note">Last month\'s master is not received yet, so there is no comparison.</div>';
+  }
+  return note + pgTable(head, t.rows, t.total);
+}
+
+function pgTurnUpHtml(col, ctx) {
+  const cmp = pgSel.compare === "ON" && ctx.compareOk;
+  const head = ["Category", "Billable", "Paid", "Turn up"];
+  if (cmp) head.push("Last month same day", "Last month total");
+  const row = (name, c) => {
+    const r = [name, pgN(c.billable), pgN(c.paid), pgPct(c.paid, c.billable)];
+    if (cmp) r.push(pgPct(c.lmPaidDay, c.billable), pgPct(c.lmPaid, c.billable));
+    return r;
+  };
+  const cats = PG_CAT_ORDER.filter(k => col.total.cats[k] && col.total.cats[k].billable)
+    .map(k => row(k === "LMV-5" ? "LMV-5 (PTW)" : k, col.total.cats[k]));
+  const total = row("Total", { billable: col.total.billable, paid: col.total.paid,
+    lmPaid: col.total.lmPaid, lmPaidDay: col.total.lmPaidDay });
+  const meterRows = [["Smart meter", col.byMeter.S], ["Non-smart", col.byMeter.N]]
+    .map(([n, m]) => row(n, { billable: m.billable, paid: m.paid, lmPaid: m.lmPaid, lmPaidDay: m.lmPaidDay }));
+  return pgTable(head, cats, total) +
+    '<div class="pg-note">Smart / non-smart (MR source SM):</div>' + pgTable(head, meterRows, null);
+}
+
+function pgBillingHtml(col) {
+  const head = [PG_LEVEL_LABEL[pgSel.level], "Billable", "Billed", "Billing %", "Unbilled"];
+  const t = pgUnitRows(col, m => [pgN(m.billable), pgN(m.billed), pgPct(m.billed, m.billable), pgN(m.billable - m.billed)]);
+  const cats = PG_CAT_ORDER.filter(k => col.total.cats[k] && col.total.cats[k].unbilled)
+    .map(k => [k === "LMV-5" ? "LMV-5 (PTW)" : k, pgN(col.total.cats[k].unbilled), pgPct(col.total.cats[k].unbilled, col.total.cats[k].billable)]);
+  const bands = PG_UNBILLED_BANDS.map((b, i) => [b + " kW/kVA/BHP", pgN(col.total.ub[i])]);
+  return pgTable(head, t.rows, t.total) +
+    '<div class="pg-note">Unbilled by category:</div>' + pgTable(["Category", "Unbilled", "Of billable"], cats, null) +
+    '<div class="pg-note">Unbilled by load:</div>' + pgTable(["Load", "Unbilled"], bands, null);
+}
+
+function pgCountHtml(counts, billed) {
+  const keys = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  const rows = keys.map(k => [escapeHtml(k), pgN(counts[k]), pgPct(counts[k], billed)]);
+  return pgTable(["Code", "Consumers", "Of billed"], rows, ["Total billed", pgN(billed), "100%"]);
+}
+
+function pgUnpaidHtml(col) {
+  const head = [PG_LEVEL_LABEL[pgSel.level], "Unpaid", "Outstanding", "Never paid", "Never paid outst."];
+  const t = pgUnitRows(col, m => [pgN(m.unpaid), pgRs(m.unpaidAmt), pgN(m.never), pgRs(m.neverAmt)]);
+  const bands = PG_UNPAID_BANDS.map((b, i) => [b + " kW/kVA/BHP", pgN(col.total.band[i]), pgRs(col.total.bandAmt[i])]);
+  const cats = PG_CAT_ORDER.filter(k => col.total.cats[k] && col.total.cats[k].unpaid)
+    .map(k => [k === "LMV-5" ? "LMV-5 (PTW)" : k, pgN(col.total.cats[k].unpaid), pgRs(col.total.cats[k].unpaidAmt)]);
+  return pgTable(head, t.rows, t.total) +
+    '<div class="pg-note">Unpaid by load:</div>' + pgTable(["Load", "Unpaid", "Outstanding"], bands, null) +
+    '<div class="pg-note">Unpaid by category:</div>' + pgTable(["Category", "Unpaid", "Outstanding"], cats, null);
+}
+
+/* ---------- disconnection drive (server, kept for offline) ---------- */
+function pgDriveKey() { return "fieldworkProgressDrive:" + String(state.userId || "").trim().toLowerCase(); }
+let pgDrive = null;          /* { at, month, rows:[{status, date, u:[4], grp, meter, acct}], missing } */
+let pgPaysCache = null;      /* payment dates of visited consumers, per data version */
+
+function pgLoadDrive() {
+  try { pgDrive = JSON.parse(localStorage.getItem(pgDriveKey()) || "null"); } catch (e) { pgDrive = null; }
+}
+
+async function pgRefreshDrive() {
+  if (!navigator.onLine) { setStatus("pgDriveStatus", "No internet. Showing the last copy.", "error"); return; }
+  setStatus("pgDriveStatus", "Loading the disconnection drive…");
+  if ($("pgDriveRefreshBtn")) $("pgDriveRefreshBtn").disabled = true;
+  try {
+    const res = await serverPost("disconnection_list", {});
+    if (!res || !res.success) throw new Error((res && res.message) || "Server error");
+    const month = pgTodayYmd().slice(0, 7);
+    const rows = [];
+    let missing = 0;
+    for (const d of res.disconnections || []) {
+      if (!String(d.date || "").startsWith(month)) continue;
+      const c = await getMasterByAccountInput(d.account_id);
+      if (!c) { missing++; continue; }
+      const code = pgSupplyCode(c.SUPPLY_TYPE);
+      const cat = pgCategory(code);
+      rows.push({
+        status: String(d.status || "").toUpperCase(),
+        date: String(d.date || ""),
+        u: [dlVal(c.SDO_CODE), dlVal(c.SUBSTATION), dlVal(c.FEEDER), dlVal(c.feeded_village_name)],
+        grp: pgGroup(code, cat),
+        meter: String(c.MR_SOURCE_CD || "").trim().toUpperCase() === "SM" ? "S" : "N",
+        acct: String(c.ACCT_ID || "")
+      });
+    }
+    pgDrive = { at: new Date().toISOString(), month: month, rows: rows, missing: missing };
+    try { localStorage.setItem(pgDriveKey(), JSON.stringify(pgDrive)); } catch (e) {}
+    setStatus("pgDriveStatus", "");
+  } catch (e) {
+    console.error(e);
+    setStatus("pgDriveStatus", "Could not load the drive summary: " + (e.message || e), "error");
+  } finally {
+    if ($("pgDriveRefreshBtn")) $("pgDriveRefreshBtn").disabled = false;
+  }
+  pgRender();
+}
+
+/* Payment date now (master + daily updates) of the visited consumers. */
+async function pgDrivePays() {
+  const pays = {};
+  for (const r of (pgDrive && pgDrive.rows) || []) {
+    const c = await getMasterByAccountInput(r.acct);
+    pays[r.acct] = c ? parseMasterDate(c.LAST_PAY_DATE) : "";
+  }
+  return pays;
+}
+
+function pgDriveHtml(pays) {
+  if (!pgDrive) return '<div class="pg-note">Tap REFRESH (needs internet) to load this month\'s drive.</div>';
+  const levelIdx = PG_LEVELS.indexOf(pgSel.level);
+  const blank = () => ({ visited: 0, disc: 0, discPaid: 0, tg: 0, tgPaid: 0, paid: 0 });
+  const total = blank();
+  const byUnit = new Map();
+  pgDrive.rows.forEach(r => {
+    if (!pgUnitMatches(r.u)) return;
+    if (pgSel.group !== "ALL" && r.grp !== pgSel.group) return;
+    if (pgSel.meter !== "ALL" && r.meter !== pgSel.meter) return;
+    const pay = pays[r.acct] || "";
+    const paidAfter = !!pay && pay >= r.date;
+    const add = t => {
+      t.visited++;
+      if (isDisconnectedStatus(r.status)) { t.disc++; if (paidAfter) t.discPaid++; }
+      else if (r.status.indexOf("TIME GIVEN") === 0) { t.tg++; if (paidAfter) t.tgPaid++; }
+      else if (r.status === "PAID") t.paid++;
+    };
+    add(total);
+    const name = r.u[levelIdx];
+    if (!byUnit.has(name)) byUnit.set(name, blank());
+    add(byUnit.get(name));
+  });
+  const fn = t => [pgN(t.visited), pgN(t.disc), pgN(t.discPaid), pgN(t.tg), pgN(t.tgPaid), pgN(t.paid)];
+  const head = [PG_LEVEL_LABEL[pgSel.level], "Visited", "Disconnected", "Paid after disconnection",
+    "Time given", "Time given → paid", "Paid at visit"];
+  const rows = dlSortValues(Array.from(byUnit.keys())).map(n => [escapeHtml(pgLabel(n))].concat(fn(byUnit.get(n))));
+  let note = '<div class="pg-note">This month, latest visit per consumer. Summary last updated: ' +
+    new Date(pgDrive.at).toLocaleString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }) + "</div>";
+  if (pgDrive.missing) note += '<div class="pg-note">' + pgN(pgDrive.missing) + " visited consumers are not in this master and are not counted.</div>";
+  return note + pgTable(head, rows, ["Total"].concat(fn(total)));
+}
+
+/* ---------- screen ---------- */
+async function pgRender() {
+  if (!pgData || !$("progressCard") || $("progressCard").classList.contains("hidden")) return;
+  const ctx = pgData.ctx;
+  pgPeriodButtons(ctx);
+  pgSetSwitches();
+  const col = pgCollect();
+  const billed = col.total.billed;
+  $("pgAsOf").textContent = "Data up to " + formatListDate(ctx.report) + " · billing month " +
+    PG_MONTHS[Number(ctx.billingMonth.slice(5, 7)) - 1] + " " + ctx.billingMonth.slice(0, 4) +
+    " · " + PG_GROUP_LABEL[pgSel.group] + (pgSel.meter === "ALL" ? "" : pgSel.meter === "S" ? " · smart meters" : " · non-smart meters");
+  $("pgRevenue").innerHTML = pgRevenueHtml(col, ctx);
+  $("pgTurnUp").innerHTML = pgTurnUpHtml(col, ctx);
+  $("pgBilling").innerHTML = pgBillingHtml(col);
+  $("pgRemark").innerHTML = pgCountHtml(col.total.remark, billed);
+  $("pgBasis").innerHTML = pgCountHtml(col.total.basis, billed);
+  $("pgUnpaid").innerHTML = pgUnpaidHtml(col);
+  const payKey = pgData.key + "|" + (pgDrive ? pgDrive.at : "");
+  if (!pgPaysCache || pgPaysCache.key !== payKey) {
+    pgPaysCache = { key: payKey, pays: await pgDrivePays() };
+  }
+  $("pgDrive").innerHTML = pgDriveHtml(pgPaysCache.pays);
+}
+
+async function openProgress() {
+  if (!state.masterReady || !state.masterDb) {
+    alert("Master Data is not ready yet. Please wait for the master to finish loading.");
+    return;
+  }
+  if (pgBusy) return;
+  pgLoadSel();
+  pgLoadDrive();
+  showMainView("progressCard");
+  window.scrollTo(0, 0);
+
+  const ctx = pgContext();
+  if (!pgData || pgData.key !== ctx.key) {
+    pgBusy = true;
+    showGlobalLoading("Preparing Progress…", "Reading the Master Data on this phone. This takes a few seconds.");
+    try {
+      pgData = await pgCompute(ctx);
+    } catch (e) {
+      console.error(e);
+      alert("Could not read Master Data. " + (e.message || ""));
+      return;
+    } finally {
+      pgBusy = false;
+      hideGlobalLoading();
+    }
+  }
+  pgRefreshDropdowns();
+  await pgRender();
+  if (!pgDrive && navigator.onLine) pgRefreshDrive();
+}
+
+function closeProgress() {
+  showMainView("home");
+}
+
+(() => {
+  return;   /* v19.1: the Progress tab now lives in progress.js; this old block is switched off */
+  if (typeof MAIN_VIEW_IDS !== "undefined") {
+    ["progressCard", "progressModuleCard"].forEach(id => { if (MAIN_VIEW_IDS.indexOf(id) === -1) MAIN_VIEW_IDS.push(id); });
+  }
+  if ($("openProgressBtn")) $("openProgressBtn").addEventListener("click", openProgress);
+  if ($("pgCloseBtn")) $("pgCloseBtn").addEventListener("click", closeProgress);
+  if ($("pgDriveRefreshBtn")) $("pgDriveRefreshBtn").addEventListener("click", pgRefreshDrive);
+
+  [["pgSdo", "sdo", ["sub", "feeder", "village"]], ["pgSub", "sub", ["feeder", "village"]],
+   ["pgFeeder", "feeder", ["village"]], ["pgVillage", "village", []]].forEach(([id, key, below]) => {
+    if (!$(id)) return;
+    $(id).addEventListener("change", () => {
+      pgSel[key] = $(id).value;
+      below.forEach(k => { pgSel[k] = ""; });
+      pgRefreshDropdowns();
+      pgSaveSel();
+      pgRender();
+    });
+  });
+
+  [["pgGroup", "group"], ["pgMeter", "meter"], ["pgLevel", "level"], ["pgCompare", "compare"], ["pgPeriod", "period"]]
+    .forEach(([id, key]) => {
+      if (!$(id)) return;
+      $(id).addEventListener("click", e => {
+        const b = e.target.closest("button[data-v]");
+        if (!b) return;
+        pgSel[key] = b.dataset.v;
+        pgSaveSel();
+        pgRender();
+      });
+    });
+})();
+
+v151InitMyCollection();
+
+initLanguageSwitch();
+init();
+requestPersistentStorage();
+
+
+
+async function v151ExportLocalData() {
+  const surveys=await getAllRecords();
+  const disconnections=await getAllFromStore("disconnections");
+  const rechecks=await getAllFromStore("rechecks");
+  const phoneCalls=await getAllFromStore("phoneCalls");
+  const files=[];
+
+
+  if(surveys.length) files.push({name:"Door_to_Door_Survey",headers:["Survey Type","Survey Status","Connection Type","Survey ID","User ID","User Name","Account ID","Consumer Name","Father/Husband","Address","Supply Type","Load","SDO Code","Village","Substation","Feeder","DT","Theft Possibility","Feeded Village Name","Connection Status","Last Pay Date","Last Pay Amount","Nature of Supply","House Condition","Consumer Payment Response","Consumer Payment Date","Meter Condition","AC Installed","Mobile Number","House Locked","Mobile Refused","Meter Installed","Meter Number","Master Reading","Site Reading","Site Max Demand","Outstanding","Connected Load","Remarks","Latitude","Longitude","GPS Accuracy","Created At","Upload Status"],rows:surveys.map(r=>[r.survey_type||"",r.survey_status||"",r.connection_type||"",r.survey_id||"",r.user_id||"",r.user_name||"",r.account_id||"",r.consumer_name||"",r.father_name||"",r.address||"",r.supply_type||"",r.load||"",r.sdo_code||"",r.village||"",r.feeder_substation||"",r.feeder||"",r.dt||"",r.theft_possibility||"",r.feeded_village_name||"",r.connection_status||"",r.last_pay_date||"",r.last_pay_amount||"",r.nature_of_supply||"",r.house_condition||"",r.consumer_payment_response||"",r.consumer_payment_date||"",r.meter_condition||"",r.ac_installed||"",r.mobile_number||"",r.house_locked||"",r.mobile_refused||"",r.meter_installed||"",r.meter_number||"",r.current_reading||"",r.site_reading||"",r.site_max_demand||"",r.outstanding||"",r.connected_load||"",r.remarks||"",r.latitude||"",r.longitude||"",r.gps_accuracy||"",v1511ISTDateTime(r.created_at)||"",r.upload_status||"PENDING"]) });
+  if(disconnections.length) files.push({name:"Disconnections",headers:["Disconnection ID","User ID","User Name","Account ID","Consumer Name","Father/Husband","Address","Supply Type","Load","SDO Code","Disconnection Status","Payment Mode","Committed Payment Date","Meter Status","Site Reading","Mobile Number","House Condition","Total Outstanding","Remarks","Latitude","Longitude","GPS Accuracy","Created At","Last Updated By User ID","Last Updated By Name","Last Updated At","Feeded Village Name","Connection Status","Last Pay Date","Last Pay Amount","Upload Status"],rows:disconnections.map(r=>[r.disconnection_id||"",r.user_id||"",r.user_name||"",r.account_id||"",r.consumer_name||"",r.father_name||"",r.address||"",r.supply_type||"",r.load||"",r.sdo_code||"",r.disconnection_status||"",r.payment_mode||"",r.committed_payment_date||"",r.meter_status||"",r.current_reading||"",r.mobile_number||"",r.house_condition||"",r.outstanding||"",r.remarks||"",r.latitude||"",r.longitude||"",r.gps_accuracy||"",v1511ISTDateTime(r.created_at)||"",r.last_updated_by_user_id||"",r.last_updated_by_name||"",v1511ISTDateTime(r.last_updated_at)||"",r.feeded_village_name||"",r.connection_status||"",r.last_pay_date||"",r.last_pay_amount||"",r.upload_status||"PENDING"]) });
+  if(rechecks.length) files.push({name:"Rechecking",headers:["Recheck ID","User ID","User Name","Account ID","Consumer Name","Father/Husband","Address","Supply Type","Load","SDO Code","Total Outstanding","Present Status","Payment Mode","Payment Date","Meter Status","Site Reading","Mobile Number","Remarks","Latitude","Longitude","GPS Accuracy","Created At","Last Updated By User ID","Last Updated By Name","Last Updated At","Feeded Village Name","Connection Status","Last Pay Date","Last Pay Amount","Upload Status"],rows:rechecks.map(r=>[r.recheck_id||"",r.user_id||"",r.user_name||"",r.account_id||"",r.consumer_name||"",r.father_name||"",r.address||"",r.supply_type||"",r.load||"",r.sdo_code||"",r.outstanding||"",r.present_status||"",r.payment_mode||"",r.payment_date||"",r.meter_status||"",r.current_reading||"",r.mobile_number||"",r.remarks||"",r.latitude||"",r.longitude||"",r.gps_accuracy||"",v1511ISTDateTime(r.created_at)||"",r.last_updated_by_user_id||"",r.last_updated_by_name||"",v1511ISTDateTime(r.last_updated_at)||"",r.feeded_village_name||"",r.connection_status||"",r.last_pay_date||"",r.last_pay_amount||"",r.upload_status||"PENDING"]) });
+  if(phoneCalls.length) files.push({name:"Phone_Calling",headers:["Calling ID","User ID","User Name","Account ID","Consumer Name","Father/Husband","Address","Supply Type","Load","SDO Code","Mobile Number","Call Response","Committed Payment Date","Remarks","Created At","Total Outstanding","Last Updated By User ID","Last Updated By Name","Last Updated At","Feeded Village Name","Connection Status","Last Pay Date","Last Pay Amount","Upload Status"],rows:phoneCalls.map(r=>[r.calling_id||"",r.user_id||"",r.user_name||"",r.account_id||"",r.consumer_name||"",r.father_name||"",r.address||"",r.supply_type||"",r.load||"",r.sdo_code||"",r.mobile_number||"",r.call_response||"",r.committed_payment_date||r.payment_date||"",r.remarks||"",v1511ISTDateTime(r.created_at)||"",r.outstanding||"",r.last_updated_by_user_id||"",r.last_updated_by_name||"",v1511ISTDateTime(r.last_updated_at)||"",r.feeded_village_name||"",r.connection_status||"",r.last_pay_date||"",r.last_pay_amount||"",r.upload_status||"PENDING"]) });
+
+  if(!files.length){ alert("No local data to export."); return; }
+  const d=new Date(), pad=n=>String(n).padStart(2,"0"), stamp=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+  const downloadCsv=(file,delay)=>setTimeout(()=>{
+    const csv=[file.headers,...file.rows].map(row=>row.map(v=>`"${String(v==null?"":v).replace(/"/g,'""')}"`).join(",")).join("\r\n");
+    const blob=new Blob(["\ufeff"+csv],{type:"text/csv;charset=utf-8"});
+    const url=URL.createObjectURL(blob), a=document.createElement("a");
+    a.href=url; a.download=`${file.name}_${stamp}.csv`; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  },delay);
+  files.forEach((file,i)=>downloadCsv(file,i*700));
+}
