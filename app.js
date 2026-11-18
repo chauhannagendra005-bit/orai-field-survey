@@ -4871,6 +4871,18 @@ function xlsxToConsumer(row, header) {
 
 
 function setMasterGate(locked) {
+  /* ORAI: an admin can use Admin / Dashboard even before any
+     consumer master exists (search stays blocked until it loads). */
+  if (locked && state.isAdmin) {
+    ["dashboardBtn","adminBtn","homeBtn"].forEach(id => {
+      const el=$(id);
+      if (el) el.disabled=false;
+    });
+    const out=$("logoutBtn");
+    if (out) out.disabled=false;
+    return;
+  }
+
   if (locked) {
     MAIN_VIEW_IDS.forEach(id => {
       const el=$(id);
