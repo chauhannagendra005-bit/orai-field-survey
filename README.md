@@ -1,6 +1,6 @@
 # Orai Fieldwork App (EDD-I Orai, DVVNL)
 
-Field survey PWA for Orai town, built from Kuthond Survey Application v20.19 (developed by Nikhil Jindal).
+Field survey PWA for Orai town, built from Kuthond Survey Application v20.19.
 
 ## Orai-specific changes
 - `app.js` → `SERVER_URL` is a placeholder: paste the Orai Apps Script Web App URL (ends in `/exec`).
