@@ -5,7 +5,7 @@
 */
 /* ORAI TOWN: paste the Web App URL of the Orai Apps Script deployment here
    (Deploy > Manage deployments > Web app URL ending in /exec). */
-const SERVER_URL = "https://script.google.com/macros/s/AKfycbwPJBZbrgaRT8wCFeeOzSJeVjiUF8aYhAEdeMBG-wQqIScCzpLXwZdE0_guq4jrMaKgJQ/exec";
+const SERVER_URL = "https://script.google.com/macros/s/AKfycbzM4cldusGnSdXWefQLi4R2c5qwag2n-wOL6O2Jevon8CaHJ8bze-twypQkOvkmMu92Gg/exec";
 
 const state = {
   consumers: [],
