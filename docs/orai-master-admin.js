@@ -177,7 +177,16 @@
     const billMissing = BILLING.filter(([, n]) => !has(n));
     const data = rows.slice(1).filter(r => r.some(v => String(v ?? "").trim() !== ""));
     const col = name => header.indexOf(norm(name));
-    const first = name => { const i = col(name); return i < 0 ? "" : String(data.find(r => String(r[i] ?? "").trim())?.[i] ?? "").trim(); };
+    const first = name => {
+      const i = col(name);
+      if (i < 0) return "";
+      const v = data.find(r => String(r[i] ?? "").trim())?.[i];
+      if (v instanceof Date && !isNaN(v)) {                 /* Excel date cell -> 2026-10-01 */
+        const d = new Date(v.getTime() - v.getTimezoneOffset() * 60000);
+        return d.toISOString().slice(0, 10);
+      }
+      return String(v ?? "").trim();
+    };
     const acctCol = col("acct_id");
     const accounts = acctCol < 0 ? 0 : data.filter(r => String(r[acctCol] ?? "").trim()).length;
 
@@ -196,7 +205,9 @@
     if (billMissing.length && !missing.length) {
       out += `<ul>` + billMissing.map(([l, , w]) => `<li>Missing ${escapeHtml(l)} — ${escapeHtml(w)}</li>`).join("") + `</ul>`;
     }
-    const bm = first("billing_month"), rd = first("report_date");
+    let bm = first("billing_month");
+    const rd = first("report_date");
+    if (/^\d{4}-\d{2}-\d{2}$/.test(bm)) bm = bm.slice(0, 7);
     if (bm || rd) out += `<br>Billing month: <b>${escapeHtml(bm || "-")}</b> · Data up to: <b>${escapeHtml(rd || "-")}</b>`;
     out += `</div>`;
     box.innerHTML = out;
