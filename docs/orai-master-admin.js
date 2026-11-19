@@ -68,6 +68,7 @@
         unzip or edit it — or a ready master XLSX. Every phone in the chosen
         scope loads it by itself on its next update check. (नया मास्टर अपलोड करें)</p>
 
+      <div id="omServer" class="om-box">Checking the Orai server…</div>
       <label for="omSdo">SDO code (only for the raw CCB file)</label>
       <input id="omSdo" value="SDO2334228" placeholder="SDO2334228 — or ALL; several: SDO2334228, SDO2334226">
 
@@ -101,7 +102,7 @@
     $("omFile").addEventListener("change", onPick);
     $("omSdo").addEventListener("change", () => { if ($("omFile").files[0]) onPick(); });
     $("omUploadBtn").addEventListener("click", upload);
-    $("omRefreshBtn").addEventListener("click", loadList);
+    $("omRefreshBtn").addEventListener("click", () => { checkServer(); loadList(); });
     $("omProgressBtn").addEventListener("click", () => {
       const b = $("progressBtn");
       if (b) b.click();
@@ -236,17 +237,59 @@
     return btoa(s);
   }
 
+  const OLD_SERVER_HELP = "The Orai server is still the OLD version. In Apps Script: (1) select all code and paste the new " +
+    "orai-server.gs, Save; (2) run setupOrai and allow Google Drive access; (3) Deploy > Manage deployments > pencil > " +
+    "Version: New version > Deploy. Then reopen this screen.";
+  const DRIVE_HELP = "The server is not allowed to use Google Drive yet. In Apps Script run setupOrai once and allow the " +
+    "permissions, then Deploy > Manage deployments > pencil > Version: New version > Deploy.";
+
+  /* Turns server / network errors into what the admin has to do. */
+  function explain(msg) {
+    const m = String(msg || "");
+    if (m.startsWith("\u2063")) return m;                       /* already explained */
+    const out = (() => {
+      if (/not set up on the Orai server/i.test(m)) return OLD_SERVER_HELP;
+      if (/authori[sz]ation|permission|DriveApp|Drive access|scopes/i.test(m)) return DRIVE_HELP + " (" + m + ")";
+      if (/Unexpected token|JSON|<!DOCTYPE|<html/i.test(m)) return "The server sent back an error page instead of data — usually " +
+        "Drive permission not given or the deployment not updated. " + DRIVE_HELP;
+      if (/exceeded maximum execution time|timed out/i.test(m)) return "The server took too long. Please try again.";
+      if (/Failed to fetch|Network problem|NetworkError/i.test(m)) return "Could not reach the server — check internet. (" + m.replace(/^Network problem: /, "") + ")";
+      if (/Login invalid|Admin access required/i.test(m)) return "Your login has expired. Log out and log in again as admin.";
+      return m;
+    })();
+    return "\u2063" + out;
+  }
+
   async function call(action, extra, tries = 3) {
     let last;
     for (let t = 1; t <= tries; t++) {
       try {
         const r = await adminRequest(action, extra);
-        if (r && (r.success || r.code === "AUTH" || t === tries)) return r;
+        if (r && (r.success || r.code === "AUTH" || t === tries ||
+            /not set up on the Orai server|Drive access|authori/i.test(r.message || ""))) {
+          if (r && !r.success) r.message = explain(r.message);
+          return r;
+        }
         last = r;
-      } catch (e) { last = { success: false, message: "Network problem: " + (e.message || e) }; }
-      await new Promise(r => setTimeout(r, 2000 * t));
+      } catch (e) { last = { success: false, message: explain("Network problem: " + (e.message || e)) }; }
+      if (t < tries) await new Promise(r => setTimeout(r, 2000 * t));
     }
+    if (last && !last.success) last.message = explain(last.message);
     return last;
+  }
+
+  async function checkServer() {
+    const box = $("omServer");
+    if (!box) return false;
+    box.innerHTML = "Checking the Orai server…";
+    const r = await call("server_info", {}, 1);
+    if (r && r.success) {
+      box.innerHTML = `<span class="om-ok">✓ Orai server ready for Master Data</span> <small>(${escapeHtml(r.version || "")})</small>`;
+      return true;
+    }
+    box.dataset.msg = ((r && r.message) || "No answer from server.").replace(/^\u2063/, "");
+    box.innerHTML = `<span class="om-bad">✗ Master Data upload will not work yet.</span><br>${escapeHtml(box.dataset.msg)}`;
+    return false;
   }
 
   async function upload() {
@@ -261,6 +304,8 @@
     bar.style.width = "0%";
     const say = (t, k) => setStatus("omStatus", t, k);
     try {
+      say("Checking the server…");
+      if (!(await checkServer())) throw new Error("\u2063" + ($("omServer").dataset.msg || "Server not ready."));
       say("Starting upload…");
       const st = await call("master_upload_start", {});
       if (!st.success) throw new Error(st.message || "Could not start the upload.");
@@ -286,7 +331,7 @@
       $("omFile").value = ""; $("omCheck").innerHTML = ""; $("omNotes").value = ""; picked = null;
       loadList();
     } catch (e) {
-      say(e.message || String(e), "error");
+      say(explain(e.message || String(e)).replace(/^\u2063/, ""), "error");
       btn.disabled = !picked;
     }
   }
@@ -296,7 +341,7 @@
     if (!box || !state.isAdmin) return;
     box.textContent = "Loading…";
     const r = await call("master_list", {}, 2);
-    if (!r || !r.success) { box.textContent = (r && r.message) || "Could not load the list."; return; }
+    if (!r || !r.success) { box.textContent = String((r && r.message) || "Could not load the list.").replace(/^\u2063/, ""); return; }
 
     const sel = $("omScope"), cur = sel.value;
     sel.innerHTML = (r.scopes || ["ALL"]).map(s =>
@@ -319,7 +364,7 @@
     box.querySelectorAll("[data-om-act]").forEach(b => b.addEventListener("click", async () => {
       if (!confirm("Make this older file the active master again? Phones will switch back to it.")) return;
       const x = await call("master_set_active", { master_file_id: b.getAttribute("data-om-act") }, 1);
-      alert(x.message || (x.success ? "Done." : "Failed."));
+      alert(String(x.message || (x.success ? "Done." : "Failed.")).replace(/^\u2063/, ""));
       loadList();
     }));
   }
@@ -327,7 +372,7 @@
   function init() {
     html();
     const adminBtn = $("adminBtn");
-    if (adminBtn) adminBtn.addEventListener("click", () => setTimeout(loadList, 300));
+    if (adminBtn) adminBtn.addEventListener("click", () => setTimeout(() => { checkServer(); loadList(); }, 300));
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
