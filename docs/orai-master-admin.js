@@ -87,6 +87,8 @@
       <div id="omStatus" class="status"></div>
 
       <h3>Masters on the server</h3>
+      <p class="muted" style="font-size:12px">When a new master is uploaded, the old one for the same scope is removed
+        automatically (Drive trash keeps it for 30 days). Phones replace their copy on the next update check.</p>
       <button id="omRefreshBtn" class="secondary" type="button">REFRESH LIST</button>
       <div id="omList" class="om-box">Not loaded yet.</div>
 
@@ -307,7 +309,7 @@
     if (!picked || !state.isAdmin) return;
     const scope = $("omScope").value || "ALL";
     if (!confirm(`Upload ${picked.name} (${picked.consumers.toLocaleString("en-IN")} consumers) for ` +
-        `${scope === "ALL" ? "ALL users" : scope}?\nIt replaces the current master for that scope.`)) return;
+        `${scope === "ALL" ? "ALL users" : scope}?\nThe current master for that scope will be removed automatically (its Drive files go to the Drive trash).`)) return;
 
     const btn = $("omUploadBtn"), bar = $("omBar");
     btn.disabled = true;

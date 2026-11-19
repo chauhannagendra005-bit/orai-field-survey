@@ -8,7 +8,7 @@
  * and show it on the open after that.
  */
 
-const CACHE_VERSION = "orai-v20.19.12";
+const CACHE_VERSION = "orai-v20.19.13";
 const CACHE_PREFIX = "orai-fieldwork-pwa-";
 const CACHE = CACHE_PREFIX + CACHE_VERSION;
 

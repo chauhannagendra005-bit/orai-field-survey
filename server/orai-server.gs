@@ -38,7 +38,7 @@ const U = {ID:1, NAME:2, HASH:3, ACTIVE:4, TOKEN:5, ADMIN:6, ROLE:7, DIVISION:8,
 const USER_HEADERS = ['User ID','User Name','Password Hash','Active','Auth Token','Admin',
                       'Role','Division','Subdivision','Substation'];
 
-const SERVER_VERSION = 'orai-server-3 (master in parts)';
+const SERVER_VERSION = 'orai-server-4 (old master auto-removed)';
 
 function doGet() {
   return json_({success:true, message:'Orai Fieldwork API is running', version:SERVER_VERSION});
@@ -521,17 +521,56 @@ function masterUploadFinish_(body) {
   folder.setName(stamp + '_' + scope.replace(/[^A-Za-z0-9-]+/g, '_') + '_' + fileName);
 
   const sh = getMastersSheet_();
-  /* The new master replaces the active master of the same scope. */
-  masterRows_().forEach(function(m) {
-    if (m.active && m.scope.toLowerCase() === scope.toLowerCase()) sh.getRange(m.row, M.ACTIVE).setValue('NO');
-  });
+  const old = masterRows_().filter(function(m) { return m.scope.toLowerCase() === scope.toLowerCase(); });
   sh.appendRow([folder.getId(), fileName, total, scope, 'YES', new Date(), admin.user_id,
                 Number(body.consumers) || '', String(body.billing_month || ''), String(body.report_date || ''),
                 String(body.notes || ''), parts]);
 
-  return json_({success:true, master_file_id:folder.getId(),
+  /* The new master replaces the old one(s) of the same scope: their rows are removed
+     and their Drive files go to the Drive trash (recoverable there for 30 days). */
+  const removed = removeMasters_(old);
+  cleanStaleUploads_(folder.getId());
+
+  return json_({success:true, master_file_id:folder.getId(), removed:removed,
                 message:'Master Data uploaded for ' + (scope === 'ALL' ? 'all users' : scope) +
-                        ' (' + parts + ' parts). Phones will load it on their next update check.'});
+                        ' (' + parts + ' parts).' + (removed ? ' Old master removed.' : '') +
+                        ' Phones will load it on their next update check.'});
+}
+
+function trashDriveItem_(id) {
+  try { DriveApp.getFolderById(id).setTrashed(true); return true; } catch (e) {}
+  try { DriveApp.getFileById(id).setTrashed(true); return true; } catch (e) {}
+  return false;
+}
+
+/* Delete rows bottom-up so row numbers stay right, and trash their Drive files. */
+function removeMasters_(list) {
+  if (!list.length) return 0;
+  const sh = getMastersSheet_();
+  list.slice().sort(function(a, b) { return b.row - a.row; }).forEach(function(m) {
+    trashDriveItem_(m.master_file_id);
+    sh.deleteRow(m.row);
+  });
+  return list.length;
+}
+
+/* Upload folders left behind by failed / abandoned uploads (older than 6 hours). */
+function cleanStaleUploads_(keepId) {
+  const cutoff = Date.now() - 6 * 3600 * 1000;
+  const it = getMasterFolder_().getFolders();
+  while (it.hasNext()) {
+    const f = it.next();
+    if (f.getId() !== keepId && /^_upload_\d+$/.test(f.getName()) && Number(f.getName().slice(8)) < cutoff) {
+      f.setTrashed(true);
+    }
+  }
+}
+
+/* Run once from Apps Script if you want to clear old masters now (keeps the active one per scope). */
+function removeOldMastersNow() {
+  const old = masterRows_().filter(function(m) { return !m.active; });
+  Logger.log('Removed ' + removeMasters_(old) + ' old master(s).');
+  cleanStaleUploads_('');
 }
 
 /* Admin can switch an older master back on (e.g. a wrong file was uploaded). */
