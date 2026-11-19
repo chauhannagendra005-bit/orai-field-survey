@@ -56,6 +56,9 @@
     if (/SU+S+H?[EIU]+L/.test(n)) return "Susheel Nagar";
     if (n.includes("RAHIYA")) return "Rahiya";
     if (n.includes("KARMER")) return "Karmer Road";
+    /* Any other substation written as NAME_12345 (rural ones): keep its name. */
+    const o = /^([A-Z][A-Z .\-]*[A-Z])_\d{5}$/.exec(s.trim());
+    if (o) return o[1];
     return "";
   }
 
