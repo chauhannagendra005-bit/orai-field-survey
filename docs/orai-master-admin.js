@@ -69,8 +69,8 @@
         scope loads it by itself on its next update check. (नया मास्टर अपलोड करें)</p>
 
       <div id="omServer" class="om-box">Checking the Orai server…</div>
-      <label for="omSdo">SDO code (only for the raw CCB file)</label>
-      <input id="omSdo" value="SDO2334228" placeholder="SDO2334228 — or ALL; several: SDO2334228, SDO2334226">
+      <label for="omSdo">SDOs to include (only for the raw CCB file) — ALL = full master</label>
+      <input id="omSdo" value="ALL" placeholder="ALL = full master (every SDO) · or e.g. SDO2334228 · several: SDO2334228, SDO2334226">
 
       <label for="omFile">Master file — CCB dump (.csv.gz / .csv) or ready master (.xlsx)</label>
       <input id="omFile" type="file" accept=".gz,.csv,.xlsx,.xls">

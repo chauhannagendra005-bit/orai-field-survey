@@ -6532,6 +6532,54 @@ async function downloadAssignedMaster(
     );
   }
 
+  /*
+   * ORAI: big masters are kept on the server in parts (~4 MB each)
+   * and downloaded one part at a time, each retried on its own.
+   */
+  if (Number(masterInfo.parts) > 0) {
+    const parts = Number(masterInfo.parts);
+    const out = new Uint8Array(totalSize);
+    let pos = 0;
+    for (let i = 0; i < parts; i++) {
+      updateMasterSetupUI(
+        "loading",
+        0,
+        `Downloading Master Data — part ${i + 1} of ${parts} (${Math.round(100 * pos / totalSize)}%)… keep the app open. (ऐप खुला रखें)`
+      );
+      if (typeof masterNotice === "function" && state.masterQuiet) {
+        masterNotice("New master downloading — part " + (i + 1) + " of " + parts + ". (नया मास्टर डाउनलोड हो रहा है)", "warn");
+      }
+      let res = null, lastErr = null;
+      for (let attempt = 1; attempt <= 4 && !res; attempt++) {
+        try {
+          const r = await serverPost("master_download_part", {
+            master_file_id: masterInfo.master_file_id,
+            index: i
+          });
+          if (!r.success) throw new Error(r.message || "Master part " + (i + 1) + " failed.");
+          res = r;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < 4) await new Promise(ok => setTimeout(ok, 3000 * attempt));
+        }
+      }
+      if (!res) {
+        throw new Error("Master Data download stopped at part " + (i + 1) + " of " + parts + ": " +
+          ((lastErr && lastErr.message) || "no answer") + " — check internet and try again.");
+      }
+      const bytes = base64ToUint8Array(res.data || "");
+      if (pos + bytes.length > totalSize) {
+        throw new Error("Master Data download is larger than expected. Please try again.");
+      }
+      out.set(bytes, pos);
+      pos += bytes.length;
+    }
+    if (pos !== totalSize) {
+      throw new Error("Master Data download is incomplete. Received " + pos + " bytes out of " + totalSize + ".");
+    }
+    return out;
+  }
+
   updateMasterSetupUI(
     "loading",
     0,
