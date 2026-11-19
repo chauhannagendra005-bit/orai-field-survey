@@ -64,11 +64,15 @@
         #omSection .om-bar div{height:100%;width:0;background:#0d9488;transition:width .2s}
       </style>
       <h2>Master Data(मास्टर डेटा)</h2>
-      <p class="muted" style="font-size:13px">Upload the new consumer master (XLSX or CSV). Every phone in the chosen
+      <p class="muted" style="font-size:13px">Choose the monthly CCB file (DVVNL_DIV233422_MMM_YYYY .csv.gz) as it is — no need to
+        unzip or edit it — or a ready master XLSX. Every phone in the chosen
         scope loads it by itself on its next update check. (नया मास्टर अपलोड करें)</p>
 
-      <label for="omFile">Master file</label>
-      <input id="omFile" type="file" accept=".xlsx,.xls,.csv">
+      <label for="omSdo">SDO code (only for the raw CCB file)</label>
+      <input id="omSdo" value="SDO2334228" placeholder="SDO2334228 — or ALL; several: SDO2334228, SDO2334226">
+
+      <label for="omFile">Master file — CCB dump (.csv.gz / .csv) or ready master (.xlsx)</label>
+      <input id="omFile" type="file" accept=".gz,.csv,.xlsx,.xls">
       <div id="omCheck"></div>
 
       <label for="omScope">Who gets this master</label>
@@ -95,6 +99,7 @@
     card.insertBefore(sec, usersHead || null);
 
     $("omFile").addEventListener("change", onPick);
+    $("omSdo").addEventListener("change", () => { if ($("omFile").files[0]) onPick(); });
     $("omUploadBtn").addEventListener("click", upload);
     $("omRefreshBtn").addEventListener("click", loadList);
     $("omProgressBtn").addEventListener("click", () => {
@@ -116,6 +121,9 @@
     box.innerHTML = `<div class="om-box">Checking ${escapeHtml(f.name)} (${(f.size / 1048576).toFixed(1)} MB)…</div>`;
     await new Promise(r => setTimeout(r, 50));
     try {
+      if (window.OraiCCB && (/\.gz$/i.test(f.name) || (/\.csv$/i.test(f.name) && await OraiCCB.isCcb(f)))) {
+        return await fromCcb(f, box);
+      }
       const raw = new Uint8Array(await f.arrayBuffer());
       const isCsv = /\.csv$/i.test(f.name);
       /* CSV: keep every value as text so account / meter / mobile numbers stay exact. */
@@ -124,53 +132,102 @@
       const ws = wb.Sheets[wb.SheetNames[0]];
       if (!ws || !ws["!ref"]) throw new Error("The file has no data sheet.");
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true, range: 0 });
-      const header = (rows[0] || []).map(norm);
-      const has = names => names.some(n => header.includes(norm(n)));
-      const missing = REQUIRED.filter(([, n]) => !has(n)).map(([l]) => l);
-      const billOk = BILLING.filter(([, n]) => has(n));
-      const billMissing = BILLING.filter(([, n]) => !has(n));
-      const data = rows.slice(1).filter(r => r.some(v => String(v ?? "").trim() !== ""));
-      const col = name => header.indexOf(norm(name));
-      const first = name => { const i = col(name); return i < 0 ? "" : String(data.find(r => String(r[i] ?? "").trim())?.[i] ?? "").trim(); };
-      const acctCol = col("acct_id");
-      const accounts = acctCol < 0 ? 0 : data.filter(r => String(r[acctCol] ?? "").trim()).length;
-
-      let out = `<div class="om-box"><b>${escapeHtml(f.name)}</b> — ${accounts.toLocaleString("en-IN")} consumers<br>`;
-      if (missing.length) {
-        out += `<span class="om-bad">Cannot be used: required columns missing</span><ul>` +
-          missing.map(m => `<li>${escapeHtml(m)}</li>`).join("") + `</ul>`;
-      } else {
-        out += `<span class="om-ok">✓ All required columns present — search and survey will work.</span>`;
-      }
-      if (!has(["last_bill_date"])) {
-        out += `<br><span class="om-warn">⚠ No LAST_BILL_DATE column — the Billed / Unbilled report will show 0 billed.</span>`;
-      } else {
-        out += `<br><span class="om-ok">✓ Billed / Unbilled report: ${billOk.length} of ${BILLING.length} report columns present.</span>`;
-      }
-      if (billMissing.length && !missing.length) {
-        out += `<ul>` + billMissing.map(([l, , w]) => `<li>Missing ${escapeHtml(l)} — ${escapeHtml(w)}</li>`).join("") + `</ul>`;
-      }
-      const bm = first("billing_month"), rd = first("report_date");
-      if (bm || rd) out += `<br>Billing month: <b>${escapeHtml(bm || "-")}</b> · Data up to: <b>${escapeHtml(rd || "-")}</b>`;
-      out += `</div>`;
-      box.innerHTML = out;
-      if (missing.length) return;
-      if (!accounts) { box.innerHTML += `<div class="om-box om-bad">No consumer rows found.</div>`; return; }
-
-      /* Phones read XLSX; a CSV / XLS is converted here. */
-      const bytes = /\.xlsx$/i.test(f.name) ? raw
-        : new Uint8Array(XLSX.write(wb, { type: "array", bookType: "xlsx", compression: true }));
-      picked = {
-        bytes,
-        name: f.name.replace(/\.(csv|xls)$/i, ".xlsx"),
-        consumers: accounts,
-        billing_month: bm,
-        report_date: rd
-      };
-      $("omUploadBtn").disabled = false;
+      await finish(rows, f.name.replace(/\.(csv|xls)$/i, ".xlsx"), /\.xlsx$/i.test(f.name) ? raw : null, wb, "");
     } catch (e) {
       box.innerHTML = `<div class="om-box om-bad">Could not read the file: ${escapeHtml(e.message || String(e))}</div>`;
     }
+  }
+
+  /* Raw CCB dump -> master rows, converted here on this device. */
+  async function fromCcb(f, box) {
+    const txt = $("omSdo").value.trim().toUpperCase();
+    const sdos = (!txt || txt === "ALL") ? [] : txt.split(/[\s,;]+/).filter(Boolean);
+    const t0 = Date.now();
+    const show = (p, n) => {
+      box.innerHTML = `<div class="om-box">Converting CCB file ${escapeHtml(f.name)}… ${Math.round(100 * p)}% ` +
+        `(${n.toLocaleString("en-IN")} rows read) — keep this screen open.<div class="om-bar"><div style="width:${Math.round(100 * p)}%"></div></div></div>`;
+    };
+    show(0, 0);
+    const { rows, stats } = await OraiCCB.convert(f, sdos, show);
+    box.innerHTML = `<div class="om-box">Making the master file (${stats.kept.toLocaleString("en-IN")} consumers)…</div>`;
+    await new Promise(r => setTimeout(r, 30));
+    const N = n => Number(n).toLocaleString("en-IN");
+    const subs = Object.entries(stats.bySub).sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${escapeHtml(k)} ${N(v)}`).join(" · ");
+    const sdoTxt = Object.entries(stats.sdoCount).map(([k, v]) => `${escapeHtml(k)} ${N(v)}`).join(" · ");
+    const info = `<div class="om-box"><b>CCB file converted</b> in ${Math.round((Date.now() - t0) / 1000)} s<br>` +
+      `SDOs in file: ${sdoTxt}<br>Kept: <b>${sdos.length ? escapeHtml(sdos.join(", ")) : "all SDOs"}</b> — ` +
+      `${N(stats.kept)} consumers (${N(stats.dropped)} NC Reject / Rejected left out)<br>` +
+      `Billing month <b>${escapeHtml(stats.billingMonth)}</b>, data up to <b>${escapeHtml(stats.reportDate)}</b><br>` +
+      `Billable ${N(stats.billable)} · Billed ${N(stats.billed)} · <b>Unbilled ${N(stats.billable - stats.billed)}</b> · ` +
+      `Collection ₹${N(Math.round(stats.collection))}<br>` +
+      `Substations: ${subs}${stats.fromBook ? ` <small>(${N(stats.fromBook)} placed by book number)</small>` : ""}</div>`;
+    const name = "Orai_Master_" + (sdos.length === 1 ? sdos[0] + "_" : "") + (stats.billingMonth || "CCB") + ".xlsx";
+    await finish(rows, name, null, null, info);
+  }
+
+  /* Column check, then keep the XLSX bytes ready for upload. */
+  async function finish(rows, outName, rawXlsx, wb, extraHtml) {
+    const box = $("omCheck");
+    const header = (rows[0] || []).map(norm);
+    const has = names => names.some(n => header.includes(norm(n)));
+    const missing = REQUIRED.filter(([, n]) => !has(n)).map(([l]) => l);
+    const billOk = BILLING.filter(([, n]) => has(n));
+    const billMissing = BILLING.filter(([, n]) => !has(n));
+    const data = rows.slice(1).filter(r => r.some(v => String(v ?? "").trim() !== ""));
+    const col = name => header.indexOf(norm(name));
+    const first = name => { const i = col(name); return i < 0 ? "" : String(data.find(r => String(r[i] ?? "").trim())?.[i] ?? "").trim(); };
+    const acctCol = col("acct_id");
+    const accounts = acctCol < 0 ? 0 : data.filter(r => String(r[acctCol] ?? "").trim()).length;
+
+    let out = extraHtml + `<div class="om-box"><b>${escapeHtml(outName)}</b> — ${accounts.toLocaleString("en-IN")} consumers<br>`;
+    if (missing.length) {
+      out += `<span class="om-bad">Cannot be used: required columns missing</span><ul>` +
+        missing.map(m => `<li>${escapeHtml(m)}</li>`).join("") + `</ul>`;
+    } else {
+      out += `<span class="om-ok">✓ All required columns present — search and survey will work.</span>`;
+    }
+    if (!has(["last_bill_date"])) {
+      out += `<br><span class="om-warn">⚠ No LAST_BILL_DATE column — the Billed / Unbilled report will show 0 billed.</span>`;
+    } else {
+      out += `<br><span class="om-ok">✓ Billed / Unbilled report: ${billOk.length} of ${BILLING.length} report columns present.</span>`;
+    }
+    if (billMissing.length && !missing.length) {
+      out += `<ul>` + billMissing.map(([l, , w]) => `<li>Missing ${escapeHtml(l)} — ${escapeHtml(w)}</li>`).join("") + `</ul>`;
+    }
+    const bm = first("billing_month"), rd = first("report_date");
+    if (bm || rd) out += `<br>Billing month: <b>${escapeHtml(bm || "-")}</b> · Data up to: <b>${escapeHtml(rd || "-")}</b>`;
+    out += `</div>`;
+    box.innerHTML = out;
+    if (missing.length) return;
+    if (!accounts) { box.innerHTML += `<div class="om-box om-bad">No consumer rows found.</div>`; return; }
+
+    /* Phones read XLSX: anything else is written as XLSX here. */
+    let bytes = rawXlsx;
+    if (!bytes && !wb && window.OraiCCB && typeof CompressionStream !== "undefined") {
+      box.innerHTML += `<div class="om-box" id="omMaking">Making the XLSX file…</div>`;
+      await new Promise(r => setTimeout(r, 30));
+      bytes = await OraiCCB.buildXlsx(rows);
+      const mk = $("omMaking"); if (mk) mk.remove();
+    }
+    if (!bytes) {
+      if (!wb) {
+        wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), "Master");
+      }
+      bytes = new Uint8Array(XLSX.write(wb, { type: "array", bookType: "xlsx", compression: false, bookSST: true }));
+      if (window.OraiCCB) bytes = await OraiCCB.repackZip(bytes);
+    }
+    picked = { bytes, name: outName, consumers: accounts, billing_month: bm, report_date: rd };
+    box.innerHTML += `<div class="om-box">Ready to upload: ${(bytes.length / 1048576).toFixed(1)} MB.
+      <button class="small-btn" type="button" id="omSaveBtn">SAVE COPY OF MASTER</button></div>`;
+    $("omSaveBtn").addEventListener("click", () => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+      a.download = outName; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    });
+    $("omUploadBtn").disabled = false;
   }
 
   function toB64(u8) {

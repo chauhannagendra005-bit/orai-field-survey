@@ -8,7 +8,7 @@
  * and show it on the open after that.
  */
 
-const CACHE_VERSION = "orai-v20.19.6";
+const CACHE_VERSION = "orai-v20.19.7";
 const CACHE_PREFIX = "orai-fieldwork-pwa-";
 const CACHE = CACHE_PREFIX + CACHE_VERSION;
 
@@ -24,7 +24,8 @@ const REQUIRED = [
   "./style.css",
   "./progress.js",
   "./consumer-view.js",
-  "./orai-master-admin.js"
+  "./orai-master-admin.js",
+  "./orai-ccb-convert.js"
 ];
 
 /* Cached if present; a missing file does not block install. */
