@@ -69,6 +69,7 @@
         scope loads it by itself on its next update check. (नया मास्टर अपलोड करें)</p>
 
       <div id="omServer" class="om-box">Checking the Orai server…</div>
+      <div id="omDaily" class="om-box">Daily billed / unbilled update: checking…</div>
       <label for="omSdo">SDOs to include (only for the raw CCB file) — ALL = full master</label>
       <input id="omSdo" value="ALL" placeholder="ALL = full master (every SDO) · or e.g. SDO2334228 · several: SDO2334228, SDO2334226">
 
@@ -232,7 +233,7 @@
       bytes = new Uint8Array(XLSX.write(wb, { type: "array", bookType: "xlsx", compression: false, bookSST: true }));
       if (window.OraiCCB) bytes = await OraiCCB.repackZip(bytes);
     }
-    picked = { bytes, name: outName, consumers: accounts, billing_month: bm, report_date: rd };
+    picked = { bytes, name: outName, consumers: accounts, billing_month: bm, report_date: rd, base_id: first("base_id") };
     box.innerHTML += `<div class="om-box">Ready to upload: ${(bytes.length / 1048576).toFixed(1)} MB.
       <button class="small-btn" type="button" id="omSaveBtn">SAVE COPY OF MASTER</button></div>`;
     $("omSaveBtn").addEventListener("click", () => {
@@ -291,6 +292,23 @@
     return last;
   }
 
+  function showDaily(list) {
+    const box = $("omDaily");
+    if (!box) return;
+    if (!Array.isArray(list)) { box.innerHTML = "Daily billed / unbilled update: needs server version 5."; return; }
+    if (!list.length) {
+      box.innerHTML = `<b>Daily billed / unbilled update</b>: none yet. The PC job uploads it every day at 9:30 AM ` +
+        `from Documents\\DVVNL_Reports (BILLED_ / UNBILLED_ files).`;
+      return;
+    }
+    const d = list[0], N = n => Number(n || 0).toLocaleString("en-IN");
+    const at = new Date(d.at);
+    box.innerHTML = `<b>Daily billed / unbilled update</b>: <span class="om-ok">${escapeHtml(d.report_date || d.tag)}</span> — ` +
+      `billed ${N(d.billed)} · <b>unbilled ${N(d.unbilled)}</b> (month ${escapeHtml(d.billing_month)}) · uploaded ` +
+      `${isNaN(at) ? escapeHtml(d.at) : at.toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}. ` +
+      `Phones load it on their next sync.`;
+  }
+
   async function checkServer() {
     const box = $("omServer");
     if (!box) return false;
@@ -298,6 +316,7 @@
     const r = await call("server_info", {}, 1);
     if (r && r.success) {
       box.innerHTML = `<span class="om-ok">✓ Orai server ready for Master Data</span> <small>(${escapeHtml(r.version || "")})</small>`;
+      showDaily(r.daily);
       return true;
     }
     box.dataset.msg = ((r && r.message) || "No answer from server.").replace(/^\u2063/, "");
@@ -336,6 +355,7 @@
       const fin = await call("master_upload_finish", {
         upload_id: st.upload_id, parts, total_size: total, file_name: picked.name, scope,
         consumers: picked.consumers, billing_month: picked.billing_month, report_date: picked.report_date,
+        base_id: picked.base_id || "",
         notes: $("omNotes").value.trim()
       }, 1);
       if (!fin.success) throw new Error(fin.message || "Upload could not be saved.");

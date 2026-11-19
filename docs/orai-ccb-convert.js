@@ -16,7 +16,7 @@
     "CON_STATUS", "SERIAL_NBR", "TOTAL_OUTSTANDING", "CLOSE_READING", "MOBILE_NO", "LAST_PAY_DATE", "LAST_PAY_AMOUNT",
     "SUBSTATION", "FEEDER", "LAST_BILL_DATE", "BILLING_MONTH", "REPORT_DATE", "CUR_ASSESSMENT", "PREV_ASSESSMENT",
     "THIS_MONTH_TOTAL_PAY_AMT", "MR_SOURCE_CD", "CONSUMPTION_CURR_MNTH", "CONSUMPTION_PREV_MNTH",
-    "CONSUMPTION_PREV_TO_PREV_MNTH", "DOC", "BILL_BASIS", "METER_READ_REMARK", "SBM_MACHINE_ID"];
+    "CONSUMPTION_PREV_TO_PREV_MNTH", "DOC", "BILL_BASIS", "METER_READ_REMARK", "SBM_MACHINE_ID", "BASE_ID"];
   const NUMERIC = new Set(["LOAD", "TOTAL_OUTSTANDING", "CLOSE_READING", "LAST_PAY_AMOUNT", "CUR_ASSESSMENT",
     "THIS_MONTH_TOTAL_PAY_AMT", "CONSUMPTION_CURR_MNTH", "CONSUMPTION_PREV_MNTH", "CONSUMPTION_PREV_TO_PREV_MNTH"]);
   const NEEDED = ["ACCT_ID", "SDO_CODE", "NAME", "FATHER_NAME", "ADDRESS", "HABITAT_NAME", "VILLAGE_NAME", "SUPPLY_TYPE",
@@ -213,8 +213,11 @@
     const stats = { seen, kept: recs.length, dropped, dup, fromBook, sdoCount, billingMonth, reportDate,
       billable: 0, billed: 0, collection: 0, bySub: {} };
     const rows = [MASTER_COLS];
+    /* One id per master: daily billed/unbilled updates are built for, and only applied to, this master. */
+    const baseId = "ORAI-" + (billingMonth || "M") + "-" + Date.now().toString(36);
+    stats.baseId = baseId;
     for (const c of recs) {
-      c.BILLING_MONTH = billingMonth; c.REPORT_DATE = reportDate;
+      c.BILLING_MONTH = billingMonth; c.REPORT_DATE = reportDate; c.BASE_ID = baseId;
       if (BILLABLE.has(c.CON_STATUS.toUpperCase().replace(/\s+/g, ""))) {
         stats.billable++;
         if (c.LAST_BILL_DATE.slice(0, 7) === billingMonth) stats.billed++;

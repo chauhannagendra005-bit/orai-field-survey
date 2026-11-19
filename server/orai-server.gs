@@ -38,7 +38,7 @@ const U = {ID:1, NAME:2, HASH:3, ACTIVE:4, TOKEN:5, ADMIN:6, ROLE:7, DIVISION:8,
 const USER_HEADERS = ['User ID','User Name','Password Hash','Active','Auth Token','Admin',
                       'Role','Division','Subdivision','Substation'];
 
-const SERVER_VERSION = 'orai-server-4 (old master auto-removed)';
+const SERVER_VERSION = 'orai-server-5 (daily billed/unbilled)';
 
 function doGet() {
   return json_({success:true, message:'Orai Fieldwork API is running', version:SERVER_VERSION});
@@ -50,7 +50,8 @@ function serverInfo_(body) {
   try {
     const f = getMasterFolder_();
     getMastersSheet_();
-    return json_({success:true, version:SERVER_VERSION, drive_ok:true, folder:f.getName()});
+    getDailySheet_();
+    return json_({success:true, version:SERVER_VERSION, drive_ok:true, folder:f.getName(), daily:dailySummary_()});
   } catch (e) {
     return json_({success:false, version:SERVER_VERSION, drive_ok:false,
       message:'Google Drive access is not allowed yet: open Apps Script, run setupOrai and allow the permissions. (' + e + ')'});
@@ -83,7 +84,10 @@ function doPost(e) {
     if (a === 'master_check') return masterCheck_(body);
     if (a === 'master_download') return masterDownload_(body);
     if (a === 'master_download_part') return masterDownloadPart_(body);
-    if (a === 'master_updates') return masterUpdates_(body);
+    if (a === 'master_updates') return masterUpdatesDaily_(body);
+    if (a === 'daily_info') return dailyInfo_(body);
+    if (a === 'daily_update_upload') return dailyUpdateUpload_(body);
+    if (a === 'daily_update_get') return dailyUpdateGet_(body);
     if (a === 'master_list') return masterList_(body);
     if (a === 'master_upload_start') return masterUploadStart_(body);
     if (a === 'master_upload_chunk') return masterUploadChunk_(body);
@@ -343,8 +347,8 @@ function masterLists_(body) {
 const MASTERS_SHEET = 'Masters';
 const MASTER_FOLDER_NAME = 'Orai Fieldwork Master Data';
 const MASTER_HEADERS = ['Master File ID','File Name','File Size','Scope','Active',
-                        'Uploaded At','Uploaded By','Consumers','Billing Month','Report Date','Notes','Parts'];
-const M = {ID:1, NAME:2, SIZE:3, SCOPE:4, ACTIVE:5, AT:6, BY:7, COUNT:8, BMONTH:9, RDATE:10, NOTES:11, PARTS:12};
+                        'Uploaded At','Uploaded By','Consumers','Billing Month','Report Date','Notes','Parts','Base ID'];
+const M = {ID:1, NAME:2, SIZE:3, SCOPE:4, ACTIVE:5, AT:6, BY:7, COUNT:8, BMONTH:9, RDATE:10, NOTES:11, PARTS:12, BASE:13};
 /* A master is kept in Drive as its upload parts (Base64 text, ~4 MB each) inside one folder,
    and phones download it part by part. The server never has to hold the whole file, so a
    full-division master (30 MB+) works within Apps Script limits. */
@@ -390,8 +394,11 @@ function masterRows_() {
       last_updated: r[M.AT-1] instanceof Date ? r[M.AT-1].toISOString() : String(r[M.AT-1] || ''),
       uploaded_by: String(r[M.BY-1] || ''),
       consumers: Number(r[M.COUNT-1]) || 0,
-      billing_month: String(r[M.BMONTH-1] || ''),
-      report_date: String(r[M.RDATE-1] || ''),
+      billing_month: r[M.BMONTH-1] instanceof Date ? Utilities.formatDate(r[M.BMONTH-1], Session.getScriptTimeZone(), 'yyyy-MM')
+                                                    : String(r[M.BMONTH-1] || '').replace(/^'/, ''),
+      report_date: r[M.RDATE-1] instanceof Date ? Utilities.formatDate(r[M.RDATE-1], Session.getScriptTimeZone(), 'yyyy-MM-dd')
+                                                : String(r[M.RDATE-1] || '').replace(/^'/, ''),
+      base_id: String(r[M.BASE-1] || '').replace(/^'/, ''),
       notes: String(r[M.NOTES-1] || ''),
       parts: Number(r[M.PARTS-1]) || 0
     });
@@ -469,7 +476,7 @@ function masterList_(body) {
     if (sub && scopes.indexOf(sub) === -1) scopes.push(sub);
   });
   const masters = masterRows_().reverse().slice(0, 20);
-  return json_({success:true, scopes:scopes, masters:masters});
+  return json_({success:true, scopes:scopes, masters:masters, daily:dailySummary_()});
 }
 
 /* ---------- Admin: upload in parts ----------
@@ -523,8 +530,8 @@ function masterUploadFinish_(body) {
   const sh = getMastersSheet_();
   const old = masterRows_().filter(function(m) { return m.scope.toLowerCase() === scope.toLowerCase(); });
   sh.appendRow([folder.getId(), fileName, total, scope, 'YES', new Date(), admin.user_id,
-                Number(body.consumers) || '', String(body.billing_month || ''), String(body.report_date || ''),
-                String(body.notes || ''), parts]);
+                Number(body.consumers) || '', "'" + String(body.billing_month || ''), "'" + String(body.report_date || ''),
+                String(body.notes || ''), parts, "'" + String(body.base_id || '')]);
 
   /* The new master replaces the old one(s) of the same scope: their rows are removed
      and their Drive files go to the Drive trash (recoverable there for 30 days). */
@@ -551,6 +558,9 @@ function removeMasters_(list) {
     trashDriveItem_(m.master_file_id);
     sh.deleteRow(m.row);
   });
+  /* daily updates built for those masters are of no use any more */
+  const ids = list.map(function(m) { return m.master_file_id; });
+  removeDailyRows_(dailyRows_().filter(function(d) { return ids.indexOf(d.master_file_id) !== -1; }));
   return list.length;
 }
 
@@ -595,6 +605,150 @@ function uploadFolder_(id) {
     if (!parents.hasNext() || parents.next().getId() !== getMasterFolder_().getId()) return null;
     return f;
   } catch (e) { return null; }
+}
+
+/* =========================================================
+ * DAILY BILLED / UNBILLED UPDATES
+ * =========================================================
+ * Every morning the PC job (Orai_Daily_Update.ps1) reads the newest
+ * BILLED_ / UNBILLED_ CCB pair, builds a small gzip "change file"
+ * (only bill date, MR source, units, reading, payments per consumer)
+ * and uploads it here. Phones that have the active master download the
+ * newest change file on their next sync and apply it on top of the
+ * master, so Progress > Billing shows this month's billed / unbilled.
+ * Only the newest few files are kept; older ones go to the Drive trash.
+ */
+const DAILY_SHEET = 'Daily Updates';
+const DAILY_HEADERS = ['Seq','Tag','Report Date','Billing Month','Base ID','Master File ID','File ID','Size',
+                       'Billed','Unbilled','Consumers','Uploaded At','Uploaded By'];
+const D = {SEQ:1, TAG:2, RDATE:3, BMONTH:4, BASE:5, MASTER:6, FILE:7, SIZE:8, BILLED:9, UNBILLED:10, COUNT:11, AT:12, BY:13};
+const DAILY_KEEP = 3;
+
+function getDailySheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(DAILY_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(DAILY_SHEET);
+    sh.getRange(1,1,1,DAILY_HEADERS.length).setValues([DAILY_HEADERS]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function getDailyFolder_() {
+  const parent = getMasterFolder_();
+  const it = parent.getFoldersByName('Daily Updates');
+  return it.hasNext() ? it.next() : parent.createFolder('Daily Updates');
+}
+
+function txt_(v) {                          /* keep "2026-11" as text, not a date */
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return String(v == null ? '' : v).replace(/^'/, '');
+}
+
+function dailyRows_() {
+  const data = getDailySheet_().getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[D.SEQ-1]) continue;
+    rows.push({row:i + 1, seq:Number(r[D.SEQ-1]), tag:txt_(r[D.TAG-1]), report_date:txt_(r[D.RDATE-1]),
+      billing_month:txt_(r[D.BMONTH-1]).slice(0, 7), base_id:txt_(r[D.BASE-1]), master_file_id:txt_(r[D.MASTER-1]),
+      file_id:txt_(r[D.FILE-1]), size:Number(r[D.SIZE-1]) || 0, billed:Number(r[D.BILLED-1]) || 0,
+      unbilled:Number(r[D.UNBILLED-1]) || 0, consumers:Number(r[D.COUNT-1]) || 0,
+      at:r[D.AT-1] instanceof Date ? r[D.AT-1].toISOString() : txt_(r[D.AT-1]), by:txt_(r[D.BY-1])});
+  }
+  return rows;
+}
+
+function latestDailyFor_(masterId) {
+  const rows = dailyRows_().filter(function(d) { return d.master_file_id === masterId; });
+  rows.sort(function(a, b) { return b.seq - a.seq; });
+  return rows[0] || null;
+}
+
+/* PC job asks this first: which master the update must be built for. */
+function dailyInfo_(body) {
+  if (!requireAdmin_(body)) return json_({success:false, code:'AUTH', message:'Admin access required.'});
+  const masters = masterRows_().filter(function(m) { return m.active; }).map(function(m) {
+    const d = latestDailyFor_(m.master_file_id);
+    return {scope:m.scope, master_file_id:m.master_file_id, base_id:m.base_id, file_name:m.file_name,
+            last_tag:d ? d.tag : '', last_report_date:d ? d.report_date : ''};
+  });
+  return json_({success:true, version:SERVER_VERSION, masters:masters});
+}
+
+function dailyUpdateUpload_(body) {
+  const admin = requireAdmin_(body);
+  if (!admin) return json_({success:false, code:'AUTH', message:'Admin access required.'});
+  const masterId = String(body.master_file_id || '');
+  const m = masterRows_().filter(function(x) { return x.active && x.master_file_id === masterId; })[0];
+  if (!m) return json_({success:false, message:'The master changed since this update was built. Run the update again.'});
+  const data = String(body.data || '');
+  if (!data) return json_({success:false, message:'Empty update.'});
+
+  const tag = String(body.tag || '');
+  const file = getDailyFolder_().createFile('daily_' + tag + '_' + Date.now() + '.b64', data, MimeType.PLAIN_TEXT);
+  const sh = getDailySheet_();
+  const all = dailyRows_();
+  const seq = all.reduce(function(a, d) { return Math.max(a, d.seq); }, 0) + 1;
+  sh.appendRow([seq, "'" + tag, "'" + String(body.report_date || ''), "'" + String(body.billing_month || ''),
+                "'" + m.base_id, m.master_file_id, file.getId(), Number(body.size) || 0,
+                Number(body.billed) || 0, Number(body.unbilled) || 0, Number(body.consumers) || 0, new Date(), admin.user_id]);
+
+  /* keep only the newest DAILY_KEEP updates (older files to the Drive trash) */
+  const old = dailyRows_().sort(function(a, b) { return b.seq - a.seq; }).slice(DAILY_KEEP);
+  removeDailyRows_(old);
+
+  return json_({success:true, seq:seq, message:'Daily update ' + tag + ' saved (billed ' + (Number(body.billed) || 0) +
+                ', unbilled ' + (Number(body.unbilled) || 0) + '). Phones load it on their next sync.'});
+}
+
+function removeDailyRows_(list) {
+  if (!list.length) return 0;
+  const sh = getDailySheet_();
+  list.slice().sort(function(a, b) { return b.row - a.row; }).forEach(function(d) {
+    try { DriveApp.getFileById(d.file_id).setTrashed(true); } catch (e) {}
+    sh.deleteRow(d.row);
+  });
+  return list.length;
+}
+
+/* Phone: the newest change file for its master (Base64 of the gzip). */
+function dailyUpdateGet_(body) {
+  const s = getUserByToken_(String(body.token || ''));
+  if (!s) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
+  const m = assignedMaster_(s);
+  const d = m ? dailyRows_().filter(function(x) { return x.seq === Number(body.seq) && x.master_file_id === m.master_file_id; })[0] : null;
+  if (!d) return json_({success:false, message:'This daily update is no longer available.'});
+  return json_({success:true, seq:d.seq, data:DriveApp.getFileById(d.file_id).getBlob().getDataAsString()});
+}
+
+/* Replaces the old masterUpdates_: tells the phone about a new master or the newest daily update. */
+function masterUpdatesDaily_(body) {
+  const s = getUserByToken_(String(body.token || ''));
+  if (!s) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
+  const m = assignedMaster_(s);
+  if (!m) return json_({success:true, available:false});
+  const phoneFile = String(body.master_file_id || '');
+  if (phoneFile ? phoneFile !== m.master_file_id : String(body.base_id || '') !== m.base_id) {
+    return json_({success:true, available:true, master_changed:true});
+  }
+  const d = latestDailyFor_(m.master_file_id);
+  if (!d) return json_({success:true, available:true, up_to_date:true});
+  if (d.seq > (Number(body.seq) || 0)) {
+    return json_({success:true, available:true, report_date:d.report_date, billing_month:d.billing_month,
+                  downloads:[{seq:d.seq, from_seq:0, server:true, size:d.size}]});
+  }
+  return json_({success:true, available:true, up_to_date:true, report_date:d.report_date});
+}
+
+function dailySummary_() {
+  const rows = dailyRows_().sort(function(a, b) { return b.seq - a.seq; });
+  return rows.map(function(d) {
+    return {seq:d.seq, tag:d.tag, report_date:d.report_date, billing_month:d.billing_month, billed:d.billed,
+            unbilled:d.unbilled, consumers:d.consumers, size:d.size, at:d.at, master_file_id:d.master_file_id};
+  });
 }
 
 function checkUploadStatus_(body) {

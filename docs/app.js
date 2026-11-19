@@ -13367,6 +13367,7 @@ async function syncMasterUpdates(force, fromButton) {
       masterNotice("Checking for daily master updates… (दैनिक अपडेट जाँच)", "info");
       const res = await serverPost("master_updates", {
         base_id: meta.base_id || "",
+        master_file_id: meta.master_file_id || "",
         seq: Number(meta.updates_seq) || 0
       });
       if (!res || !res.success || !res.available) { masterNotice(""); return; }
@@ -13399,16 +13400,25 @@ async function syncMasterUpdates(force, fromButton) {
         if (Number(d.from_seq) > (Number(meta.updates_seq) || 0)) break;   /* gap: next time */
         const which = "daily update " + d.seq + (files.length > 1 ? " (" + (n + 1) + " of " + files.length + ")" : "");
         masterNotice("Downloading " + which + (d.size ? ", " + formatBytes(d.size) : "") + "… (दैनिक अपडेट डाउनलोड)", "info");
-        const r = await fetch(d.url);
-        if (!r.ok) throw new Error("Update download failed (HTTP " + r.status + ")");
-        const file = await gunzipJson(await r.arrayBuffer());
+        let gz;
+        if (d.server) {
+          /* ORAI: the daily billed/unbilled update is kept on the Apps Script server */
+          const g = await serverPost("daily_update_get", { seq: d.seq });
+          if (!g || !g.success) throw new Error((g && g.message) || "Daily update download failed.");
+          gz = base64ToUint8Array(g.data || "");
+        } else {
+          const r = await fetch(d.url);
+          if (!r.ok) throw new Error("Update download failed (HTTP " + r.status + ")");
+          gz = await r.arrayBuffer();
+        }
+        const file = await gunzipJson(gz);
         total += await applyMasterChangeFile(file, meta, (done, all) => {
           masterNotice("Loading " + which + ": " + Math.round(100 * done / Math.max(all, 1)) + "% (" +
             done.toLocaleString("en-IN") + " of " + all.toLocaleString("en-IN") +
             " consumers) — keep the app open. (ऐप खुला रखें)", "warn");
         });
         meta = Object.assign({}, getLocalMasterMeta(), {
-          updates_seq: Number(file.seq) || 0,
+          updates_seq: Number(d.seq) || Number(file.seq) || 0,
           report_date: file.report_date || meta.report_date || "",
           billing_month: file.billing_month || meta.billing_month || "",
           reports: file.reports || meta.reports || {}
