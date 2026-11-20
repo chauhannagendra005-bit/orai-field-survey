@@ -38,7 +38,7 @@ const U = {ID:1, NAME:2, HASH:3, ACTIVE:4, TOKEN:5, ADMIN:6, ROLE:7, DIVISION:8,
 const USER_HEADERS = ['User ID','User Name','Password Hash','Active','Auth Token','Admin',
                       'Role','Division','Subdivision','Substation'];
 
-const SERVER_VERSION = 'orai-server-5 (daily billed/unbilled)';
+const SERVER_VERSION = 'orai-server-6 (disconnection report)';
 
 function doGet() {
   return json_({success:true, message:'Orai Fieldwork API is running', version:SERVER_VERSION});
@@ -85,6 +85,7 @@ function doPost(e) {
     if (a === 'master_download') return masterDownload_(body);
     if (a === 'master_download_part') return masterDownloadPart_(body);
     if (a === 'master_updates') return masterUpdatesDaily_(body);
+    if (a === 'disconnection_report') return disconnectionReport_(body);
     if (a === 'daily_info') return dailyInfo_(body);
     if (a === 'daily_update_upload') return dailyUpdateUpload_(body);
     if (a === 'daily_update_get') return dailyUpdateGet_(body);
@@ -751,6 +752,199 @@ function dailySummary_() {
   });
 }
 
+/* =========================================================
+ * DISCONNECTION / RECHECK / PHONE CALL ENTRIES + DISCONNECTION REPORT
+ * =========================================================
+ * Field entries arrive through the same 'upload' action as surveys,
+ * marked with activity_type. Each type has its own sheet; one row per
+ * visit, never merged with surveys. 'disconnection_report' feeds the
+ * Dashboard PDF reports (complete report, time given / paid / disconnected
+ * but not yet paid).
+ */
+const ACTIVITY = {
+  DISCONNECTION: {sheet:'Disconnections', id:'disconnection_id'},
+  RECHECK:       {sheet:'Rechecks',       id:'recheck_id'},
+  PHONE_CALLING: {sheet:'Phone Calls',    id:'calling_id'}
+};
+const ACT_HEADERS = ['Entry ID','Visit Date','Created At','User ID','User Name','User Subdivision','User Substation',
+  'Account ID','Consumer Name','Father Name','Address','Supply Type','Load','SDO Code','Village','Status',
+  'Payment Mode','Paid Amount','Committed Date','Outstanding','Meter Status','Current Reading','Mobile',
+  'Mobile Refused','House Condition','Remarks','Latitude','Longitude','GPS Accuracy','Data Up To','Uploaded At','Full Entry (JSON)'];
+const A = {}; ACT_HEADERS.forEach(function(h, i) { A[h] = i; });
+
+function activityType_(r) {
+  const t = String((r && r.activity_type) || '').trim().toUpperCase();
+  return ACTIVITY[t] ? t : '';
+}
+
+function getActivitySheet_(type) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const name = ACTIVITY[type].sheet;
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1,1,1,ACT_HEADERS.length).setValues([ACT_HEADERS]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function istDate_(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return Utilities.formatDate(d, 'Asia/Kolkata', 'yyyy-MM-dd');
+}
+
+function activityIds_(type) {
+  const sh = getActivitySheet_(type);
+  const n = sh.getLastRow() - 1;
+  const ids = new Set();
+  if (n > 0) sh.getRange(2, 1, n, 1).getValues().forEach(function(r) { if (r[0]) ids.add(String(r[0]).trim()); });
+  return ids;
+}
+
+/* Save activity entries; returns {uploaded, duplicates}. */
+function uploadActivities_(session, records) {
+  const out = {uploaded:0, duplicates:0};
+  const byType = {};
+  records.forEach(function(r) { const t = activityType_(r); (byType[t] = byType[t] || []).push(r); });
+  const users = getUsersSheet_().getDataRange().getValues();
+  let sub = '', subst = '';
+  for (let i = 1; i < users.length; i++) {
+    if (String(users[i][U.ID-1]).trim().toLowerCase() === String(session.user_id).toLowerCase()) {
+      sub = String(users[i][U.SUBDIVISION-1] || ''); subst = String(users[i][U.SUBSTATION-1] || ''); break;
+    }
+  }
+  Object.keys(byType).forEach(function(type) {
+    const sh = getActivitySheet_(type);
+    const ids = activityIds_(type);
+    const rows = [];
+    byType[type].forEach(function(r) {
+      const id = String(r[ACTIVITY[type].id] || '').trim();
+      if (!id) return;
+      if (ids.has(id)) { out.duplicates++; return; }
+      ids.add(id);
+      let json = JSON.stringify(r);
+      if (json.length > 45000) json = json.slice(0, 45000);
+      const status = r.disconnection_status || r.recheck_status || r.call_status || r.calling_status || r.status || '';
+      const row = new Array(ACT_HEADERS.length).fill('');
+      const put = function(h, v) { row[A[h]] = v == null ? '' : v; };
+      put('Entry ID', id); put('Visit Date', istDate_(r.created_at) || istDate_(new Date().toISOString()));
+      put('Created At', r.created_at); put('User ID', session.user_id); put('User Name', session.user_name || r.user_name);
+      put('User Subdivision', sub); put('User Substation', subst);
+      put('Account ID', "'" + String(r.account_id || '')); put('Consumer Name', r.consumer_name); put('Father Name', r.father_name);
+      put('Address', r.address); put('Supply Type', "'" + String(r.supply_type || '')); put('Load', r.load);
+      put('SDO Code', r.sdo_code); put('Village', r.feeded_village_name || r.village); put('Status', status);
+      put('Payment Mode', r.payment_mode); put('Paid Amount', r.paid_amount); put('Committed Date', r.committed_payment_date);
+      put('Outstanding', r.outstanding); put('Meter Status', r.meter_status); put('Current Reading', r.current_reading);
+      put('Mobile', "'" + String(r.mobile_number || '')); put('Mobile Refused', r.mobile_refused);
+      put('House Condition', r.house_condition); put('Remarks', r.remarks); put('Latitude', r.latitude);
+      put('Longitude', r.longitude); put('GPS Accuracy', r.gps_accuracy); put('Data Up To', r.master_data_up_to);
+      put('Uploaded At', new Date()); put('Full Entry (JSON)', json);
+      rows.push(row);
+    });
+    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, ACT_HEADERS.length).setValues(rows);
+    out.uploaded += rows.length;
+  });
+  return out;
+}
+
+/* Wraps the survey upload: activity entries go to their own sheets. */
+function upload_(body) {
+  const session = getUserByToken_(String(body.token || ''));
+  if (!session) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled. Please login again.'});
+  const all = body.records || [];
+  const acts = all.filter(function(r) { return activityType_(r); });
+  const surveys = all.filter(function(r) { return !activityType_(r); });
+  let uploaded = 0, duplicates = 0;
+  if (acts.length) {
+    const lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+    try { const a = uploadActivities_(session, acts); uploaded += a.uploaded; duplicates += a.duplicates; }
+    finally { lock.releaseLock(); }
+  }
+  if (surveys.length) {
+    const s = unwrap_(uploadSurveys_(Object.assign({}, body, {records:surveys})));
+    if (!s.success) return json_(s);
+    uploaded += Number(s.uploaded) || 0; duplicates += Number(s.duplicates) || 0;
+  }
+  return json_({success:true, uploaded:uploaded, duplicates:duplicates});
+}
+
+function unwrap_(out) {
+  return out && typeof out.getContent === 'function' ? JSON.parse(out.getContent()) : out;
+}
+
+/* Wraps the survey status check: also reports activity entries already on the server. */
+function syncUploadStatus_(body) {
+  const session = getUserByToken_(String(body.token || ''));
+  if (!session) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
+  const all = body.records || [];
+  const acts = all.filter(function(r) { return activityType_(r); });
+  const surveys = all.filter(function(r) { return !activityType_(r); });
+  const keys = [];
+  const idCache = {};
+  acts.forEach(function(r) {
+    const t = activityType_(r);
+    const id = String(r[ACTIVITY[t].id] || '').trim();
+    if (!idCache[t]) idCache[t] = activityIds_(t);
+    if (id && idCache[t].has(id)) keys.push(t + '|' + id);
+  });
+  if (surveys.length) {
+    const s = unwrap_(syncSurveyStatus_(Object.assign({}, body, {records:surveys})));
+    if (!s.success) return json_(s);
+    (s.present_keys || []).forEach(function(k) { keys.push(k); });
+  }
+  return json_({success:true, present_keys:keys});
+}
+
+/* Dashboard PDF: disconnection entries between two dates (yyyy-MM-dd, IST visit date). */
+function disconnectionReport_(body) {
+  const s = getUserByToken_(String(body.token || ''));
+  if (!s) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
+  const from = String(body.from_date || ''), to = String(body.to_date || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return json_({success:false, message:'Choose the report dates.'});
+  }
+  const scope = (function() {
+    if (s.is_admin) return 'ALL';
+    const r = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ROLES_SHEET);
+    let sc = '';
+    if (r) r.getDataRange().getValues().slice(1).forEach(function(x) {
+      if (String(x[0]).trim().toLowerCase() === String(s.role || '').toLowerCase()) sc = String(x[1]).trim().toUpperCase();
+    });
+    return sc === 'DIVISION' ? 'ALL' : sc === 'SUBDIVISION' ? 'SUBDIVISION' : 'OWN';
+  })();
+  const subs = String(body.substation || '').split('||').map(function(x) { return x.trim().toLowerCase(); }).filter(String);
+
+  const data = getActivitySheet_('DISCONNECTION').getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    let date = r[A['Visit Date']];
+    date = date instanceof Date ? Utilities.formatDate(date, 'Asia/Kolkata', 'yyyy-MM-dd') : String(date || '').slice(0, 10);
+    if (!date || date < from || date > to) continue;
+    const userId = String(r[A['User ID']] || '');
+    if (scope === 'OWN' && userId.toLowerCase() !== String(s.user_id).toLowerCase()) continue;
+    if (scope === 'SUBDIVISION' && String(r[A['User Subdivision']] || '').toLowerCase() !== String(s.subdivision || '').toLowerCase()) continue;
+    const userSubst = String(r[A['User Substation']] || '');
+    if (subs.length) {
+      const mine = userSubst.split(',').map(function(x) { return x.trim().toLowerCase(); });
+      if (!mine.some(function(x) { return subs.indexOf(x) !== -1; })) continue;
+    }
+    const v = function(h) { const x = r[A[h]]; return x instanceof Date ? Utilities.formatDate(x, 'Asia/Kolkata', 'yyyy-MM-dd') : String(x == null ? '' : x).replace(/^'/, ''); };
+    rows.push({
+      id:v('Entry ID'), date:date, account_id:v('Account ID'), consumer_name:v('Consumer Name'), father_name:v('Father Name'),
+      address:v('Address'), supply_type:v('Supply Type'), load:v('Load'), mobile:v('Mobile'), mobile_refused:v('Mobile Refused'),
+      latitude:v('Latitude'), longitude:v('Longitude'), outstanding:v('Outstanding'), visit_day_outstanding:'',
+      phone_data_up_to:v('Data Up To'), status:String(v('Status')).toUpperCase(), committed_date:v('Committed Date'),
+      payment_mode:v('Payment Mode'), paid_amount:v('Paid Amount'), user_id:userId, user_name:v('User Name'),
+      user_substation:userSubst, meter_status:v('Meter Status'), remarks:v('Remarks')
+    });
+  }
+  return json_({success:true, rows:rows, scope:scope});
+}
+
 function checkUploadStatus_(body) {
   const session = getUserByToken_(String(body.token || ''));
   if (!session) return json_({success:false, message:'Login invalid or user disabled.'});
@@ -786,7 +980,7 @@ function checkUploadStatus_(body) {
   return json_({success:true,uploaded_keys:found});
 }
 
-function upload_(body) {
+function uploadSurveys_(body) {
   const session = getUserByToken_(String(body.token || ''));
   if (!session) {
     return json_({success:false, code:'AUTH', message:'Login invalid or user disabled. Please login again.'});
@@ -884,7 +1078,7 @@ function upload_(body) {
 }
 
 
-function syncUploadStatus_(body) {
+function syncSurveyStatus_(body) {
   const session = getUserByToken_(String(body.token || ''));
   if (!session) {
     return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
