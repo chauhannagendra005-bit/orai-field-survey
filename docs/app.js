@@ -7951,7 +7951,7 @@ function preparePhoneCallSave(){
     supply_type:c.SUPPLY_TYPE||"",
     load:c.LOAD||"",
 
-    sdo_code:c.SDO_CODE || "",
+    sdo_code:c.SDO_CODE || "",substation:c.SUBSTATION || "",
     feeded_village_name:c.feeded_village_name || "",
     connection_status:c.CONNECTION_STATUS || "",
     last_pay_date:c.LAST_PAY_DATE || "",
@@ -8323,7 +8323,7 @@ function prepareRecheckSave(){
     supply_type:c.SUPPLY_TYPE||"",
     load:c.LOAD||"",
 
-    sdo_code:c.SDO_CODE || "",
+    sdo_code:c.SDO_CODE || "",substation:c.SUBSTATION || "",
     feeded_village_name:c.feeded_village_name || "",
     connection_status:c.CONNECTION_STATUS || "",
     last_pay_date:c.LAST_PAY_DATE || "",
@@ -8659,7 +8659,7 @@ function prepareDisconnectionSave(){
     activity_type:"DISCONNECTION",
     disconnection_id:makeActivityId("DISC"),
     user_id:state.userId,user_name:state.userName,
-    account_id:c.ACCT_ID,consumer_name:c.NAME||"",father_name:c.FATHER_NAME||"",address:c.ADDRESS||"",supply_type:c.SUPPLY_TYPE||"",load:c.LOAD||"",sdo_code:c.SDO_CODE || "",
+    account_id:c.ACCT_ID,consumer_name:c.NAME||"",father_name:c.FATHER_NAME||"",address:c.ADDRESS||"",supply_type:c.SUPPLY_TYPE||"",load:c.LOAD||"",sdo_code:c.SDO_CODE || "",substation:c.SUBSTATION || "",
     feeded_village_name:c.feeded_village_name || "",
     connection_status:c.CONNECTION_STATUS || "",
     last_pay_date:c.LAST_PAY_DATE || "",
@@ -9335,7 +9335,7 @@ async function prepareExistingSave() {
     address:state.current.ADDRESS,
     supply_type:state.current.SUPPLY_TYPE,
     load:state.current.LOAD,
-    sdo_code:state.current.SDO_CODE,
+    sdo_code:state.current.SDO_CODE,substation:state.current.SUBSTATION || "",
 
     connection_status:state.current.CONNECTION_STATUS || "",
     last_pay_date:state.current.LAST_PAY_DATE || "",

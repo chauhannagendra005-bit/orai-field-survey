@@ -38,7 +38,7 @@ const U = {ID:1, NAME:2, HASH:3, ACTIVE:4, TOKEN:5, ADMIN:6, ROLE:7, DIVISION:8,
 const USER_HEADERS = ['User ID','User Name','Password Hash','Active','Auth Token','Admin',
                       'Role','Division','Subdivision','Substation'];
 
-const SERVER_VERSION = 'orai-server-8 (feeder/DT lists)';
+const SERVER_VERSION = 'orai-server-9 (dashboard summaries)';
 
 function doGet() {
   return json_({success:true, message:'Orai Fieldwork API is running', version:SERVER_VERSION});
@@ -75,8 +75,8 @@ function doPost(e) {
     if (a === 'create_user') return createUser_(body);
     if (a === 'set_user_active') return setUserActive_(body);
     if (a === 'reset_password') return resetPassword_(body);
-    if (a === 'dashboard') return dashboard_(body);
-    if (a === 'dashboard_filters') return dashboard_filters_(body);
+    if (a === 'dashboard') return dashboardV2_(body);
+    if (a === 'dashboard_filters') return dashboardFiltersV2_(body);
     if (a === 'export_report') return exportReport_(body);
     if (a === 'get_record') return getRecord_(body);
     if (a === 'update_record') return updateRecord_(body);
@@ -1168,6 +1168,193 @@ function referenceInfo_(body) {
   }
   return json_({success:true, version:PropertiesService.getScriptProperties().getProperty('REF_VERSION') || '',
                 dts:n, feeders:feeders, substations:subs, villages:vs ? Math.max(vs.getLastRow() - 1, 0) : 0});
+}
+
+/* =========================================================
+ * DASHBOARD (Survey / Disconnection / Recheck / Phone Calling summaries)
+ * =========================================================
+ * Reads the four work sheets. Each entry is counted under the consumer's
+ * substation (sent by the phone; else the feeder's substation for surveys;
+ * else the user's substation). Admin / division roles see everything,
+ * subdivision roles their subdivision, everyone else their own entries.
+ * With rows_type it returns the entries behind a tapped number.
+ */
+function dashScope_(s) {
+  if (s.is_admin) return 'ALL';
+  const r = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ROLES_SHEET);
+  let sc = '';
+  if (r) r.getDataRange().getValues().slice(1).forEach(function(x) {
+    if (String(x[0]).trim().toLowerCase() === String(s.role || '').toLowerCase()) sc = String(x[1]).trim().toUpperCase();
+  });
+  return sc === 'DIVISION' ? 'ALL' : sc === 'SUBDIVISION' ? 'SUBDIVISION' : 'OWN';
+}
+
+function dashTxt_(x) {
+  return x instanceof Date ? Utilities.formatDate(x, 'Asia/Kolkata', 'yyyy-MM-dd') : String(x == null ? '' : x).replace(/^'/, '').trim();
+}
+
+function dashNum_(x) {
+  const n = Number(String(x == null ? '' : x).replace(/,/g, ''));
+  return isFinite(n) ? n : 0;
+}
+
+/* All entries of all four kinds, as flat objects. */
+function dashEntries_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const users = {};
+  getUsersSheet_().getDataRange().getValues().slice(1).forEach(function(u) {
+    users[String(u[U.ID-1]).trim().toLowerCase()] = {name:String(u[U.NAME-1] || ''), subdivision:String(u[U.SUBDIVISION-1] || ''),
+                                                       substation:String(u[U.SUBSTATION-1] || '')};
+  });
+  const firstSub = function(s) { return String(s || '').split(',')[0].trim(); };
+  const out = [];
+  const parse = function(j) { try { return JSON.parse(j); } catch (e) { return {}; } };
+
+  /* Door to Door Survey: original columns by position, extras by name */
+  const sv = ss.getSheetByName(SHEET_NAME);
+  if (sv && sv.getLastRow() > 1) {
+    const ix = headerIndex_(sv);
+    sv.getRange(2, 1, sv.getLastRow() - 1, sv.getLastColumn()).getValues().forEach(function(r) {
+      const uid = dashTxt_(r[0]); if (!uid && !r[2]) return;
+      const j = ('Full Entry (JSON)' in ix) ? parse(r[ix['Full Entry (JSON)']]) : {};
+      const u = users[uid.toLowerCase()] || {};
+      out.push({kind:'SURVEY', user_id:uid, user_name:dashTxt_(r[1]) || u.name, subdivision:u.subdivision || '',
+        date:istDate_(r[13]) || dashTxt_(r[13]).slice(0, 10), account_id:dashTxt_(r[2]), consumer_name:dashTxt_(r[3]),
+        father_name:dashTxt_(r[4]), address:dashTxt_(r[5]), mobile:dashTxt_(r[12]),
+        meter:dashTxt_(r[10]).toUpperCase(), ac:dashTxt_(r[11]).toUpperCase(), outstanding:dashTxt_(r[24]),
+        status:dashTxt_(r[16]), remarks:dashTxt_(r[26]),
+        sub:j.substation || (('Feeder Substation' in ix) ? dashTxt_(r[ix['Feeder Substation']]) : '') || firstSub(u.substation) || 'Unassigned',
+        video:j.video_file ? 'video_pending' : 'video_none'});
+    });
+  }
+
+  /* the three activity sheets: by column name */
+  const kinds = {DISCONNECTION:'Disconnection Status', RECHECK:'Present Status', PHONE_CALLING:'Call Response'};
+  Object.keys(kinds).forEach(function(kind) {
+    const sh = getActivitySheet_(kind);
+    if (sh.getLastRow() < 2) return;
+    const ix = headerIndex_(sh);
+    sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues().forEach(function(r) {
+      const v = function(h) { return h in ix ? dashTxt_(r[ix[h]]) : ''; };
+      if (!v('Entry ID')) return;
+      const j = parse(r[ix['Full Entry (JSON)']]);
+      out.push({kind:kind, id:v('Entry ID'), user_id:v('User ID'), user_name:v('User Name'), subdivision:v('User Subdivision'),
+        date:v('Visit Date').slice(0, 10), account_id:v('Account ID'), consumer_name:v('Consumer Name'),
+        father_name:v('Father/Husband Name'), address:v('Address'), mobile:v('Mobile'),
+        status:v(kinds[kind]).toUpperCase(), payment_mode:v('Payment Mode'), paid_amount:v('Paid Amount'),
+        committed_date:v('Committed Payment Date') || v('Payment Date'), outstanding:v('Outstanding'), remarks:v('Remarks'),
+        meter:v('Meter Status'), sub:j.substation || firstSub(v('User Substation')) || 'Unassigned',
+        video:v('Video') ? 'video_pending' : 'video_none'});
+    });
+  });
+  return out;
+}
+
+function dashboardV2_(body) {
+  const s = getUserByToken_(String(body.token || ''));
+  if (!s) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
+  const scope = dashScope_(s);
+  const from = String(body.from_date || ''), to = String(body.to_date || '');
+  const subs = String(body.substation || '').split('||').map(function(x) { return x.trim().toLowerCase(); }).filter(String);
+
+  const list = dashEntries_().filter(function(e) {
+    if (from && (!e.date || e.date < from)) return false;
+    if (to && (!e.date || e.date > to)) return false;
+    if (scope === 'OWN' && e.user_id.toLowerCase() !== String(s.user_id).toLowerCase()) return false;
+    if (scope === 'SUBDIVISION' && String(e.subdivision).toLowerCase() !== String(s.subdivision || '').toLowerCase()) return false;
+    if (subs.length && subs.indexOf(String(e.sub).toLowerCase()) === -1) return false;
+    return true;
+  });
+
+  if (body.rows_type) {
+    const k = String(body.rows_type).toUpperCase();
+    return json_({success:true, rows:list.filter(function(e) { return e.kind === k; })});
+  }
+
+  const bump = function(o, k, n) { o[k] = (o[k] || 0) + (n === undefined ? 1 : n); };
+  const by = {survey:{}, disconnection:{}, recheck:{}, phone_calling:{}};
+  const sum = {survey:{total:0}, disconnection:{total:0, outstanding:0}, recheck:{total:0, outstanding:0},
+               phone_calling:{total:0, outstanding:0}};
+  const phoneResp = {};
+  const subW = {}, userW = {};
+  const KEY = {SURVEY:'survey', DISCONNECTION:'disconnection', RECHECK:'recheck', PHONE_CALLING:'phone_calling'};
+  list.forEach(function(e) {
+    const key = KEY[e.kind];
+    const cell = by[key][e.sub] = by[key][e.sub] || {total:0};
+    const tot = sum[key];
+    const both = function(k, n) { bump(cell, k, n); bump(tot, k, n); };
+    both('total');
+    if (e.kind === 'SURVEY') {
+      if (e.meter === 'OK') both('meter_ok');
+      else if (e.meter === 'DAMAGED') both('meter_damaged');
+      else if (e.meter === 'NOT INSTALLED') both('meter_not_installed');
+      if (e.ac === 'YES') both('ac_yes'); else if (e.ac === 'NO') both('ac_no');
+    } else {
+      both('outstanding', dashNum_(e.outstanding));
+      if (e.kind === 'DISCONNECTION') {
+        if (e.status === 'DISCONNECTED') both('disconnected');
+        if (e.status === 'HOUSE LOCK AND DISCONNECTED') { both('house_lock_disc'); bump(tot, 'disconnected'); }
+        if (e.status === 'TIME GIVEN FOR PAYMENT') both('time_given');
+        if (e.status === 'PAID') both('paid');
+        both(e.video);
+      } else if (e.kind === 'RECHECK') {
+        if (e.status === 'FOUND CONNECTED') both('found_connected');
+        if (e.status === 'STILL DISCONNECTED') both('still_disconnected');
+        if (e.status === 'HOUSE LOCKED') both('house_locked');
+        if (e.status === 'PAYMENT MADE') both('payment_made');
+        both(e.video);
+      } else {
+        cell.responses = cell.responses || {};
+        bump(cell.responses, e.status || 'UNKNOWN');
+        bump(phoneResp, e.status || 'UNKNOWN');
+      }
+    }
+    const sw = subW[e.sub] = subW[e.sub] || {name:e.sub, survey:0, disconnection:0, recheck:0, phone_calling:0, total:0};
+    sw[key]++; sw.total++;
+    const uk = e.user_id.toLowerCase();
+    const uw = userW[uk] = userW[uk] || {user_id:e.user_id, name:e.user_name, substation:'', survey:0, disconnection:0,
+                                         recheck:0, phone_calling:0, total:0};
+    uw[key]++; uw.total++;
+  });
+  const users = {};
+  getUsersSheet_().getDataRange().getValues().slice(1).forEach(function(u) {
+    users[String(u[U.ID-1]).trim().toLowerCase()] = String(u[U.SUBSTATION-1] || '');
+  });
+  Object.keys(userW).forEach(function(k) { userW[k].substation = users[k] || ''; });
+
+  return json_({
+    success:true, scope:scope,
+    survey_summary:sum.survey, disconnection_summary:sum.disconnection, recheck_summary:sum.recheck,
+    phone_calling_summary:{total:sum.phone_calling.total, outstanding:sum.phone_calling.outstanding,
+      responses:Object.keys(phoneResp).sort().map(function(k) { return {name:k, count:phoneResp[k]}; })},
+    summary_by_substation:by,
+    substation_wise:Object.keys(subW).sort().map(function(k) { return subW[k]; }),
+    user_wise:Object.keys(userW).map(function(k) { return userW[k]; }).sort(function(a, b) { return b.total - a.total; }),
+    total:list.length
+  });
+}
+
+/* Substation tick-boxes on the Dashboard. */
+function dashboardFiltersV2_(body) {
+  const s = getUserByToken_(String(body.token || ''));
+  if (!s) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
+  const scope = dashScope_(s);
+  const set = {};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const h = ss.getSheetByName(HIERARCHY_SHEET);
+  if (h) h.getDataRange().getValues().slice(1).forEach(function(r) {
+    if (scope === 'SUBDIVISION' && String(r[1]).toLowerCase() !== String(s.subdivision || '').toLowerCase()) return;
+    if (r[2]) set[String(r[2]).trim()] = 1;
+  });
+  if (scope === 'ALL') {
+    const rf = ss.getSheetByName(REF_SHEET);
+    if (rf && rf.getLastRow() > 1) rf.getRange(2, 2, rf.getLastRow() - 1, 1).getValues().forEach(function(r) { if (r[0]) set[String(r[0])] = 1; });
+  }
+  if (scope === 'OWN') {
+    Object.keys(set).forEach(function(k) { delete set[k]; });
+    String(s.substation || '').split(',').map(function(x) { return x.trim(); }).filter(String).forEach(function(x) { set[x] = 1; });
+  }
+  return json_({success:true, substations:Object.keys(set).sort()});
 }
 
 function checkUploadStatus_(body) {
