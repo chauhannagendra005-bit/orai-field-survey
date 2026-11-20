@@ -22,7 +22,7 @@
  *   (scope = DIVISION, SUBDIVISION, SUBSTATION_MULTI or SUBSTATION_SINGLE).
  */
 
-const SHEET_NAME = 'Mobile Data';
+const SHEET_NAME = 'Door to Door Survey';   /* was 'Mobile Data' (renamed automatically) */
 const USERS_SHEET = 'Users';
 const HIERARCHY_SHEET = 'Hierarchy';
 const ROLES_SHEET = 'Roles';
@@ -38,7 +38,7 @@ const U = {ID:1, NAME:2, HASH:3, ACTIVE:4, TOKEN:5, ADMIN:6, ROLE:7, DIVISION:8,
 const USER_HEADERS = ['User ID','User Name','Password Hash','Active','Auth Token','Admin',
                       'Role','Division','Subdivision','Substation'];
 
-const SERVER_VERSION = 'orai-server-6 (disconnection report)';
+const SERVER_VERSION = 'orai-server-7 (separate work sheets)';
 
 function doGet() {
   return json_({success:true, message:'Orai Fieldwork API is running', version:SERVER_VERSION});
@@ -62,6 +62,7 @@ function doPost(e) {
   try {
     const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     const a = body.action;
+    ensureSheetNames_();
 
     if (a === 'login') return login_(body);
     if (a === 'check_auth') return checkAuth_(body);
@@ -753,28 +754,118 @@ function dailySummary_() {
 }
 
 /* =========================================================
- * DISCONNECTION / RECHECK / PHONE CALL ENTRIES + DISCONNECTION REPORT
+ * FOUR WORK SHEETS
+ *   Door to Door Survey | Disconnection Work | Phone Calling | Recheck (Already Disconnected)
  * =========================================================
- * Field entries arrive through the same 'upload' action as surveys,
- * marked with activity_type. Each type has its own sheet; one row per
- * visit, never merged with surveys. 'disconnection_report' feeds the
- * Dashboard PDF reports (complete report, time given / paid / disconnected
- * but not yet paid).
+ * Entries arrive through the same 'upload' action; activity_type decides
+ * the sheet. Every row also keeps the complete entry (JSON) in its last
+ * column, so nothing the phone sent is ever lost.
+ * 'disconnection_report' feeds the Dashboard PDF reports.
  */
+const BASE_COLS = [
+  ['Entry ID', null], ['Visit Date', null], ['Created At', 'created_at'], ['User ID', null], ['User Name', null],
+  ['User Subdivision', null], ['User Substation', null], ['Account ID', 'account_id'], ['Consumer Name', 'consumer_name'],
+  ['Father/Husband Name', 'father_name'], ['Address', 'address'], ['Supply Type', 'supply_type'], ['Load', 'load'],
+  ['SDO Code', 'sdo_code'], ['Village / Area', 'feeded_village_name'], ['Connection Status', 'connection_status'],
+  ['Last Pay Date', 'last_pay_date'], ['Last Pay Amount', 'last_pay_amount'], ['Outstanding', 'outstanding'],
+  ['Mobile', 'mobile_number']
+];
 const ACTIVITY = {
-  DISCONNECTION: {sheet:'Disconnections', id:'disconnection_id'},
-  RECHECK:       {sheet:'Rechecks',       id:'recheck_id'},
-  PHONE_CALLING: {sheet:'Phone Calls',    id:'calling_id'}
+  DISCONNECTION: {sheet:'Disconnection Work', old:['Disconnections'], id:'disconnection_id', cols:[
+    ['Disconnection Status', 'disconnection_status'], ['Payment Mode', 'payment_mode'], ['Paid Amount', 'paid_amount'],
+    ['Committed Payment Date', 'committed_payment_date'], ['Meter Status', 'meter_status'],
+    ['Current Reading', 'current_reading'], ['Mobile Refused', 'mobile_refused'], ['House Condition', 'house_condition'],
+    ['Office List', 'office_list'], ['Remarks', 'remarks'], ['Latitude', 'latitude'], ['Longitude', 'longitude'],
+    ['GPS Accuracy', 'gps_accuracy'], ['Video', 'video_file'], ['Phone Data Up To', 'master_data_up_to']]},
+  PHONE_CALLING: {sheet:'Phone Calling', old:['Phone Calls'], id:'calling_id', cols:[
+    ['Call Response', 'call_response'], ['Committed Payment Date', 'committed_payment_date'],
+    ['Payment Date', 'payment_date'], ['Remarks', 'remarks']]},
+  RECHECK: {sheet:'Recheck (Already Disconnected)', old:['Rechecks'], id:'recheck_id', cols:[
+    ['Present Status', 'present_status'], ['Payment Mode', 'payment_mode'], ['Payment Date', 'payment_date'],
+    ['Office List', 'office_list'], ['Meter Status', 'meter_status'], ['Current Reading', 'current_reading'],
+    ['Remarks', 'remarks'], ['Latitude', 'latitude'], ['Longitude', 'longitude'], ['GPS Accuracy', 'gps_accuracy'],
+    ['Video', 'video_file']]}
 };
-const ACT_HEADERS = ['Entry ID','Visit Date','Created At','User ID','User Name','User Subdivision','User Substation',
-  'Account ID','Consumer Name','Father Name','Address','Supply Type','Load','SDO Code','Village','Status',
-  'Payment Mode','Paid Amount','Committed Date','Outstanding','Meter Status','Current Reading','Mobile',
-  'Mobile Refused','House Condition','Remarks','Latitude','Longitude','GPS Accuracy','Data Up To','Uploaded At','Full Entry (JSON)'];
-const A = {}; ACT_HEADERS.forEach(function(h, i) { A[h] = i; });
+const TAIL_COLS = [['Uploaded At', null], ['Full Entry (JSON)', null]];
+
+function actColumns_(type) { return BASE_COLS.concat(ACTIVITY[type].cols, TAIL_COLS); }
+function actHeaders_(type) { return actColumns_(type).map(function(c) { return c[0]; }); }
 
 function activityType_(r) {
   const t = String((r && r.activity_type) || '').trim().toUpperCase();
   return ACTIVITY[t] ? t : '';
+}
+
+function istDate_(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return Utilities.formatDate(d, 'Asia/Kolkata', 'yyyy-MM-dd');
+}
+
+/* One spreadsheet row for an entry, in the type's column order. */
+function buildActivityRow_(type, r, who) {
+  const textCols = {'Account ID':1, 'Mobile':1, 'Supply Type':1};
+  let json = JSON.stringify(r);
+  if (json.length > 45000) json = json.slice(0, 45000);
+  return actColumns_(type).map(function(c) {
+    const h = c[0], k = c[1];
+    if (h === 'Entry ID') return String(r[ACTIVITY[type].id] || '').trim();
+    if (h === 'Visit Date') return istDate_(r.created_at) || istDate_(new Date().toISOString());
+    if (h === 'User ID') return who.user_id;
+    if (h === 'User Name') return who.user_name || r.user_name || '';
+    if (h === 'User Subdivision') return who.subdivision || '';
+    if (h === 'User Substation') return who.substation || '';
+    if (h === 'Uploaded At') return who.uploaded_at || new Date();
+    if (h === 'Full Entry (JSON)') return json;
+    const v = r[k] == null ? '' : r[k];
+    return textCols[h] && v !== '' ? "'" + String(v) : v;
+  });
+}
+
+function userInfo_(userId) {
+  const users = getUsersSheet_().getDataRange().getValues();
+  for (let i = 1; i < users.length; i++) {
+    if (String(users[i][U.ID-1]).trim().toLowerCase() === String(userId).toLowerCase()) {
+      return {user_id:String(users[i][U.ID-1]).trim(), user_name:String(users[i][U.NAME-1] || ''),
+              subdivision:String(users[i][U.SUBDIVISION-1] || ''), substation:String(users[i][U.SUBSTATION-1] || '')};
+    }
+  }
+  return {user_id:userId, user_name:'', subdivision:'', substation:''};
+}
+
+/* Renames old sheets to the four work-sheet names; an old activity sheet with a different
+   column layout is rebuilt from its saved entries. Runs on every request (cheap when done). */
+function ensureSheetNames_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss.getSheetByName(SHEET_NAME) && ss.getSheetByName('Mobile Data')) ss.getSheetByName('Mobile Data').setName(SHEET_NAME);
+  Object.keys(ACTIVITY).forEach(function(type) {
+    const a = ACTIVITY[type];
+    a.old.forEach(function(oldName) {
+      const old = ss.getSheetByName(oldName);
+      if (!old) return;
+      const heads = old.getLastColumn() ? old.getRange(1, 1, 1, old.getLastColumn()).getValues()[0] : [];
+      if (!ss.getSheetByName(a.sheet) && heads.join('|') === actHeaders_(type).join('|')) { old.setName(a.sheet); return; }
+      const sh = getActivitySheet_(type);
+      const jsonCol = heads.indexOf('Full Entry (JSON)');
+      const userCol = heads.indexOf('User ID'), atCol = heads.indexOf('Uploaded At');
+      const have = activityIds_(type);
+      const rows = [];
+      if (jsonCol !== -1 && old.getLastRow() > 1) {
+        old.getRange(2, 1, old.getLastRow() - 1, old.getLastColumn()).getValues().forEach(function(x) {
+          let r = null;
+          try { r = JSON.parse(x[jsonCol]); } catch (e) { return; }
+          const id = String(r[a.id] || '').trim();
+          if (!id || have.has(id)) return;
+          have.add(id);
+          const who = userInfo_(x[userCol]);
+          who.uploaded_at = x[atCol];
+          rows.push(buildActivityRow_(type, r, who));
+        });
+      }
+      if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+      ss.deleteSheet(old);
+    });
+  });
 }
 
 function getActivitySheet_(type) {
@@ -783,16 +874,18 @@ function getActivitySheet_(type) {
   let sh = ss.getSheetByName(name);
   if (!sh) {
     sh = ss.insertSheet(name);
-    sh.getRange(1,1,1,ACT_HEADERS.length).setValues([ACT_HEADERS]);
+    const h = actHeaders_(type);
+    sh.getRange(1, 1, 1, h.length).setValues([h]).setFontWeight('bold').setBackground('#0f766e').setFontColor('#ffffff');
     sh.setFrozenRows(1);
   }
   return sh;
 }
 
-function istDate_(iso) {
-  const d = new Date(iso);
-  if (isNaN(d)) return '';
-  return Utilities.formatDate(d, 'Asia/Kolkata', 'yyyy-MM-dd');
+function headerIndex_(sh) {
+  const heads = sh.getLastColumn() ? sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0] : [];
+  const ix = {};
+  heads.forEach(function(h, i) { ix[String(h)] = i; });
+  return ix;
 }
 
 function activityIds_(type) {
@@ -803,18 +896,12 @@ function activityIds_(type) {
   return ids;
 }
 
-/* Save activity entries; returns {uploaded, duplicates}. */
 function uploadActivities_(session, records) {
   const out = {uploaded:0, duplicates:0};
   const byType = {};
   records.forEach(function(r) { const t = activityType_(r); (byType[t] = byType[t] || []).push(r); });
-  const users = getUsersSheet_().getDataRange().getValues();
-  let sub = '', subst = '';
-  for (let i = 1; i < users.length; i++) {
-    if (String(users[i][U.ID-1]).trim().toLowerCase() === String(session.user_id).toLowerCase()) {
-      sub = String(users[i][U.SUBDIVISION-1] || ''); subst = String(users[i][U.SUBSTATION-1] || ''); break;
-    }
-  }
+  const who = userInfo_(session.user_id);
+  who.user_name = session.user_name || who.user_name;
   Object.keys(byType).forEach(function(type) {
     const sh = getActivitySheet_(type);
     const ids = activityIds_(type);
@@ -824,29 +911,46 @@ function uploadActivities_(session, records) {
       if (!id) return;
       if (ids.has(id)) { out.duplicates++; return; }
       ids.add(id);
-      let json = JSON.stringify(r);
-      if (json.length > 45000) json = json.slice(0, 45000);
-      const status = r.disconnection_status || r.recheck_status || r.call_status || r.calling_status || r.status || '';
-      const row = new Array(ACT_HEADERS.length).fill('');
-      const put = function(h, v) { row[A[h]] = v == null ? '' : v; };
-      put('Entry ID', id); put('Visit Date', istDate_(r.created_at) || istDate_(new Date().toISOString()));
-      put('Created At', r.created_at); put('User ID', session.user_id); put('User Name', session.user_name || r.user_name);
-      put('User Subdivision', sub); put('User Substation', subst);
-      put('Account ID', "'" + String(r.account_id || '')); put('Consumer Name', r.consumer_name); put('Father Name', r.father_name);
-      put('Address', r.address); put('Supply Type', "'" + String(r.supply_type || '')); put('Load', r.load);
-      put('SDO Code', r.sdo_code); put('Village', r.feeded_village_name || r.village); put('Status', status);
-      put('Payment Mode', r.payment_mode); put('Paid Amount', r.paid_amount); put('Committed Date', r.committed_payment_date);
-      put('Outstanding', r.outstanding); put('Meter Status', r.meter_status); put('Current Reading', r.current_reading);
-      put('Mobile', "'" + String(r.mobile_number || '')); put('Mobile Refused', r.mobile_refused);
-      put('House Condition', r.house_condition); put('Remarks', r.remarks); put('Latitude', r.latitude);
-      put('Longitude', r.longitude); put('GPS Accuracy', r.gps_accuracy); put('Data Up To', r.master_data_up_to);
-      put('Uploaded At', new Date()); put('Full Entry (JSON)', json);
-      rows.push(row);
+      rows.push(buildActivityRow_(type, r, who));
     });
-    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, ACT_HEADERS.length).setValues(rows);
+    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
     out.uploaded += rows.length;
   });
   return out;
+}
+
+/* ---- Door to Door Survey: the original 27 columns stay as they are (Dashboard and corrections
+   read them); the extra survey fields are written by column name after them. ---- */
+const SURVEY_EXTRA = [
+  ['Correct Village', 'correct_village_name'], ['Feeder Substation', 'feeder_substation'], ['Feeder', 'feeder'],
+  ['DT', 'dt'], ['Theft Possibility', 'theft_possibility'], ['Site Reading', 'site_reading'],
+  ['Site Max Demand', 'site_max_demand'], ['Nature of Supply', 'nature_of_supply'], ['House Condition', 'house_condition'],
+  ['Consumer Payment Response', 'consumer_payment_response'], ['Consumer Payment Date', 'consumer_payment_date'],
+  ['Connection Status (Master)', 'connection_status'], ['Last Pay Date', 'last_pay_date'],
+  ['Last Pay Amount', 'last_pay_amount'], ['Latitude', 'latitude'], ['Longitude', 'longitude'],
+  ['GPS Accuracy', 'gps_accuracy'], ['Video', 'video_file'], ['Full Entry (JSON)', null]
+];
+
+function writeSurveyRows_(sheet, rows, recs) {
+  if (!rows.length) return;
+  let ix = headerIndex_(sheet);
+  SURVEY_EXTRA.forEach(function(c) {
+    if (!(c[0] in ix)) { sheet.getRange(1, sheet.getLastColumn() + 1).setValue(c[0]); ix = headerIndex_(sheet); }
+  });
+  const width = sheet.getLastColumn();
+  const full = rows.map(function(base, n) {
+    const row = base.slice();
+    while (row.length < width) row.push('');
+    const r = recs[n] || {};
+    SURVEY_EXTRA.forEach(function(c) {
+      let v;
+      if (!c[1]) { v = JSON.stringify(r); if (v.length > 45000) v = v.slice(0, 45000); }
+      else v = r[c[1]] == null ? '' : r[c[1]];
+      row[ix[c[0]]] = v;
+    });
+    return row.slice(0, width);
+  });
+  sheet.getRange(sheet.getLastRow() + 1, 1, full.length, width).setValues(full);
 }
 
 /* Wraps the survey upload: activity entries go to their own sheets. */
@@ -875,7 +979,6 @@ function unwrap_(out) {
   return out && typeof out.getContent === 'function' ? JSON.parse(out.getContent()) : out;
 }
 
-/* Wraps the survey status check: also reports activity entries already on the server. */
 function syncUploadStatus_(body) {
   const session = getUserByToken_(String(body.token || ''));
   if (!session) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
@@ -917,32 +1020,51 @@ function disconnectionReport_(body) {
   })();
   const subs = String(body.substation || '').split('||').map(function(x) { return x.trim().toLowerCase(); }).filter(String);
 
-  const data = getActivitySheet_('DISCONNECTION').getDataRange().getValues();
+  const sh = getActivitySheet_('DISCONNECTION');
+  const ix = headerIndex_(sh);
+  const data = sh.getDataRange().getValues();
   const rows = [];
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
-    let date = r[A['Visit Date']];
-    date = date instanceof Date ? Utilities.formatDate(date, 'Asia/Kolkata', 'yyyy-MM-dd') : String(date || '').slice(0, 10);
+    const v = function(h) {
+      const x = r[ix[h]];
+      return x instanceof Date ? Utilities.formatDate(x, 'Asia/Kolkata', 'yyyy-MM-dd') : String(x == null ? '' : x).replace(/^'/, '');
+    };
+    const date = v('Visit Date').slice(0, 10);
     if (!date || date < from || date > to) continue;
-    const userId = String(r[A['User ID']] || '');
+    const userId = v('User ID');
     if (scope === 'OWN' && userId.toLowerCase() !== String(s.user_id).toLowerCase()) continue;
-    if (scope === 'SUBDIVISION' && String(r[A['User Subdivision']] || '').toLowerCase() !== String(s.subdivision || '').toLowerCase()) continue;
-    const userSubst = String(r[A['User Substation']] || '');
+    if (scope === 'SUBDIVISION' && v('User Subdivision').toLowerCase() !== String(s.subdivision || '').toLowerCase()) continue;
+    const userSubst = v('User Substation');
     if (subs.length) {
       const mine = userSubst.split(',').map(function(x) { return x.trim().toLowerCase(); });
       if (!mine.some(function(x) { return subs.indexOf(x) !== -1; })) continue;
     }
-    const v = function(h) { const x = r[A[h]]; return x instanceof Date ? Utilities.formatDate(x, 'Asia/Kolkata', 'yyyy-MM-dd') : String(x == null ? '' : x).replace(/^'/, ''); };
     rows.push({
-      id:v('Entry ID'), date:date, account_id:v('Account ID'), consumer_name:v('Consumer Name'), father_name:v('Father Name'),
-      address:v('Address'), supply_type:v('Supply Type'), load:v('Load'), mobile:v('Mobile'), mobile_refused:v('Mobile Refused'),
-      latitude:v('Latitude'), longitude:v('Longitude'), outstanding:v('Outstanding'), visit_day_outstanding:'',
-      phone_data_up_to:v('Data Up To'), status:String(v('Status')).toUpperCase(), committed_date:v('Committed Date'),
+      id:v('Entry ID'), date:date, account_id:v('Account ID'), consumer_name:v('Consumer Name'),
+      father_name:v('Father/Husband Name'), address:v('Address'), supply_type:v('Supply Type'), load:v('Load'),
+      mobile:v('Mobile'), mobile_refused:v('Mobile Refused'), latitude:v('Latitude'), longitude:v('Longitude'),
+      outstanding:v('Outstanding'), visit_day_outstanding:'', phone_data_up_to:v('Phone Data Up To'),
+      status:v('Disconnection Status').toUpperCase(), committed_date:v('Committed Payment Date'),
       payment_mode:v('Payment Mode'), paid_amount:v('Paid Amount'), user_id:userId, user_name:v('User Name'),
       user_substation:userSubst, meter_status:v('Meter Status'), remarks:v('Remarks')
     });
   }
   return json_({success:true, rows:rows, scope:scope});
+}
+
+/* Run once from Apps Script to create / rename all four work sheets now. */
+function setupWorkSheets() {
+  ensureSheetNames_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const surv = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+  ensureHeaders_(surv);
+  let ix = headerIndex_(surv);
+  SURVEY_EXTRA.forEach(function(c) {
+    if (!(c[0] in ix)) { surv.getRange(1, surv.getLastColumn() + 1).setValue(c[0]); ix = headerIndex_(surv); }
+  });
+  Object.keys(ACTIVITY).forEach(getActivitySheet_);
+  Logger.log('Work sheets ready: ' + [SHEET_NAME].concat(Object.keys(ACTIVITY).map(function(t) { return ACTIVITY[t].sheet; })).join(', '));
 }
 
 function checkUploadStatus_(body) {
@@ -1017,6 +1139,7 @@ function uploadSurveys_(body) {
     }
 
     const rows=[];
+    const rowRecs=[];
     let duplicates=0;
 
     for(const r of records){
@@ -1034,6 +1157,7 @@ function uploadSurveys_(body) {
         continue;
       }
 
+      rowRecs.push(r);
       rows.push([
         session.user_id,
         session.user_name,
@@ -1068,7 +1192,7 @@ function uploadSurveys_(body) {
     }
 
     if(rows.length){
-      sheet.getRange(sheet.getLastRow()+1,1,rows.length,rows[0].length).setValues(rows);
+      writeSurveyRows_(sheet, rows, rowRecs);
     }
 
     return json_({success:true,uploaded:rows.length,duplicates:duplicates});
