@@ -1603,10 +1603,10 @@ function updateVillageListInfo() {
       `Feeders: ${saved.feeders.length} · DTs: ${dtCount} · Last checked: ${formatMasterDate(saved.checked_at)}`;
   } else if (saved || getLegacyVillageList()) {
     info.textContent =
-      "Using the previously saved village list. Tap the button below to load the latest village, feeder and DT lists.";
+      "Using the previously saved feeder and DT list. Tap the button below to load the latest list.";
   } else {
     info.textContent =
-      "Village, feeder and DT lists are not loaded yet. Tap the button below to load them.";
+      "Feeder and DT lists are not loaded yet. Tap the button below to load them.";
   }
 
 }
@@ -1651,7 +1651,7 @@ async function fetchVillageListFromServer() {
 
       if (attempt === maxAttempts) {
         throw new Error(
-          "Could not reach the server to load the village, feeder and DT lists. " +
+          "Could not reach the server to load the feeder and DT lists. " +
           "Please check your internet connection and try again."
         );
       }
@@ -1666,7 +1666,7 @@ async function fetchVillageListFromServer() {
 
   if (!result.success) {
     throw new Error(
-      result.message || "Could not load the village, feeder and DT lists."
+      result.message || "Could not load the feeder and DT lists."
     );
   }
 
@@ -1699,8 +1699,8 @@ async function checkVillageListUpdate(auto = false) {
     setStatus(
       "villageListStatus",
       auto
-        ? "Loading village, feeder and DT lists…"
-        : "Checking village, feeder and DT lists…"
+        ? "Loading feeder and DT lists…"
+        : "Checking feeder and DT lists…"
     );
   }
 
@@ -1725,7 +1725,7 @@ async function checkVillageListUpdate(auto = false) {
     updateVillageListInfo();
 
     const counts =
-      `${result.villages.length} villages, ${result.feeders.length} feeders`;
+      `${result.feeders.length} feeders`;
 
     if (hasStatus) {
       setStatus(
@@ -1749,7 +1749,7 @@ async function checkVillageListUpdate(auto = false) {
         (getSavedVillageList()
           ? "The saved lists are still in use. "
           : "") +
-        (e.message || "Could not load the village, feeder and DT lists."),
+        (e.message || "Could not load the feeder and DT lists."),
         "error"
       );
     }
