@@ -2989,7 +2989,7 @@ function buildActivityShareText(record) {
     record.outstanding !== "" && record.outstanding != null ? "Outstanding: ₹" + record.outstanding : "",
     record.meter_status ? "Meter: " + record.meter_status : "",
     record.current_reading ? "Site Reading: " + record.current_reading : "",
-    record.house_condition ? "House Condition: " + record.house_condition : "",
+    "",
     record.remarks ? "Remark: " + record.remarks : "",
     lat && lng ? "Location: https://maps.google.com/?q=" + lat + "," + lng : "",
     "Date: " + shareDateText(record.created_at),
@@ -7398,7 +7398,7 @@ function renderActivityCards(records) {
       if(r.payment_mode) details.push("Payment Mode: "+r.payment_mode);
       if(r.disconnection_status) details.push("Status: "+r.disconnection_status);
       if(r.meter_status) details.push("Meter Status: "+r.meter_status);
-      if(r.house_condition) details.push("House Condition: "+r.house_condition);
+      /* ORAI: house condition not shown */
     } else if(type==="SURVEY"){
       if(r.consumer_name) details.push("Name: "+r.consumer_name);
       if(r.address) details.push("Address: "+r.address);
@@ -7644,7 +7644,7 @@ function renderActivityCorrectionForm(record){
     fields+=`<label for="activityCorrReading">Site Reading</label><input id="activityCorrReading" value="${escapeHtml(record.current_reading||"")}">`;
     fields+=`<label for="activityCorrMobile">Mobile Number</label><input id="activityCorrMobile" inputmode="numeric" maxlength="10" value="${escapeHtml(record.mobile_number||"")}">`;
     fields+=`<div class="check-row"><label><input id="activityCorrMobileRefused" type="checkbox"${String(record.mobile_refused||"").toUpperCase()==="YES"?" checked":""}>Consumer refused to give mobile number</label></div>`;
-    fields+=activityCorrectionSelect("activityCorrHouse","House Condition",record.house_condition,["kutcha house","Pucca normal house","Pucca Good house","Luxury (Rich) house"]);
+    if (false) fields+=activityCorrectionSelect("activityCorrHouse","House Condition",record.house_condition,["kutcha house","Pucca normal house","Pucca Good house","Luxury (Rich) house"]);
     fields+=`<label for="activityCorrRemarks">Remark</label><textarea id="activityCorrRemarks" rows="3">${escapeHtml(record.remarks||"")}</textarea>`;
   } else if(type==="RECHECK"){
     fields+=activityCorrectionSelect("activityCorrStatus","Present Status",record.present_status,["STILL DISCONNECTED","FOUND CONNECTED","HOUSE LOCKED","PAYMENT MADE"]);
@@ -7705,14 +7705,14 @@ function prepareActivityCorrectionSave(original){
     corrected.meter_status=$("activityCorrMeterStatus").value;
     corrected.current_reading=$("activityCorrReading").value.trim();
     corrected.mobile_number=$("activityCorrMobile").value.replace(/\D/g,"");
-    corrected.house_condition=$("activityCorrHouse").value;
+    corrected.house_condition=$("activityCorrHouse") ? $("activityCorrHouse").value : (record.house_condition || "");
     corrected.remarks=$("activityCorrRemarks").value.trim();
     if(!corrected.disconnection_status) return setStatus("activityCorrectionStatus","Select disconnection status.","error");
     if(corrected.disconnection_status==="PAID" && !corrected.payment_mode) return setStatus("activityCorrectionStatus","Select payment mode.","error");
     if(corrected.disconnection_status==="TIME GIVEN FOR PAYMENT" && !corrected.committed_payment_date) return setStatus("activityCorrectionStatus","Select committed payment date.","error");
     if(!corrected.meter_status) return setStatus("activityCorrectionStatus","Select current meter status.","error");
     if(corrected.mobile_number && !/^\d{10}$/.test(corrected.mobile_number)) return setStatus("activityCorrectionStatus","Enter a valid 10 digit mobile number.","error");
-    if(!corrected.house_condition) return setStatus("activityCorrectionStatus","Select house condition.","error");
+    /* ORAI: house condition not asked */
     /* v20.17: amount paid (only for Paid) and consumer refused (only for Disconnected) */
     const paidText=$("activityCorrPaidAmount").value.replace(/,/g,"").trim();
     if(paidText && !(Number(paidText)>0)) return setStatus("activityCorrectionStatus","Amount paid must be a number.","error");
@@ -7800,7 +7800,7 @@ function prepareActivityCorrectionSave(original){
     ["Consumer",corrected.consumer_name||""],
     ["Total Outstanding",corrected.outstanding||"—"]
   ];
-  if(type==="DISCONNECTION") items.push(["Disconnection Status",corrected.disconnection_status], ["Payment Mode",corrected.payment_mode||"—"], ["Amount Paid",corrected.paid_amount ? "₹"+corrected.paid_amount : "—"], ["Committed Payment Date",corrected.committed_payment_date||"—"], ["Meter Status",corrected.meter_status], ["Site Reading",corrected.current_reading||"—"], ["Mobile",corrected.mobile_refused==="YES" ? "Not provided - Consumer Refused" : (corrected.mobile_number||"—")], ["House Condition",corrected.house_condition], ["Remark",corrected.remarks||"—"]);
+  if(type==="DISCONNECTION") items.push(["Disconnection Status",corrected.disconnection_status], ["Payment Mode",corrected.payment_mode||"—"], ["Amount Paid",corrected.paid_amount ? "₹"+corrected.paid_amount : "—"], ["Committed Payment Date",corrected.committed_payment_date||"—"], ["Meter Status",corrected.meter_status], ["Site Reading",corrected.current_reading||"—"], ["Mobile",corrected.mobile_refused==="YES" ? "Not provided - Consumer Refused" : (corrected.mobile_number||"—")], ["Remark",corrected.remarks||"—"]);
   else if(type==="RECHECK") items.push(["Present Status",corrected.present_status], ["Payment Mode",corrected.payment_mode||"—"], ["Current Meter Status",corrected.meter_status||"—"], ["Site Reading",corrected.current_reading||"—"], ["Mobile",corrected.mobile_number||"—"], ["Remark",corrected.remarks||"—"]);
   else if(type==="PHONE_CALLING") items.push(["Mobile",corrected.mobile_number], ["Call Response",corrected.call_response], ["Committed Payment Date",corrected.committed_payment_date||"—"], ["Remark",corrected.remarks||"—"]);
 
@@ -8649,7 +8649,7 @@ function prepareDisconnectionSave(){
   if(houseLock && mobile && !/^\d{10}$/.test(mobile)) return setStatus("disconnectSaveStatus","Enter a valid 10 digit mobile number, or leave it empty.","error");
   if(!houseLock && !mobileRefused && !/^\d{10}$/.test(mobile)) return setStatus("disconnectSaveStatus",
     status==="DISCONNECTED" ? "Enter a valid 10 digit mobile number, or tick Consumer Refused." : "Enter a valid 10 digit mobile number.","error");
-  if(!house) return setStatus("disconnectSaveStatus","Select house condition.","error");
+  /* ORAI: house condition not asked */
   const videoProblem=checkActivityVideo("DISCONNECTION",c,isVideoRequired("DISCONNECTION",status));
 
   if(videoProblem) return setStatus("disconnectSaveStatus",videoProblem,"error");
@@ -8680,7 +8680,7 @@ function prepareDisconnectionSave(){
     ["Account ID",record.account_id],["Consumer",record.consumer_name],["Disconnection Status",record.disconnection_status],
     ["Payment Mode",record.payment_mode||"—"],["Amount Paid",record.paid_amount ? "₹"+record.paid_amount : "—"],
     ["Committed Payment Date",record.committed_payment_date||"—"],["Meter Status",record.meter_status],
-    ["Site Reading",record.current_reading||"—"],["Mobile",mobileRefused ? "Not provided - Consumer Refused" : (record.mobile_number||"—")],["House Condition",record.house_condition],["Remark",record.remarks||"—"],
+    ["Site Reading",record.current_reading||"—"],["Mobile",mobileRefused ? "Not provided - Consumer Refused" : (record.mobile_number||"—")],["Remark",record.remarks||"—"],
     ["Video",video?videoSummary(video):"Not required"]
   ],async()=>{
     if(video) downloadActivityVideo(video);
@@ -9315,7 +9315,7 @@ async function prepareExistingSave() {
   if (!natureOfSupply) return setStatus("saveStatus","Select Nature of Supply.","error");
 
 
-  if (!houseCondition) return setStatus("saveStatus","Select House Condition.","error");
+  /* ORAI: house condition not asked */
   if (!consumerPaymentResponse) {return setStatus("saveStatus","उपभोक्ता द्वारा भुगतान के संबंध में प्रतिक्रिया चुनें.","error");}
   if (consumerPaymentResponse === "कुछ दिन बाद जमा करेंगे" && !consumerPaymentDate) {return setStatus("saveStatus","भुगतान की संभावित दिनांक चुनें.","error");}
   if (!meterCondition) return setStatus("saveStatus","Select meter condition.","error");
@@ -9385,7 +9385,6 @@ async function prepareExistingSave() {
       ["DT",record.dt],
       ["Nature of Supply",record.nature_of_supply],
 
-      ["House Condition",record.house_condition],
       ["Payment Response",record.consumer_payment_response],
       ["Expected Payment Date",record.consumer_payment_date || "—"],
       ["Meter Number",record.meter_number || "Not available"],
@@ -9521,7 +9520,7 @@ async function prepareNewSave() {
 
 
   if (!natureOfSupply) return setStatus("newSaveStatus","Select Nature of Supply.","error");
-  if (!houseCondition) return setStatus("newSaveStatus","Select House Condition.","error");
+  /* ORAI: house condition not asked */
   if (!address) return setStatus("newSaveStatus","Enter complete address.","error");
   if (mobile && !/^\d{10}$/.test(mobile)) {
     return setStatus("newSaveStatus","Enter a valid 10 digit mobile number.","error");
@@ -9601,7 +9600,6 @@ async function prepareNewSave() {
       ["Address",record.address],
 
       ["Nature of Supply",record.nature_of_supply],
-      ["House Condition",record.house_condition],
       ["Mobile",record.mobile_number || "Not provided"],
       ["Meter Installed",record.meter_installed],
       ["Meter Number",record.meter_number || "Not applicable"],
