@@ -3642,6 +3642,7 @@ function dlRow(c) {
     load: parseMasterLoad(c.LOAD),
     doc: parseMasterDate(c.DOC),
     outstanding: dlOutstanding(c),
+    outAsOn: String(c.OUTSTANDING_AS_ON || ""),       /* set for BILLED consumers by the daily update */
     lastPay: parseMasterDate(c.LAST_PAY_DATE),
     lastPayAmount: String(c.LAST_PAY_AMOUNT || "")
   };
@@ -3895,9 +3896,18 @@ function dlMakePdf(rows, total, f, label) {
     "   Total outstanding: " + dlMoney(total);
   doc.text(meta, 10, 18);
 
+  /* where the outstanding comes from: billed consumers = Amount Payable of the daily Billed report */
+  const billedRows = rows.filter(r => r.outAsOn);
+  const asOn = billedRows.reduce((m, r) => r.outAsOn > m ? r.outAsOn : m, "");
+  const srcText = billedRows.length
+    ? "Outstanding: billed consumers (" + billedRows.length.toLocaleString("en-IN") + ") = Amount Payable of Billed report dated " +
+      formatListDate(asOn) + "; others = Master Data.  Last Pay Date / Amount: daily Billed / Unbilled report."
+    : "Outstanding, Last Pay Date / Amount: Master Data (no daily Billed report loaded yet - sync the app).";
+  doc.text(srcText, 10, 22);
+
   const filterLines = doc.splitTextToSize("Filters: " + dlFilterSummary(f), 277);
-  doc.text(filterLines, 10, 23);
-  const startY = 25 + filterLines.length * 3.5;
+  doc.text(filterLines, 10, 26);
+  const startY = 28 + filterLines.length * 3.5;
 
   const body = rows.map((r, i) => [
     i + 1, r.account, r.name, r.father, r.address, r.village, r.substation, r.feeder, r.mrSource,

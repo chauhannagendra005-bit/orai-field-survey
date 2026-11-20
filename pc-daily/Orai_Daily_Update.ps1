@@ -1,11 +1,13 @@
-<#
+﻿<#
   Orai Fieldwork App - daily Billed / Unbilled update            (Developed by Nagendra Singh)
 
   Runs every day at 9:30 AM (Windows Task Scheduler, retried every 30 minutes till 1:30 PM).
   1. Finds the newest complete pair in this folder:
         BILLED_DVVNL_DIV233422_DDMMYYYY.csv.gz  +  UNBILLED_DVVNL_DIV233422_DDMMYYYY.csv.gz
   2. Builds a small change file for the app's active master: per consumer the
-     last bill date, MR source, bill basis, units, reading and payments.
+     last bill date, MR source, bill basis, units, reading and payments
+     (last pay date / amount from both reports). For BILLED consumers the
+     Total Outstanding becomes the report's AMOUNT_PAYABLE.
   3. Uploads it to the Orai server. Phones load it on their next sync, and
      PROGRESS > Billing shows this month's billed / unbilled.
   Nothing is uploaded twice: the pair already sent for the current master is skipped.
@@ -213,7 +215,11 @@ try {
     param($f, $ix)
     $a = G $f $ix 'ACCT_ID'; if (-not $a) { return }
     [void]$billedSet.Add($a)
-    $changes[$a] = '{"LAST_BILL_DATE":' + (J (To-Ymd (G $f $ix 'BILL_DATE'))) +
+    # billed consumer: Total Outstanding = AMOUNT_PAYABLE of the billed report (kept from master if blank)
+    $pay = G $f $ix 'AMOUNT_PAYABLE'
+    $out = ''
+    if ($pay -ne '') { $out = '"TOTAL_OUTSTANDING":' + (Num $pay) + ',"OUTSTANDING_AS_ON":' + (J $pair.Date) + ',' }
+    $changes[$a] = '{' + $out + '"LAST_BILL_DATE":' + (J (To-Ymd (G $f $ix 'BILL_DATE'))) +
       ',"MR_SOURCE_CD":' + (J (G $f $ix 'MR_SOURCE_CD')) +
       ',"BILL_BASIS":' + (J (G $f $ix 'BILL_BASIS')) +
       ',"METER_READ_REMARK":' + (J (G $f $ix 'METER_READ_REMARK')) +
