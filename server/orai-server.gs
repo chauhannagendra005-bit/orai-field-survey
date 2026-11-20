@@ -38,7 +38,7 @@ const U = {ID:1, NAME:2, HASH:3, ACTIVE:4, TOKEN:5, ADMIN:6, ROLE:7, DIVISION:8,
 const USER_HEADERS = ['User ID','User Name','Password Hash','Active','Auth Token','Admin',
                       'Role','Division','Subdivision','Substation'];
 
-const SERVER_VERSION = 'orai-server-7 (separate work sheets)';
+const SERVER_VERSION = 'orai-server-8 (feeder/DT lists)';
 
 function doGet() {
   return json_({success:true, message:'Orai Fieldwork API is running', version:SERVER_VERSION});
@@ -87,6 +87,9 @@ function doPost(e) {
     if (a === 'master_download_part') return masterDownloadPart_(body);
     if (a === 'master_updates') return masterUpdatesDaily_(body);
     if (a === 'disconnection_report') return disconnectionReport_(body);
+    if (a === 'reference_data') return referenceData_(body);
+    if (a === 'reference_upload') return referenceUpload_(body);
+    if (a === 'reference_info') return referenceInfo_(body);
     if (a === 'daily_info') return dailyInfo_(body);
     if (a === 'daily_update_upload') return dailyUpdateUpload_(body);
     if (a === 'daily_update_get') return dailyUpdateGet_(body);
@@ -1065,6 +1068,106 @@ function setupWorkSheets() {
   });
   Object.keys(ACTIVITY).forEach(getActivitySheet_);
   Logger.log('Work sheets ready: ' + [SHEET_NAME].concat(Object.keys(ACTIVITY).map(function(t) { return ACTIVITY[t].sheet; })).join(', '));
+}
+
+/* =========================================================
+ * FEEDER / DT / VILLAGE LISTS (survey dropdowns)
+ * =========================================================
+ * "Feeders & DTs": one row per DT, in hierarchical order
+ *    Sub-Division > Substation > Feeder > DT.
+ * "Villages": the village / area names used in the consumer master.
+ * The app asks 'reference_data' (feeder dropdown grouped by substation,
+ * DT dropdown filtered by the chosen feeder). Admin uploads a new list
+ * from Admin > Master Data > Feeder / DT list ('reference_upload').
+ */
+const REF_SHEET = 'Feeders & DTs';
+const VILLAGE_SHEET = 'Villages';
+const REF_HEADERS = ['Sub-Division','Substation','Feeder','Feeder Code','DT No','DT (as shown in app)','DT Location',
+                     'DT Loc Code','Capacity (kVA)','Equipment No'];
+
+function referenceUpload_(body) {
+  const admin = requireAdmin_(body);
+  if (!admin) return json_({success:false, code:'AUTH', message:'Admin access required.'});
+  const feeders = Array.isArray(body.feeders) ? body.feeders : [];
+  const villages = Array.isArray(body.villages) ? body.villages : [];
+  if (!feeders.length) return json_({success:false, message:'No feeders in the list.'});
+
+  const rows = [];
+  feeders.forEach(function(f) {
+    (f.dts || []).forEach(function(d, i) {
+      rows.push([f.subdivision || '', f.substation || '', f.feeder || '', "'" + String(f.feeder_code || ''),
+                 i + 1, d.label || '', d.location || '', d.code || '', d.kva || '', "'" + String(d.equipment || '')]);
+    });
+  });
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(REF_SHEET);
+  if (sh) sh.clear(); else sh = ss.insertSheet(REF_SHEET);
+  sh.getRange(1, 1, 1, REF_HEADERS.length).setValues([REF_HEADERS]).setFontWeight('bold')
+    .setBackground('#0f766e').setFontColor('#ffffff');
+  sh.setFrozenRows(1);
+  if (rows.length) sh.getRange(2, 1, rows.length, REF_HEADERS.length).setValues(rows);
+
+  if (villages.length) {
+    let vs = ss.getSheetByName(VILLAGE_SHEET);
+    if (vs) vs.clear(); else vs = ss.insertSheet(VILLAGE_SHEET);
+    const list = villages.map(String).filter(String).sort();
+    vs.getRange(1, 1).setValue('Village / Area').setFontWeight('bold');
+    vs.getRange(2, 1, list.length, 1).setValues(list.map(function(v) { return [v]; }));
+    vs.setFrozenRows(1);
+  }
+  const version = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM-dd HH:mm');
+  PropertiesService.getScriptProperties().setProperty('REF_VERSION', version);
+  return json_({success:true, version:version, feeders:feeders.length, dts:rows.length, villages:villages.length,
+                message:'Feeder / DT list saved: ' + feeders.length + ' feeders, ' + rows.length + ' DTs' +
+                        (villages.length ? ', ' + villages.length + ' villages / areas' : '') +
+                        '. Phones get it with CHECK AND UPDATE (villages, feeders, DTs).'});
+}
+
+function referenceData_(body) {
+  const s = getUserByToken_(String(body.token || ''));
+  if (!s) return json_({success:false, code:'AUTH', message:'Login invalid or user disabled.'});
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(REF_SHEET);
+  const vs = ss.getSheetByName(VILLAGE_SHEET);
+  if (!sh || sh.getLastRow() < 2) {
+    return json_({success:false, message:'Feeder / DT list is not uploaded yet (Admin > Master Data > Feeder / DT list).'});
+  }
+  const mine = String(s.substation || '').split(',').map(function(x) { return x.trim().toLowerCase(); }).filter(String);
+  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, REF_HEADERS.length).getValues();
+  const build = function(filter) {
+    const out = [], byKey = {};
+    rows.forEach(function(r) {
+      const sub = String(r[1]), fd = String(r[2]);
+      if (filter && filter.indexOf(sub.toLowerCase()) === -1) return;
+      const key = sub + '||' + fd;
+      if (!byKey[key]) { byKey[key] = {subdivision:String(r[0]), substation:sub, feeder:fd, dts:[]}; out.push(byKey[key]); }
+      if (r[5]) byKey[key].dts.push(String(r[5]));
+    });
+    return out;
+  };
+  let feeders = (!s.is_admin && mine.length) ? build(mine) : build(null);
+  if (!feeders.length) feeders = build(null);          /* user's substations not in the list: show all */
+  const villages = vs && vs.getLastRow() > 1
+    ? vs.getRange(2, 1, vs.getLastRow() - 1, 1).getValues().map(function(r) { return String(r[0]); }).filter(String)
+    : [];
+  return json_({success:true, version:PropertiesService.getScriptProperties().getProperty('REF_VERSION') || '',
+                villages:villages, feeders:feeders});
+}
+
+/* Admin screen: what is loaded now. */
+function referenceInfo_(body) {
+  if (!requireAdmin_(body)) return json_({success:false, code:'AUTH', message:'Admin access required.'});
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(REF_SHEET), vs = ss.getSheetByName(VILLAGE_SHEET);
+  const n = sh ? Math.max(sh.getLastRow() - 1, 0) : 0;
+  let feeders = 0, subs = 0;
+  if (n) {
+    const r = sh.getRange(2, 2, n, 2).getValues();
+    feeders = new Set(r.map(function(x) { return x[0] + '||' + x[1]; })).size;
+    subs = new Set(r.map(function(x) { return x[0]; })).size;
+  }
+  return json_({success:true, version:PropertiesService.getScriptProperties().getProperty('REF_VERSION') || '',
+                dts:n, feeders:feeders, substations:subs, villages:vs ? Math.max(vs.getLastRow() - 1, 0) : 0});
 }
 
 function checkUploadStatus_(body) {

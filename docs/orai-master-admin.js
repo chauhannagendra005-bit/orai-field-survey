@@ -98,6 +98,16 @@
         billable, billed, billing % and unbilled (SDO / substation / feeder / village, by category and load);
         tap any number for the consumer list. It needs the LAST_BILL_DATE column in the master.</p>
       <button id="omProgressBtn" class="secondary" type="button">OPEN BILLED / UNBILLED REPORT</button>
+
+      <h3>Feeder / DT list (survey dropdowns)</h3>
+      <p class="muted" style="font-size:13px">Choose the PM-module transformer Excel (columns Substation, Feeder,
+        DT Location, DT Loc Code, DT Capacity). It is arranged Sub-Division → Substation → Feeder → DT; village / area
+        names are taken from the consumer master on this device. (फीडर / ट्रांसफार्मर सूची)</p>
+      <div id="omRefInfo" class="om-box">Not loaded yet.</div>
+      <input id="omRefFile" type="file" accept=".xlsx,.xls,.csv">
+      <div id="omRefCheck"></div>
+      <button id="omRefUploadBtn" class="primary" type="button" disabled>UPLOAD FEEDER / DT LIST</button>
+      <div id="omRefStatus" class="status"></div>
     `;
     const usersHead = Array.from(card.querySelectorAll("h3")).find(h => /Users/.test(h.textContent));
     card.insertBefore(sec, usersHead || null);
@@ -105,6 +115,8 @@
     $("omFile").addEventListener("change", onPick);
     $("omSdo").addEventListener("change", () => { if ($("omFile").files[0]) onPick(); });
     $("omUploadBtn").addEventListener("click", upload);
+    $("omRefFile").addEventListener("change", onRefPick);
+    $("omRefUploadBtn").addEventListener("click", refUpload);
     $("omRefreshBtn").addEventListener("click", () => { checkServer(); loadList(); });
     $("omProgressBtn").addEventListener("click", () => {
       const b = $("progressBtn");
@@ -402,10 +414,133 @@
     }));
   }
 
+  /* ---------- Feeder / DT list ---------- */
+  let refPicked = null;
+  const TOWN_SUBS = { "KALPI ROAD": "Kalpi Road", "KONCH NAKA": "Konch Naka", "ORAI KALPI ROAD": "Orai Kalpi Road",
+    "KARMER ROAD": "Karmer Road", "SUSHEEL NAGAR": "Susheel Nagar", "RAHIYA": "Rahiya" };
+  /* Same substation names as the consumer master ("33/11 KV KALPI ROAD" -> "Kalpi Road", "33/11 KV AIT" -> "AIT"). */
+  function refSubName(s) {
+    const n = String(s || "").replace(/^\s*\d+\s*\/\s*\d+\s*KV\s*/i, "").replace(/\s+/g, " ").trim().toUpperCase();
+    return TOWN_SUBS[n] || n;
+  }
+  function buildReference(rows) {
+    const head = (rows[0] || []).map(h => String(h).trim().toLowerCase());
+    const col = (...names) => { for (const n of names) { const i = head.indexOf(n.toLowerCase()); if (i !== -1) return i; } return -1; };
+    const C = { sub: col("Substation"), fd: col("Feeder"), fdc: col("Feeder Code"), loc: col("DT Location", "FuncLoc Desc"),
+      code: col("DT Loc Code", "Func. Location"), kva: col("DT Capacity"), div: col("Sub-Division"), eq: col("Equipment") };
+    const missing = ["sub", "fd", "loc", "code"].filter(k => C[k] < 0);
+    if (missing.length) throw new Error("Columns not found: " + missing.map(k => ({ sub: "Substation", fd: "Feeder", loc: "DT Location", code: "DT Loc Code" })[k]).join(", "));
+    const g = (r, k) => C[k] < 0 ? "" : String(r[C[k]] ?? "").trim();
+    const map = new Map();
+    for (const r of rows.slice(1)) {
+      const sub = refSubName(g(r, "sub")), fd = g(r, "fd").toUpperCase(), code = g(r, "code");
+      if (!sub || !fd || !code) continue;
+      const key = sub + "||" + fd;
+      if (!map.has(key)) map.set(key, { subdivision: "", substation: sub, feeder: fd, feeder_code: g(r, "fdc"), dts: [], _div: {} });
+      const f = map.get(key);
+      const dv = g(r, "div");
+      if (dv) f._div[dv] = (f._div[dv] || 0) + 1;
+      const loc = g(r, "loc").replace(/\s+/g, " ");
+      const kva = g(r, "kva");
+      const no = code.split("-").pop();
+      f.dts.push({ code, location: loc, kva, equipment: g(r, "eq"),
+        label: no + " · " + (loc || "DT") + (kva ? " · " + kva + " kVA" : "") });
+    }
+    for (const f of map.values()) {                       /* a feeder belongs to the sub-division most of its DTs list */
+      f.subdivision = Object.entries(f._div).sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+      delete f._div;
+    }
+    const seq = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+    const feeders = Array.from(map.values()).sort((a, b) =>
+      seq(a.subdivision, b.subdivision) || seq(a.substation, b.substation) || seq(a.feeder, b.feeder));
+    for (const f of feeders) {
+      f.dts.sort((a, b) => seq(a.code, b.code));
+      const seen = {};
+      for (const d of f.dts) { if (seen[d.label]) d.label += " (" + d.code + ")"; seen[d.label] = 1; }
+    }
+    return feeders;
+  }
+  function masterVillages() {
+    return new Promise(resolve => {
+      try {
+        if (!state.masterDb || !state.masterReady) return resolve([]);
+        const set = new Set();
+        const req = state.masterDb.transaction(state.activeMasterStore, "readonly").objectStore(state.activeMasterStore).openCursor();
+        req.onsuccess = () => {
+          const c = req.result;
+          if (!c) return resolve(Array.from(set));
+          const v = String(c.value.feeded_village_name || "").trim();
+          if (v) set.add(v.toUpperCase());
+          c.continue();
+        };
+        req.onerror = () => resolve([]);
+      } catch (e) { resolve([]); }
+    });
+  }
+  async function onRefPick() {
+    refPicked = null;
+    $("omRefUploadBtn").disabled = true;
+    const box = $("omRefCheck"), f = $("omRefFile").files[0];
+    if (!f) { box.innerHTML = ""; return; }
+    box.innerHTML = `<div class="om-box">Reading ${escapeHtml(f.name)}…</div>`;
+    await new Promise(r => setTimeout(r, 30));
+    try {
+      const wb = XLSX.read(new Uint8Array(await f.arrayBuffer()), { type: "array", raw: true, dense: true });
+      const name = wb.SheetNames.find(n => /^data$/i.test(n)) || wb.SheetNames[0];
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: "", raw: false });
+      const feeders = buildReference(rows);
+      const villages = await masterVillages();
+      const dts = feeders.reduce((a, x) => a + x.dts.length, 0);
+      const subs = {};
+      feeders.forEach(x => { const k = (x.subdivision ? x.subdivision + " › " : "") + x.substation; subs[k] = subs[k] || { f: 0, d: 0 }; subs[k].f++; subs[k].d += x.dts.length; });
+      box.innerHTML = `<div class="om-box"><b>${escapeHtml(f.name)}</b> (sheet "${escapeHtml(name)}"): ` +
+        `${Object.keys(subs).length} substations, ${feeders.length} feeders, <b>${dts.toLocaleString("en-IN")} DTs</b>` +
+        (villages.length ? `, ${villages.length.toLocaleString("en-IN")} villages / areas from the master` :
+          `<br><span class="om-warn">⚠ Master Data is not loaded on this device, so the village list will not be changed.</span>`) +
+        `<div style="max-height:160px;overflow:auto;margin-top:6px"><table><tr><th>Substation</th><th>Feeders</th><th>DTs</th></tr>` +
+        Object.entries(subs).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${v.f}</td><td>${v.d}</td></tr>`).join("") +
+        `</table></div></div>`;
+      refPicked = { feeders, villages };
+      $("omRefUploadBtn").disabled = false;
+    } catch (e) {
+      box.innerHTML = `<div class="om-box om-bad">Could not read the file: ${escapeHtml(e.message || String(e))}</div>`;
+    }
+  }
+  async function refUpload() {
+    if (!refPicked) return;
+    $("omRefUploadBtn").disabled = true;
+    setStatus("omRefStatus", "Uploading the feeder / DT list…");
+    const r = await call("reference_upload", {
+      feeders: refPicked.feeders.map(f => ({ subdivision: f.subdivision, substation: f.substation, feeder: f.feeder,
+        feeder_code: f.feeder_code, dts: f.dts })),
+      villages: refPicked.villages
+    }, 1);
+    if (r && r.success) {
+      setStatus("omRefStatus", "✓ " + r.message, "ok");
+      refPicked = null; $("omRefFile").value = ""; $("omRefCheck").innerHTML = "";
+      loadRefInfo();
+      if (typeof checkVillageListUpdate === "function") { try { checkVillageListUpdate(true); } catch (e) {} }
+    } else {
+      setStatus("omRefStatus", String((r && r.message) || "Upload failed.").replace(/^\u2063/, ""), "error");
+      $("omRefUploadBtn").disabled = false;
+    }
+  }
+  async function loadRefInfo() {
+    const box = $("omRefInfo");
+    if (!box) return;
+    const r = await call("reference_info", {}, 1);
+    if (!r || !r.success) { box.textContent = "Feeder / DT list: needs server version 8."; return; }
+    box.innerHTML = r.dts
+      ? `<b>On the server</b>: ${r.substations} substations, ${r.feeders} feeders, ${Number(r.dts).toLocaleString("en-IN")} DTs, ` +
+        `${Number(r.villages).toLocaleString("en-IN")} villages / areas <small>(updated ${escapeHtml(r.version)})</small>`
+      : `<span class="om-warn">No feeder / DT list on the server yet — surveys cannot be saved until it is uploaded.</span>`;
+  }
+  window.OraiRef = { buildReference, refSubName };
+
   function init() {
     html();
     const adminBtn = $("adminBtn");
-    if (adminBtn) adminBtn.addEventListener("click", () => setTimeout(() => { checkServer(); loadList(); }, 300));
+    if (adminBtn) adminBtn.addEventListener("click", () => setTimeout(() => { checkServer(); loadList(); loadRefInfo(); }, 300));
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
