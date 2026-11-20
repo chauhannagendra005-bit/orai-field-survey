@@ -30,7 +30,7 @@ const ROLES_SHEET = 'Roles';
 /* Admin created by setupOrai(). Change the password after first login. */
 const ADMIN_USER_ID = 'admin';
 const ADMIN_NAME = 'Nagendra Singh (SDO)';
-const ADMIN_PASSWORD = '';   /* only used if the Users sheet does not exist yet: set one before first setup */
+const ADMIN_PASSWORD = 'CHANGE_ME';
 const ORAI_DIVISION = 'EDD-I Orai';
 
 /* Users sheet columns (1-based) */
@@ -38,7 +38,7 @@ const U = {ID:1, NAME:2, HASH:3, ACTIVE:4, TOKEN:5, ADMIN:6, ROLE:7, DIVISION:8,
 const USER_HEADERS = ['User ID','User Name','Password Hash','Active','Auth Token','Admin',
                       'Role','Division','Subdivision','Substation'];
 
-const SERVER_VERSION = 'orai-server-9 (dashboard summaries)';
+const SERVER_VERSION = 'orai-server-10 (video log, no video upload)';
 
 function doGet() {
   return json_({success:true, message:'Orai Fieldwork API is running', version:SERVER_VERSION});
@@ -146,7 +146,7 @@ function setupOrai() {
   getMastersSheet_();
   getMasterFolder_();
 
-  Logger.log('Setup done (Users, Hierarchy, Roles, Masters, Drive folder).');
+  Logger.log('Setup done (Users, Hierarchy, Roles, Masters, Drive folder). Admin login -> User ID: ' + ADMIN_USER_ID + '  Password: ' + ADMIN_PASSWORD);
 }
 
 /* ---------- USERS ---------- */
@@ -158,7 +158,6 @@ function getUsersSheet_() {
   if (!sheet) {
     sheet = ss.insertSheet(USERS_SHEET);
     sheet.getRange(1,1,1,USER_HEADERS.length).setValues([USER_HEADERS]);
-    if (!ADMIN_PASSWORD) throw new Error('Set ADMIN_PASSWORD at the top of the script before the first setupOrai.');
     sheet.getRange(2,1,1,USER_HEADERS.length).setValues([[
       ADMIN_USER_ID, ADMIN_NAME, sha256_(ADMIN_PASSWORD), 'YES', newToken_(), 'YES',
       'Admin', ORAI_DIVISION, '', ''
@@ -918,8 +917,47 @@ function uploadActivities_(session, records) {
     });
     if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
     out.uploaded += rows.length;
+    logVideos_(type, byType[type].filter(function(r) { return rows.some(function(x) { return x[0] === String(r[ACTIVITY[type].id] || '').trim(); }); }), who);
   });
   return out;
+}
+
+/* ---- Video Log: videos are NOT uploaded; they stay on the user's phone (Download folder).
+   One row per video: who, which phone, date and time. ---- */
+const VIDEO_LOG_SHEET = 'Video Log';
+const VIDEO_LOG_HEADERS = ['Logged At', 'User ID', 'User Name', 'User Subdivision', 'Activity', 'Entry ID', 'Account ID',
+  'Consumer Name', 'Status', 'Video File', 'Video Date', 'Video Time', 'Duration (sec)', 'Size (MB)',
+  'Device', 'Device ID', 'Saved On'];
+
+function videoLogSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(VIDEO_LOG_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(VIDEO_LOG_SHEET);
+    sh.getRange(1, 1, 1, VIDEO_LOG_HEADERS.length).setValues([VIDEO_LOG_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function logVideos_(type, recs, who) {
+  const list = (recs || []).filter(function(r) { return r && String(r.video_file || '').trim(); });
+  if (!list.length) return;
+  const now = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM-dd HH:mm:ss');
+  const rows = list.map(function(r) {
+    const at = new Date(r.video_recorded_at || r.created_at || '');
+    const ok = !isNaN(at);
+    return [now, who.user_id, who.user_name || '', who.subdivision || '',
+      type === 'DISCONNECTION' ? 'Disconnection' : (type === 'RECHECK' ? 'Recheck' : type),
+      String(r[ACTIVITY[type].id] || ''), "'" + String(r.account_id || ''), r.consumer_name || '',
+      r.disconnection_status || r.present_status || '', r.video_file || '',
+      ok ? Utilities.formatDate(at, 'Asia/Kolkata', 'dd-MM-yyyy') : '',
+      ok ? Utilities.formatDate(at, 'Asia/Kolkata', 'hh:mm a') : '',
+      Number(r.video_duration_sec) || '', r.video_size_bytes ? Math.round(Number(r.video_size_bytes) / 10485.76) / 100 : '',
+      r.video_device || '', r.video_device_id || '', r.video_saved_on || 'Phone (Download folder)'];
+  });
+  const sh = videoLogSheet_();
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, VIDEO_LOG_HEADERS.length).setValues(rows);
 }
 
 /* ---- Door to Door Survey: the original 27 columns stay as they are (Dashboard and corrections
@@ -1224,7 +1262,7 @@ function dashEntries_() {
         meter:dashTxt_(r[10]).toUpperCase(), ac:dashTxt_(r[11]).toUpperCase(), outstanding:dashTxt_(r[24]),
         status:dashTxt_(r[16]), remarks:dashTxt_(r[26]),
         sub:j.substation || (('Feeder Substation' in ix) ? dashTxt_(r[ix['Feeder Substation']]) : '') || firstSub(u.substation) || 'Unassigned',
-        video:j.video_file ? 'video_pending' : 'video_none'});
+        video:j.video_file ? 'video_on_phone' : 'video_none', video_device:j.video_device || '', video_at:j.video_recorded_at || ''});
     });
   }
 
@@ -1244,7 +1282,7 @@ function dashEntries_() {
         status:v(kinds[kind]).toUpperCase(), payment_mode:v('Payment Mode'), paid_amount:v('Paid Amount'),
         committed_date:v('Committed Payment Date') || v('Payment Date'), outstanding:v('Outstanding'), remarks:v('Remarks'),
         meter:v('Meter Status'), sub:j.substation || firstSub(v('User Substation')) || 'Unassigned',
-        video:v('Video') ? 'video_pending' : 'video_none'});
+        video:v('Video') ? 'video_on_phone' : 'video_none', video_device:j.video_device || '', video_at:j.video_recorded_at || ''});
     });
   });
   return out;

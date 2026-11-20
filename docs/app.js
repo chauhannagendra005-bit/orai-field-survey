@@ -2451,7 +2451,7 @@ function saveRecordedVideo() {
   if ($(ids.info)) {
     $(ids.info).textContent =
       "Video ready: " + videoSummary(state.activityVideo[type]) +
-      ". It will be saved to Download when you submit.";
+      ". It will be saved in this phone's Download folder when you submit (not uploaded).";
   }
   setStatus(ids.status, "");
 
@@ -2512,7 +2512,44 @@ function attachVideoToRecord(record, video) {
   record.video_size_bytes = video.size;
   record.video_duration_sec = video.durationSec;
   record.video_recorded_at = video.recordedAt;
-  record.video_upload = !!getVideoSettings().video_upload;
+  record.video_upload = false;                        /* videos are never uploaded */
+  record.video_saved_on = "Phone (Download folder)";
+  record.video_device = videoDeviceLabel();
+  record.video_device_id = videoDeviceId();
+}
+
+/* ---------- which phone has the video (sent with the entry, logged on the server) ---------- */
+function videoDeviceId() {
+  const key = "fieldworkDeviceId";
+  try {
+    let id = localStorage.getItem(key);
+    if (!id) {
+      id = "DEV-" + Date.now().toString(36).toUpperCase() + "-" + Math.random().toString(36).slice(2, 6).toUpperCase();
+      localStorage.setItem(key, id);
+    }
+    return id;
+  } catch (e) { return ""; }
+}
+let videoDeviceModel = "";
+(async () => {                                        /* exact model on Android Chrome */
+  try {
+    if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+      const h = await navigator.userAgentData.getHighEntropyValues(["model", "platformVersion"]);
+      if (h.model) videoDeviceModel = h.model + (h.platformVersion ? " (Android " + String(h.platformVersion).split(".")[0] + ")" : "");
+    }
+  } catch (e) {}
+})();
+function videoDeviceLabel() {
+  if (videoDeviceModel) return videoDeviceModel;
+  const ua = navigator.userAgent || "";
+  let m = ua.match(/Android\s+([\d.]+);\s*([^;)]+?)(?:\s+Build|\))/);
+  if (m && m[2] && m[2] !== "K") return m[2].trim() + " (Android " + m[1].split(".")[0] + ")";
+  if ((m = ua.match(/Android\s+([\d.]+)/))) return "Android " + m[1].split(".")[0] + " phone";
+  if (/iPhone/.test(ua)) return "iPhone";
+  if (/iPad/.test(ua)) return "iPad";
+  if (/Windows/.test(ua)) return "Windows PC";
+  if (/Mac OS/.test(ua)) return "Mac";
+  return "Unknown device";
 }
 
 function openVideoDB() {
@@ -2535,7 +2572,7 @@ function openVideoDB() {
  * hidden copy deleted. The Download copy is never touched.
  */
 async function keepVideoForUpload(record, video) {
-
+  return;                                            /* videos stay only in the phone's Download folder */
   try {
     const db = await openVideoDB();
     await new Promise((resolve, reject) => {
@@ -2605,6 +2642,9 @@ function checkActivityVideo(type, consumer, required) {
 let videoUploadRunning = false;
 
 async function getPendingVideos() {
+  return [];                                         /* nothing is uploaded any more */
+}
+async function getPendingVideosOld() {
   const db = await openVideoDB();
   try {
     const all = await new Promise((resolve, reject) => {
@@ -2748,6 +2788,7 @@ async function uploadOneVideo(video, onProgress) {
 }
 
 async function uploadPendingVideos() {
+  return;                                            /* video upload removed */
 
   if (videoUploadRunning) return;
   if (!state.sessionToken) return showLogin();
@@ -10454,11 +10495,10 @@ function renderDashboardSummaries(result) {
   };
   const row = (label, key, extra) => Object.assign({ label: label, key: key, get: c => (c && c[key]) || 0 }, extra || {});
   const videoRows = missingLabel => [
-    row("Videos uploaded", "video_uploaded", { sep: true, match: x => x.video === "video_uploaded" }),
-    row("Videos recorded, not uploaded yet", "video_pending", { match: x => x.video === "video_pending" }),
+    row("Videos saved on user's phone", "video_on_phone", { sep: true, match: x => x.video === "video_on_phone" || x.video === "video_pending" }),
     row(missingLabel, "video_none", { match: x => x.video === "video_none" })
   ];
-  const videoNote = "Tap a number to see those consumers. Entries still waiting on a phone are counted after they are uploaded.";
+  const videoNote = "Videos are not uploaded; they stay in the user's phone (Download folder). Tap a number to see which phone and the date and time of each video. Full log: 'Video Log' sheet.";
   const st = s => x => x.status === s;
   const all = () => true;
   mtx("dashSurveyTable", "SURVEY", by.survey, [
@@ -10563,11 +10603,15 @@ function dashListColumns(kind) {
   if (kind === "SURVEY") return base.concat([["Meter", "meter"], ["AC", "ac"], ["Outstanding", "outstanding"]]);
   if (kind === "PHONE_CALLING") return base.concat([["Response", "status"], ["Committed Date", "committed_date"], ["Outstanding", "outstanding"], ["Remarks", "remarks"]]);
   return base.concat([["Status", "status"], ["Payment Mode", "payment_mode"], ["Committed / Payment Date", "committed_date"],
-    ["Paid Amount (by user)", "paid_amount"], ["Outstanding", "outstanding"], ["Video", "video"]]);
+    ["Paid Amount (by user)", "paid_amount"], ["Outstanding", "outstanding"], ["Video (phone, date & time)", "video"]]);
 }
-const dashVideoText = v => ({ video_uploaded: "Uploaded", video_pending: "Pending", video_none: "No video" }[v] || "");
+const dashVideoText = v => ({ video_uploaded: "Uploaded", video_pending: "On phone", video_on_phone: "On phone", video_none: "No video" }[v] || "");
 function dashListCell(x, key) {
-  if (key === "video") return dashVideoText(x.video);
+  if (key === "video") {
+    if (x.video !== "video_on_phone" && x.video !== "video_pending") return dashVideoText(x.video);
+    const at = x.video_at ? shareDateText(x.video_at) : "";
+    return "On phone" + (x.video_device ? ": " + x.video_device : "") + (at ? ", " + at : "");
+  }
   if (key === "outstanding") return Math.round(Number(String(x.outstanding).replace(/,/g, "")) || 0);
   return x[key] == null ? "" : String(x[key]);
 }
@@ -14115,3 +14159,13 @@ async function v151ExportLocalData() {
   },delay);
   files.forEach((file,i)=>downloadCsv(file,i*700));
 }
+
+/* v20.19.23: video upload removed. Old hidden copies (kept only for upload) are deleted once;
+   the user's own copy in the Download folder is never touched. */
+(function dropHiddenVideoCopies() {
+  try {
+    if (localStorage.getItem("fieldworkVideoDbDropped") === "1") return;
+    const req = indexedDB.deleteDatabase(VIDEO_DB_NAME);
+    req.onsuccess = () => { try { localStorage.setItem("fieldworkVideoDbDropped", "1"); } catch (e) {} };
+  } catch (e) {}
+})();
