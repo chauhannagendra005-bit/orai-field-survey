@@ -1600,7 +1600,7 @@ function updateVillageListInfo() {
       0
     );
     info.textContent =
-      `Villages: ${saved.villages.length} · Feeders: ${saved.feeders.length} · DTs: ${dtCount} · Last checked: ${formatMasterDate(saved.checked_at)}`;
+      `Feeders: ${saved.feeders.length} · DTs: ${dtCount} · Last checked: ${formatMasterDate(saved.checked_at)}`;
   } else if (saved || getLegacyVillageList()) {
     info.textContent =
       "Using the previously saved village list. Tap the button below to load the latest village, feeder and DT lists.";
