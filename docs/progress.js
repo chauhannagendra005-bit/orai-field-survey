@@ -297,7 +297,7 @@
 
   const saveKey = () => "fieldworkProgress:" + String(state.userId || "").trim().toLowerCase();
   function loadSel() {
-    try { sel = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(saveKey()) || "{}")); }
+    try { sel = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(saveKey()) || "{}")); if (sel.level === "village") sel.level = "sub"; }
     catch (e) { sel = Object.assign({}, DEFAULTS); }
     FILTERS.forEach(([k]) => {                       /* older saved choice was a single value */
       if (typeof sel[k] === "string") sel[k] = sel[k] ? [sel[k]] : null;
@@ -1002,8 +1002,7 @@
     '<option value="ONE">One file(एक फ़ाइल)</option>' +
     '<option value="sdo">A file for each SDO(हर एसडीओ की अलग)</option>' +
     '<option value="substation">A file for each Substation(हर उपकेंद्र की अलग)</option>' +
-    '<option value="feeder">A file for each Feeder(हर फीडर की अलग)</option>' +
-    '<option value="village">A file for each Village(हर ग्राम की अलग)</option>';
+    '<option value="feeder">A file for each Feeder(हर फीडर की अलग)</option>';
 
   /* v20.8: Excel the same way: one file, or one file for each group */
   async function saveXlsxSet(groups, write, base, title, statusId) {

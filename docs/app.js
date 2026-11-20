@@ -7661,7 +7661,7 @@ function renderActivityCorrectionForm(record){
     fields+=`<label for="activityCorrRemarks">Remark</label><textarea id="activityCorrRemarks" rows="3">${escapeHtml(record.remarks||"")}</textarea>`;
   } else {
 
-    fields+=activityCorrectionSelect("activityCorrVillage","Village",record.village,[...new Set([record.village||"", ...Array.from($("village").options).map(o=>o.value).filter(Boolean)])].filter(Boolean));
+    if (false) fields+=activityCorrectionSelect("activityCorrVillage","Village",record.village,[...new Set([record.village||"", ...Array.from($("village").options).map(o=>o.value).filter(Boolean)])].filter(Boolean));
     fields+=`<label for="activityCorrFeeder">Feeder</label><select id="activityCorrFeeder"><option value="">Select feeder</option></select>`;
     fields+=`<label for="activityCorrDt">DT</label><select id="activityCorrDt"><option value="">Select DT</option></select>`;
     fields+=activityCorrectionSelect("activityCorrMeterStatus","Meter Condition",record.meter_condition,["OK","DAMAGED","NOT INSTALLED"]);
@@ -7744,7 +7744,7 @@ function prepareActivityCorrectionSave(original){
     if(!corrected.call_response) return setStatus("activityCorrectionStatus","Select call response.","error");
     if(corrected.call_response==="कुछ दिन बाद जमा करेंगे" && !corrected.committed_payment_date) return setStatus("activityCorrectionStatus","Enter committed payment date.","error");
   } else {
-    corrected.village=$("activityCorrVillage").value;
+    corrected.village=$("activityCorrVillage") ? ($("activityCorrVillage").value || record.village || "") : (record.village || "");
     corrected.meter_condition=$("activityCorrMeterStatus").value;
     corrected.ac_installed=$("activityCorrAc").value;
     corrected.mobile_number=$("activityCorrMobile").value.replace(/\D/g,"");
@@ -7754,7 +7754,7 @@ function prepareActivityCorrectionSave(original){
     corrected.last_updated_by_user_id=state.userId||"";
     corrected.last_updated_by_name=state.userName||state.userId||"";
     corrected.last_updated_at=new Date().toISOString();
-    if(!corrected.village) return setStatus("activityCorrectionStatus","Select village.","error");
+    /* ORAI urban: village not required */
     if(!corrected.meter_condition) return setStatus("activityCorrectionStatus","Select meter condition.","error");
     if(!corrected.ac_installed) return setStatus("activityCorrectionStatus","Select AC Installed: YES or NO.","error");
     if(!/^\d{10}$/.test(corrected.mobile_number)) return setStatus("activityCorrectionStatus","Enter a valid 10 digit mobile number.","error");
@@ -7804,7 +7804,7 @@ function prepareActivityCorrectionSave(original){
   else if(type==="RECHECK") items.push(["Present Status",corrected.present_status], ["Payment Mode",corrected.payment_mode||"—"], ["Current Meter Status",corrected.meter_status||"—"], ["Site Reading",corrected.current_reading||"—"], ["Mobile",corrected.mobile_number||"—"], ["Remark",corrected.remarks||"—"]);
   else if(type==="PHONE_CALLING") items.push(["Mobile",corrected.mobile_number], ["Call Response",corrected.call_response], ["Committed Payment Date",corrected.committed_payment_date||"—"], ["Remark",corrected.remarks||"—"]);
 
-  else items.push(["Village",corrected.village], ["Feeder",corrected.feeder?feederDisplay(corrected):"—"], ["DT",corrected.dt||"—"], ["Meter Condition",corrected.meter_condition], ["Site Reading",corrected.site_reading||"—"], ["Site Max Demand",corrected.site_max_demand||"—"], ["Theft Possibility",corrected.theft_possibility||"—"], ["AC Installed",corrected.ac_installed], ["Mobile",corrected.mobile_number], ["Remark",corrected.remarks||"—"]);
+  else items.push(["Feeder",corrected.feeder?feederDisplay(corrected):"—"], ["DT",corrected.dt||"—"], ["Meter Condition",corrected.meter_condition], ["Site Reading",corrected.site_reading||"—"], ["Site Max Demand",corrected.site_max_demand||"—"], ["Theft Possibility",corrected.theft_possibility||"—"], ["AC Installed",corrected.ac_installed], ["Mobile",corrected.mobile_number], ["Remark",corrected.remarks||"—"]);
   openConfirmation("Confirm Correction",items,()=>saveActivityCorrectionLocal(corrected));
 }
 
@@ -9283,7 +9283,8 @@ async function prepareExistingSave() {
     return;
   }
 
-  const village=$("village").value;
+  /* ORAI (urban): no village choice; the consumer's area from the master is kept instead */
+  const village=$("village").value || String((state.current && state.current.feeded_village_name) || "");
   const natureOfSupply=$("natureOfSupply").value;
   const houseCondition=$("houseCondition").value;
   const consumerPaymentResponse=$("consumerPaymentResponse").value;
@@ -9297,7 +9298,7 @@ async function prepareExistingSave() {
   const status=surveyStatusForExisting();
 
 
-  if (!village) return setStatus("saveStatus","Select village.","error");
+  /* ORAI urban: village not asked */
 
   const feederValue=$("feeder").value;
   const dt=$("dt").value;
@@ -9380,7 +9381,6 @@ async function prepareExistingSave() {
       ["Account ID",record.account_id],
       ["Consumer",record.consumer_name],
 
-      ["Village",record.village],
       ["Feeder",feederDisplay(record)],
       ["DT",record.dt],
       ["Nature of Supply",record.nature_of_supply],
@@ -9491,7 +9491,7 @@ async function prepareNewSave() {
   const connectionType=$("newConnectionType").value;
   const name=$("newName").value.trim();
   const father=$("newFather").value.trim();
-  const village=$("newVillage").value;
+  const village=$("newVillage").value;      /* ORAI urban: not asked (empty) */
   const address=$("newAddress").value.trim();
   const mobile=$("newMobile").value.replace(/\D/g,"");
   const installed=$("newMeterInstalled").value;
@@ -9507,7 +9507,7 @@ async function prepareNewSave() {
   if (!connectionType) return setStatus("newSaveStatus","Select connection status.","error");
   if (!name) return setStatus("newSaveStatus","Enter consumer/occupant name.","error");
 
-  if (!village) return setStatus("newSaveStatus","Select village.","error");
+  /* ORAI urban: village not asked */
 
   const feederValue=$("newFeeder").value;
   const dt=$("newDt").value;
@@ -9596,7 +9596,6 @@ async function prepareNewSave() {
       ["Connection Status",record.connection_type],
       ["Name",record.consumer_name],
 
-      ["Village",record.village],
       ["Feeder",feederDisplay(record)],
       ["DT",record.dt],
       ["Address",record.address],
@@ -10149,12 +10148,12 @@ async function findCorrectionRecord() {
 async function saveCorrection() {
   if (!correctionRecord) return;
 
-  const village=$("corrVillage").value;
+  const village=$("corrVillage").value || String((correctionRecord && correctionRecord.village) || "");
   const meter=$("corrMeterCondition").value;
   const ac=$("corrAcInstalled").value;
   const mobile=$("corrMobile").value.replace(/\D/g,"");
 
-  if (!village) return setStatus("correctionStatus","Select village.","error");
+  /* ORAI urban: village not required */
   if (!meter) return setStatus("correctionStatus","Select meter condition.","error");
   if (!ac) return setStatus("correctionStatus","Select AC Installed: YES or NO.","error");
   if (!/^\d{10}$/.test(mobile)) {
@@ -10553,7 +10552,7 @@ async function openDashList(kind, sub, rowIndex) {
 function dashListColumns(kind) {
   const base = [["Date", "date"], ["Substation", "sub"], ["User", "user_name"], ["Account ID", "account_id"], ["Consumer Name", "consumer_name"],
     ["Father/Husband", "father_name"], ["Address", "address"], ["Mobile", "mobile"]];
-  if (kind === "SURVEY") return base.concat([["Village", "village"], ["Meter", "meter"], ["AC", "ac"], ["Outstanding", "outstanding"]]);
+  if (kind === "SURVEY") return base.concat([["Meter", "meter"], ["AC", "ac"], ["Outstanding", "outstanding"]]);
   if (kind === "PHONE_CALLING") return base.concat([["Response", "status"], ["Committed Date", "committed_date"], ["Outstanding", "outstanding"], ["Remarks", "remarks"]]);
   return base.concat([["Status", "status"], ["Payment Mode", "payment_mode"], ["Committed / Payment Date", "committed_date"],
     ["Paid Amount (by user)", "paid_amount"], ["Outstanding", "outstanding"], ["Video", "video"]]);

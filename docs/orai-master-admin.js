@@ -101,8 +101,8 @@
 
       <h3>Feeder / DT list (survey dropdowns)</h3>
       <p class="muted" style="font-size:13px">Choose the PM-module transformer Excel (columns Substation, Feeder,
-        DT Location, DT Loc Code, DT Capacity). It is arranged Sub-Division → Substation → Feeder → DT; village / area
-        names are taken from the consumer master on this device. (फीडर / ट्रांसफार्मर सूची)</p>
+        DT Location, DT Loc Code, DT Capacity). It is arranged Sub-Division → Substation → Feeder → DT.
+        (फीडर / ट्रांसफार्मर सूची)</p>
       <div id="omRefInfo" class="om-box">Not loaded yet.</div>
       <input id="omRefFile" type="file" accept=".xlsx,.xls,.csv">
       <div id="omRefCheck"></div>
@@ -495,8 +495,7 @@
       feeders.forEach(x => { const k = (x.subdivision ? x.subdivision + " › " : "") + x.substation; subs[k] = subs[k] || { f: 0, d: 0 }; subs[k].f++; subs[k].d += x.dts.length; });
       box.innerHTML = `<div class="om-box"><b>${escapeHtml(f.name)}</b> (sheet "${escapeHtml(name)}"): ` +
         `${Object.keys(subs).length} substations, ${feeders.length} feeders, <b>${dts.toLocaleString("en-IN")} DTs</b>` +
-        (villages.length ? `, ${villages.length.toLocaleString("en-IN")} villages / areas from the master` :
-          `<br><span class="om-warn">⚠ Master Data is not loaded on this device, so the village list will not be changed.</span>`) +
+        "" +
         `<div style="max-height:160px;overflow:auto;margin-top:6px"><table><tr><th>Substation</th><th>Feeders</th><th>DTs</th></tr>` +
         Object.entries(subs).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${v.f}</td><td>${v.d}</td></tr>`).join("") +
         `</table></div></div>`;
@@ -516,7 +515,8 @@
       villages: refPicked.villages
     }, 1);
     if (r && r.success) {
-      setStatus("omRefStatus", "✓ " + r.message, "ok");
+      setStatus("omRefStatus", "✓ Feeder / DT list saved: " + r.feeders + " feeders, " + Number(r.dts).toLocaleString("en-IN") +
+        " DTs. Phones get it with CHECK AND UPDATE FEEDER & DT LIST.", "ok");
       refPicked = null; $("omRefFile").value = ""; $("omRefCheck").innerHTML = "";
       loadRefInfo();
       if (typeof checkVillageListUpdate === "function") { try { checkVillageListUpdate(true); } catch (e) {} }
@@ -531,8 +531,8 @@
     const r = await call("reference_info", {}, 1);
     if (!r || !r.success) { box.textContent = "Feeder / DT list: needs server version 8."; return; }
     box.innerHTML = r.dts
-      ? `<b>On the server</b>: ${r.substations} substations, ${r.feeders} feeders, ${Number(r.dts).toLocaleString("en-IN")} DTs, ` +
-        `${Number(r.villages).toLocaleString("en-IN")} villages / areas <small>(updated ${escapeHtml(r.version)})</small>`
+      ? `<b>On the server</b>: ${r.substations} substations, ${r.feeders} feeders, ${Number(r.dts).toLocaleString("en-IN")} DTs ` +
+        `<small>(updated ${escapeHtml(r.version)})</small>`
       : `<span class="om-warn">No feeder / DT list on the server yet — surveys cannot be saved until it is uploaded.</span>`;
   }
   window.OraiRef = { buildReference, refSubName };
